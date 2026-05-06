@@ -121,49 +121,76 @@ jobs:
                   > $STAGE/share/MISSING_BINARIES.txt
           fi
 
-          # Bundle the dynamic libs each binary depends on. ldd lists every
-          # .so the loader needs; we filter to non-system libs (skip glibc /
-          # ld-linux / libstdc++ — those have ABI guarantees within a
-          # compatible glibc family, and bundling them could break in subtle
-          # ways). Everything else (libsodium, libprotobuf, libsqlite3,
-          # libbrotli*, libssl, libQt6*, libgstreamer*, libgst*-plugins-*)
-          # gets copied alongside.
-          for src in $STAGE/bin/*.bin; do
-              ldd "$src" 2>/dev/null | awk '/=> \// { print $3 }' | while read lib; do
-                  case "$lib" in
-                      /lib/ld-linux-*|/lib64/ld-linux-*)        continue ;;
-                      */libc.so.*|*/libm.so.*|*/libdl.so.*)     continue ;;
-                      */librt.so.*|*/libpthread.so.*)           continue ;;
-                      */libresolv.so.*|*/libnsl.so.*)           continue ;;
-                      */libstdc++.so.*|*/libgcc_s.so.*)         continue ;;
-                  esac
-                  # cp -L derefs the symlink so we get the actual SONAME
-                  # file, not a versioned alias chain.
-                  cp -Ln "$lib" $STAGE/lib/ 2>/dev/null || true
+          # ----- bundle dynamic deps -----------------------------------
+          # The trick: ldd of the BINARY only lists what the linker stamped
+          # into NEEDED. Plugin .so files (loaded via dlopen) carry their
+          # own transitive deps that won't show up that way. So we bundle
+          # iteratively: ldd the binaries, then ldd everything we copied
+          # in, then ldd the plugin .so files, until nothing new appears.
+          # That's how AppImage-builders like linuxdeploy do it.
+          should_skip() {
+              case "$1" in
+                  /lib/ld-linux-*|/lib64/ld-linux-*)        return 0 ;;
+                  */libc.so.*|*/libm.so.*|*/libdl.so.*)     return 0 ;;
+                  */librt.so.*|*/libpthread.so.*)           return 0 ;;
+                  */libresolv.so.*|*/libnsl.so.*)           return 0 ;;
+                  */libstdc++.so.*|*/libgcc_s.so.*)         return 0 ;;
+              esac
+              return 1
+          }
+          bundle_deps_of() {
+              ldd "$1" 2>/dev/null | awk '/=> \// { print $3 }' | while read lib; do
+                  if ! should_skip "$lib"; then
+                      cp -Ln "$lib" $STAGE/lib/ 2>/dev/null || true
+                  fi
               done
-          done
-          # Qt6 also dlopen()s its platform plugins (xcb, wayland) at runtime
-          # — those aren't in the binary's NEEDED list and ldd won't pick
-          # them up. Bundle the Qt plugin tree so QT_QPA_PLATFORM works.
+          }
+
+          # Pass 1: deps of the binaries themselves.
+          for src in $STAGE/bin/*.bin; do bundle_deps_of "$src"; done
+
+          # Bundle Qt6 plugin tree — needed by fb_desktop (xcb / wayland /
+          # imageformats / iconengines / styles / etc).
           if [ -x $STAGE/bin/fb_desktop.bin ]; then
-              QT_PLUGINS=$(find /usr/lib/x86_64-linux-gnu/qt6/plugins -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1 || true)
-              if [ -n "$QT_PLUGINS" ]; then
+              if [ -d /usr/lib/x86_64-linux-gnu/qt6/plugins ]; then
                   mkdir -p $STAGE/lib/qt6
                   cp -r /usr/lib/x86_64-linux-gnu/qt6/plugins $STAGE/lib/qt6/
-                  # Wrapper for fb_desktop also exports QT_PLUGIN_PATH.
                   cat > $STAGE/bin/fb_desktop <<'QWRAPPER'
           #!/bin/sh
           HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
           LIB="${HERE%/bin}/lib"
           export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           export QT_PLUGIN_PATH="$LIB/qt6/plugins"
+          export GST_PLUGIN_SYSTEM_PATH="$LIB/gstreamer-1.0"
+          export GST_PLUGIN_SCANNER="$LIB/gstreamer-1.0/gst-plugin-scanner"
           exec "$HERE/fb_desktop.bin" "$@"
           QWRAPPER
                   chmod +x $STAGE/bin/fb_desktop
               fi
           fi
+
+          # Bundle GStreamer plugin tree — webrtcbin, opusenc/dec,
+          # vp8enc/dec, rtpopuspay/depay, rtpvp8pay/depay, audioconvert,
+          # videoconvert, autoaudiosink, autovideosink, appsink, queue.
+          # All loaded via dlopen, none in fb_desktop's NEEDED.
+          if [ -x $STAGE/bin/fb_desktop.bin ] && [ -d /usr/lib/x86_64-linux-gnu/gstreamer-1.0 ]; then
+              mkdir -p $STAGE/lib/gstreamer-1.0
+              cp -r /usr/lib/x86_64-linux-gnu/gstreamer-1.0/. $STAGE/lib/gstreamer-1.0/
+          fi
+
+          # Pass 2..N: recursively bundle deps OF the plugins until the
+          # bundle stabilises. Cap at 5 passes — convergence is fast in
+          # practice (usually 2-3).
+          for pass in 1 2 3 4 5; do
+              before=$(ls $STAGE/lib | wc -l)
+              find $STAGE/lib -maxdepth 4 -type f -name "*.so*" | while read so; do
+                  bundle_deps_of "$so"
+              done
+              after=$(ls $STAGE/lib | wc -l)
+              echo "  recursive bundle pass $pass: $before -> $after libs"
+              [ "$before" = "$after" ] && break
+          done
           echo "--- bundled libs ($(ls $STAGE/lib | wc -l) files, $(du -sh $STAGE/lib | cut -f1)) ---"
-          ls $STAGE/lib | head -20
 
           cp LICENSE README.md CHANGELOG.md docs/ROADMAP.md $STAGE/share/
           # Quick "what runtime libs do I need?" hint — almost nothing,

@@ -110,22 +110,32 @@ jobs:
                   > $STAGE/share/MISSING_BINARIES.txt
           fi
 
-          # Bundle every dynamic dep ldd reports, except glibc / libstdc++
-          # / libgcc_s (those have ABI guarantees within compatible glibc
-          # families and bundling them can break in subtle ways).
-          for src in $STAGE/bin/*.bin; do
-              ldd "$src" 2>/dev/null | awk '/=> \// { print $3 }' | while read lib; do
-                  case "$lib" in
-                      /lib/ld-linux-*|/lib64/ld-linux-*)        continue ;;
-                      */libc.so.*|*/libm.so.*|*/libdl.so.*)     continue ;;
-                      */librt.so.*|*/libpthread.so.*)           continue ;;
-                      */libresolv.so.*|*/libnsl.so.*)           continue ;;
-                      */libstdc++.so.*|*/libgcc_s.so.*)         continue ;;
-                  esac
-                  cp -Ln "$lib" $STAGE/lib/ 2>/dev/null || true
+          # ----- bundle dynamic deps -----------------------------------
+          # Iterative ldd: deps of the binaries, then deps of those
+          # deps + every plugin .so we copy in. Plugins (Qt's xcb /
+          # wayland, every GStreamer element) are dlopen()'d so they
+          # don't show up in the binary's NEEDED list. See ci.yml for
+          # the full rationale.
+          should_skip() {
+              case "$1" in
+                  /lib/ld-linux-*|/lib64/ld-linux-*)        return 0 ;;
+                  */libc.so.*|*/libm.so.*|*/libdl.so.*)     return 0 ;;
+                  */librt.so.*|*/libpthread.so.*)           return 0 ;;
+                  */libresolv.so.*|*/libnsl.so.*)           return 0 ;;
+                  */libstdc++.so.*|*/libgcc_s.so.*)         return 0 ;;
+              esac
+              return 1
+          }
+          bundle_deps_of() {
+              ldd "$1" 2>/dev/null | awk '/=> \// { print $3 }' | while read lib; do
+                  if ! should_skip "$lib"; then
+                      cp -Ln "$lib" $STAGE/lib/ 2>/dev/null || true
+                  fi
               done
-          done
-          # Qt6 dlopen()s its platform plugins (xcb, wayland) at runtime.
+          }
+
+          for src in $STAGE/bin/*.bin; do bundle_deps_of "$src"; done
+
           if [ -x $STAGE/bin/fb_desktop.bin ]; then
               if [ -d /usr/lib/x86_64-linux-gnu/qt6/plugins ]; then
                   mkdir -p $STAGE/lib/qt6
@@ -136,13 +146,28 @@ jobs:
           LIB="${HERE%/bin}/lib"
           export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           export QT_PLUGIN_PATH="$LIB/qt6/plugins"
+          export GST_PLUGIN_SYSTEM_PATH="$LIB/gstreamer-1.0"
+          export GST_PLUGIN_SCANNER="$LIB/gstreamer-1.0/gst-plugin-scanner"
           exec "$HERE/fb_desktop.bin" "$@"
           QWRAPPER
                   chmod +x $STAGE/bin/fb_desktop
               fi
+              if [ -d /usr/lib/x86_64-linux-gnu/gstreamer-1.0 ]; then
+                  mkdir -p $STAGE/lib/gstreamer-1.0
+                  cp -r /usr/lib/x86_64-linux-gnu/gstreamer-1.0/. $STAGE/lib/gstreamer-1.0/
+              fi
           fi
+
+          for pass in 1 2 3 4 5; do
+              before=$(ls $STAGE/lib | wc -l)
+              find $STAGE/lib -maxdepth 4 -type f -name "*.so*" | while read so; do
+                  bundle_deps_of "$so"
+              done
+              after=$(ls $STAGE/lib | wc -l)
+              echo "  recursive bundle pass $pass: $before -> $after libs"
+              [ "$before" = "$after" ] && break
+          done
           echo "--- bundled libs ($(ls $STAGE/lib | wc -l) files, $(du -sh $STAGE/lib | cut -f1)) ---"
-          ls $STAGE/lib | head -20
 
           cp LICENSE README.md CHANGELOG.md docs/ROADMAP.md $STAGE/share/
           cat > $STAGE/share/RUNTIME_DEPS.md <<'EOF'
