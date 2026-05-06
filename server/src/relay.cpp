@@ -133,4 +133,64 @@ void Relay::unbind_all_channels(int fd) {
     fd_to_chans_.erase(cit);
 }
 
+void Relay::room_join(int fd, std::span<const std::uint8_t> room_id) {
+    std::lock_guard lk(mu_);
+    std::string key(reinterpret_cast<const char*>(room_id.data()), room_id.size());
+    auto& members = room_members_[key];
+    if (std::find(members.begin(), members.end(), fd) == members.end()) {
+        members.push_back(fd);
+    }
+    auto& rooms = fd_to_rooms_[fd];
+    if (std::find(rooms.begin(), rooms.end(), key) == rooms.end()) {
+        rooms.push_back(key);
+    }
+}
+
+void Relay::room_leave(int fd, std::span<const std::uint8_t> room_id) {
+    std::lock_guard lk(mu_);
+    std::string key(reinterpret_cast<const char*>(room_id.data()), room_id.size());
+    auto it = room_members_.find(key);
+    if (it != room_members_.end()) {
+        auto& v = it->second;
+        v.erase(std::remove(v.begin(), v.end(), fd), v.end());
+        if (v.empty()) room_members_.erase(it);
+    }
+    auto rit = fd_to_rooms_.find(fd);
+    if (rit != fd_to_rooms_.end()) {
+        auto& v = rit->second;
+        v.erase(std::remove(v.begin(), v.end(), key), v.end());
+        if (v.empty()) fd_to_rooms_.erase(rit);
+    }
+}
+
+std::vector<int> Relay::room_member_fds(std::span<const std::uint8_t> room_id) const {
+    std::lock_guard lk(mu_);
+    std::string key(reinterpret_cast<const char*>(room_id.data()), room_id.size());
+    auto it = room_members_.find(key);
+    if (it == room_members_.end()) return {};
+    return it->second;
+}
+
+std::vector<std::string> Relay::room_member_rooms(int fd) const {
+    std::lock_guard lk(mu_);
+    auto it = fd_to_rooms_.find(fd);
+    if (it == fd_to_rooms_.end()) return {};
+    return it->second;
+}
+
+void Relay::unbind_all_rooms(int fd) {
+    std::lock_guard lk(mu_);
+    auto rit = fd_to_rooms_.find(fd);
+    if (rit == fd_to_rooms_.end()) return;
+    for (const auto& key : rit->second) {
+        auto mit = room_members_.find(key);
+        if (mit != room_members_.end()) {
+            auto& v = mit->second;
+            v.erase(std::remove(v.begin(), v.end(), fd), v.end());
+            if (v.empty()) room_members_.erase(mit);
+        }
+    }
+    fd_to_rooms_.erase(rit);
+}
+
 }  // namespace fb::server

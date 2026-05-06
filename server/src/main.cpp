@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -306,6 +307,10 @@ int main(int argc, char** argv) {
 
     std::unordered_map<int, std::unique_ptr<Conn>> conns;
 
+    // Forward-declared so close_conn can broadcast roster updates on the
+    // way out without ordering pain. Body assigned right after close_conn.
+    std::function<void(const std::string&)> broadcast_room_roster;
+
     auto close_conn = [&](int fd) {
         // Best-effort: flush whatever's in the userspace write buffer before
         // tearing the socket down. Without this, frames enqueued in the same
@@ -320,10 +325,48 @@ int main(int argc, char** argv) {
             (void)it->second->write_some(
                 std::span<const std::uint8_t>(buf.data(), buf.size()));
         }
+        // Snapshot the rooms this fd was in BEFORE we forget — every
+        // remaining member needs an updated roster (one fewer participant).
+        const auto rooms_left = relay.room_member_rooms(fd);
         relay.unbind(fd);
         relay.unbind_all_channels(fd);
+        relay.unbind_all_rooms(fd);
         loop.remove_fd(fd);
         conns.erase(fd);
+        // Fan out roster updates after the disconnecting fd is fully gone
+        // (so it doesn't appear in its own goodbye broadcast).
+        for (const auto& rid : rooms_left) {
+            broadcast_room_roster(rid);
+        }
+    };
+
+    // Build a RoomRoster proto from current membership and send it to
+    // every member. `room_id` is the raw 32-byte id (as a std::string).
+    // No-op when the room has zero members left (last-leaver case).
+    broadcast_room_roster = [&](const std::string& room_id) {
+        const auto fds = relay.room_member_fds(
+            std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(room_id.data()), room_id.size()));
+        if (fds.empty()) return;
+        fb::proto::Frame f;
+        auto* roster = f.mutable_room_roster();
+        roster->set_room_id(room_id);
+        roster->set_sframe_epoch(1);   // bumped by future SFrame rotation
+        for (int member_fd : fds) {
+            auto cit = conns.find(member_fd);
+            if (cit == conns.end()) continue;
+            auto* m = roster->add_participants();
+            m->set_identity_pubkey(std::string(
+                reinterpret_cast<const char*>(cit->second->bound_user_pub.data()),
+                cit->second->bound_user_pub.size()));
+            m->set_has_audio(true);
+            m->set_has_video(false);   // refined by client-side capability later
+        }
+        const auto bytes = serialize(f);
+        for (int member_fd : fds) {
+            auto cit = conns.find(member_fd);
+            if (cit != conns.end()) enqueue_write(loop, *cit->second, bytes);
+        }
     };
 
     auto handle_frame = [&](Conn& c, const std::vector<std::uint8_t>& bytes) {
@@ -523,6 +566,31 @@ int main(int argc, char** argv) {
                             reinterpret_cast<const std::uint8_t*>(uns.channel_group_id().data()),
                             32));
                 }
+                break;
+            }
+            case fb::proto::Frame::kRoomJoin: {
+                // Group-call signaling rendezvous (full-mesh v0).
+                const auto& rj = f.room_join();
+                if (rj.room_id().size() != 32) break;
+                relay.room_join(
+                    c.sock.fd(),
+                    std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(rj.room_id().data()), 32));
+                std::fprintf(stderr,
+                             "[server] fd=%d joined room (audio=%d video=%d)\n",
+                             c.sock.fd(), rj.want_audio(), rj.want_video());
+                broadcast_room_roster(rj.room_id());
+                break;
+            }
+            case fb::proto::Frame::kRoomLeave: {
+                const auto& rl = f.room_leave();
+                if (rl.room_id().size() != 32) break;
+                relay.room_leave(
+                    c.sock.fd(),
+                    std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(rl.room_id().data()), 32));
+                std::fprintf(stderr, "[server] fd=%d left room\n", c.sock.fd());
+                broadcast_room_roster(rl.room_id());
                 break;
             }
             case fb::proto::Frame::kEnvelope: {

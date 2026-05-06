@@ -73,11 +73,19 @@ public:
     //   accept_call        — answer an inbound call after incomingCall fires.
     //   decline_call       — refuse an inbound call.
     //   hangup_call        — tear down the active call (any state).
-    // Only one call at a time is supported in v0.
+    // Only one 1:1 call at a time is supported in v0.
     void start_call(const QString& peer_username, bool with_video);
     void accept_call(bool with_video);
     void decline_call();
     void hangup_call();
+
+    // Channel voice calls (full-mesh v0). join_channel_call sends RoomJoin
+    // with the channel's group_id; the server replies with RoomRoster on
+    // every join/leave from then on. Mesh dialing of per-peer MediaCalls
+    // happens automatically on roster deltas (added in a follow-up pass —
+    // currently this just plumbs the protocol).
+    void join_channel_call(const QString& channel_name, bool with_video);
+    void leave_channel_call(const QString& channel_name);
 
     // Stop the worker and release sockets. Blocks until the thread exits.
     void disconnect();
@@ -128,6 +136,10 @@ signals:
     // hasn't been resolved yet.
     void incomingCall(QString peerLabel, QString peerFingerprint);
     void callStateChanged(QString peerLabel, int state /*MediaCall::State*/);
+    // Channel voice room roster — fires on every server-side membership
+    // change for any channel we've joined a call on. `participants` carries
+    // each member's fingerprint (resolved later to username if cached).
+    void channelCallRoster(QString channelName, QStringList participantFingerprints);
     // Forwarded from MediaCall::remoteVideoFrame so MainWindow can paint
     // without taking a direct dependency on the GStreamer wrapper.
     void remoteVideoFrame(QImage frame);

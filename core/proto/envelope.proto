@@ -164,6 +164,70 @@ message ChannelUnsubscribe {
     bytes channel_group_id = 1;
 }
 
+// =============================================================================
+// Group / channel calls.
+//
+// v0 topology is FULL-MESH: every participant runs a 1:1 PeerConnection
+// (existing MediaCall on the desktop) to every OTHER participant in the
+// room. The server is a pure signaling rendezvous — it tracks who's in
+// the room and broadcasts the roster on join/leave; SDP/ICE travel over
+// the existing DM media_signal pipe between the two endpoints. Bandwidth
+// scales O(N²) per participant so this caps out around 5–6 callers; an
+// SFU path (one PeerConnection per participant to a server-side
+// webrtcbin) is the planned upgrade and the RoomOffer/RoomAnswer/RoomIce
+// envelopes below are reserved for that mode.
+//
+// Lifecycle (v0 mesh):
+//   client → server   RoomJoin{room_id, want_video}
+//   server → all      RoomRoster{participants}       — broadcast on join/leave
+//   client → server   RoomLeave{room_id}             — explicit teardown
+//   each participant pair: existing DmPayload.media_signal carries SDP/ICE
+//
+// `room_id` for a channel call is the channel_group_id verbatim — there's
+// at most one active room per channel. Future ad-hoc rooms (DMs, threads)
+// will use freshly generated 32-byte ids.
+// =============================================================================
+
+message RoomJoin {
+    bytes  room_id    = 1;   // 32-byte opaque room identifier
+    bool   want_video = 2;
+    bool   want_audio = 3;   // typically true; a participant can join muted
+}
+
+message RoomLeave {
+    bytes room_id = 1;
+}
+
+message RoomOffer {
+    bytes  room_id = 1;
+    string sdp     = 2;      // SFU's SDP offer for this participant
+}
+
+message RoomAnswer {
+    bytes  room_id = 1;
+    string sdp     = 2;
+}
+
+message RoomIce {
+    bytes  room_id        = 1;
+    string candidate      = 2;
+    string sdp_mid        = 3;
+    int32  sdp_mline_index = 4;
+}
+
+// Per-participant entry in a roster broadcast.
+message RoomMember {
+    bytes  identity_pubkey = 1;   // 32-byte Ed25519 pubkey of the participant
+    bool   has_audio       = 2;
+    bool   has_video       = 3;
+}
+
+message RoomRoster {
+    bytes               room_id      = 1;
+    repeated RoomMember participants = 2;
+    uint32              sframe_epoch = 3;   // bumped when membership changes
+}
+
 // Top-level frame on the wire. Client <-> server TCP and peer<->peer
 // libp2p streams both carry these.
 message Frame {
@@ -183,5 +247,11 @@ message Frame {
         HelloAck                hello_ack        = 13;
         UsernameLookup          username_lookup  = 14;
         UsernameLookupResponse  username_resp    = 15;
+        RoomJoin                room_join        = 16;
+        RoomLeave               room_leave       = 17;
+        RoomOffer               room_offer       = 18;
+        RoomAnswer              room_answer      = 19;
+        RoomIce                 room_ice         = 20;
+        RoomRoster              room_roster      = 21;
     }
 }

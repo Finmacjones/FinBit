@@ -58,6 +58,18 @@ public:
         std::span<const std::uint8_t> group_id) const;
     void unbind_all_channels(int fd);
 
+    // ---- group-call rooms (full-mesh signaling rendezvous) -----------------
+    // Each room is identified by a 32-byte room_id (channel_group_id verbatim
+    // for channel calls). Joining adds the fd; leaving removes it. The
+    // server itself doesn't see media in v0 — it just tracks membership and
+    // rebroadcasts the roster so each client can mesh-dial the others.
+    void room_join(int fd, std::span<const std::uint8_t> room_id);
+    void room_leave(int fd, std::span<const std::uint8_t> room_id);
+    [[nodiscard]] std::vector<int> room_member_fds(
+        std::span<const std::uint8_t> room_id) const;
+    [[nodiscard]] std::vector<std::string> room_member_rooms(int fd) const;
+    void unbind_all_rooms(int fd);
+
     static constexpr std::size_t kMaxQueued = 1024;
 
 private:
@@ -69,6 +81,10 @@ private:
     std::unordered_map<std::string, std::vector<int>> chan_subs_;
     // fd -> set of group_ids it's subscribed to (for cleanup on disconnect)
     std::unordered_map<int, std::vector<std::string>> fd_to_chans_;
+    // room_id -> set of participating fds (group-call membership)
+    std::unordered_map<std::string, std::vector<int>> room_members_;
+    // fd -> set of room_ids it's in (for cleanup on disconnect)
+    std::unordered_map<int, std::vector<std::string>> fd_to_rooms_;
     // Optional persistent offline-message store (Phase 1). Promoted from the
     // RAM-only deque when enable_persistent_offline() is called at startup.
     std::unique_ptr<fb::store::SqliteStore> persistent_;

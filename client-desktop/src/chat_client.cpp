@@ -121,12 +121,16 @@ struct PendingSend {
 };
 
 struct PendingChannelOp {
-    enum class Kind { kCreate, kCreateLocal, kJoin, kSend, kInvite, kLeave };
+    enum class Kind {
+        kCreate, kCreateLocal, kJoin, kSend, kInvite, kLeave,
+        kRoomJoin, kRoomLeave
+    };
     Kind        kind;
     std::string channel_name;
     std::string dist_path;   // for create / join
     std::string text;        // for send
     std::string peer;        // for invite
+    bool        want_video = false;   // for kRoomJoin
 };
 
 // Outbound media-signal sends (OFFER/ANSWER/ICE/HANGUP/SFRAME_KEY) get
@@ -630,6 +634,35 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                         emit log(QString("left #%1 (sidebar entry, sessions, persisted state "
                                          "all cleared)")
                                      .arg(QString::fromStdString(op.channel_name)));
+                    } else if (op.kind == PendingChannelOp::Kind::kRoomJoin) {
+                        // Group-call signaling: announce ourselves to the
+                        // room. Server replies with RoomRoster broadcasts
+                        // (handled in the read loop) on every membership
+                        // change. The room_id IS the channel_group_id —
+                        // ensure the channel exists before joining.
+                        if (cs.id[0] == 0 && cs.id[1] == 0) {
+                            cs.id = channel_id_from_name(op.channel_name);
+                        }
+                        fb::proto::Frame jf;
+                        auto* rj = jf.mutable_room_join();
+                        rj->set_room_id(std::string(
+                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
+                        rj->set_want_audio(true);
+                        rj->set_want_video(op.want_video);
+                        blocking_send(*impl_->sock, serialize(jf));
+                        emit log(QString("joined call on #%1 (video=%2)")
+                                     .arg(QString::fromStdString(op.channel_name))
+                                     .arg(op.want_video ? "yes" : "no"));
+                    } else if (op.kind == PendingChannelOp::Kind::kRoomLeave) {
+                        if (cs.id[0] == 0 && cs.id[1] == 0) {
+                            cs.id = channel_id_from_name(op.channel_name);
+                        }
+                        fb::proto::Frame lf;
+                        lf.mutable_room_leave()->set_room_id(std::string(
+                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
+                        blocking_send(*impl_->sock, serialize(lf));
+                        emit log(QString("left call on #%1")
+                                     .arg(QString::fromStdString(op.channel_name)));
                     } else if (op.kind == PendingChannelOp::Kind::kInvite) {
                         // In-band invite: ensure we have a chain, then queue
                         // a DM to `peer` carrying the channel-key payload.
@@ -870,6 +903,41 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                             "original identity from its recovery code)."));
                                 impl_->stop_requested = true;
                             }
+                            continue;
+                        }
+                        if (f.body_case() == fb::proto::Frame::kRoomRoster) {
+                            const auto& rr = f.room_roster();
+                            if (rr.room_id().size() != 32) continue;
+                            // Resolve the room_id back to a channel name —
+                            // it's the channel's group_id verbatim.
+                            std::array<std::uint8_t, 32> rid{};
+                            std::memcpy(rid.data(), rr.room_id().data(), 32);
+                            auto nit = impl_->chan_id_to_name.find(
+                                std::string(rr.room_id().begin(), rr.room_id().end()));
+                            QString chan_name;
+                            if (nit != impl_->chan_id_to_name.end()) {
+                                chan_name = QString::fromStdString(nit->second);
+                            }
+                            QStringList fps;
+                            for (const auto& p : rr.participants()) {
+                                if (p.identity_pubkey().size() != 32) continue;
+                                fb::crypto::PubKey k{};
+                                std::memcpy(k.data(), p.identity_pubkey().data(), 32);
+                                fps << QString::fromStdString(
+                                    fb::crypto::Identity::fingerprint(k));
+                            }
+                            emit log(QString("room roster for #%1: %2 participant(s)")
+                                         .arg(chan_name.isEmpty() ? "<unknown>" : chan_name)
+                                         .arg(fps.size()));
+                            emit channelCallRoster(chan_name, fps);
+                            // TODO(mesh-dial): diff `fps` against per-room set
+                            // of mesh peers we already have a MediaCall to;
+                            // for each new peer where my_fp > peer_fp (glare
+                            // tiebreak), start_call(peer_username,
+                            // with_video). For each departed peer, tear down
+                            // their MediaCall. Requires lifting the
+                            // single-active-call constraint in start_call /
+                            // active_call → map<peer_pub, MediaCall*>.
                             continue;
                         }
                         if (f.body_case() == fb::proto::Frame::kUsernameResp) {
@@ -1338,6 +1406,26 @@ void ChatClient::invite_peer_to_channel(const QString& channel_name, const QStri
         impl_->chan_queue.push_back({PendingChannelOp::Kind::kInvite,
                                       channel_name.toStdString(), {}, {},
                                       peer.toStdString()});
+    }
+    impl_->cv.notify_all();
+}
+
+void ChatClient::join_channel_call(const QString& channel_name, bool with_video) {
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->chan_queue.push_back({PendingChannelOp::Kind::kRoomJoin,
+                                      channel_name.toStdString(), {}, {}, {},
+                                      with_video});
+    }
+    impl_->cv.notify_all();
+}
+
+void ChatClient::leave_channel_call(const QString& channel_name) {
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->chan_queue.push_back({PendingChannelOp::Kind::kRoomLeave,
+                                      channel_name.toStdString(), {}, {}, {},
+                                      false});
     }
     impl_->cv.notify_all();
 }

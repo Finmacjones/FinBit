@@ -336,6 +336,8 @@ MainWindow::MainWindow(QWidget* parent)
     QObject::connect(client_.get(), &ChatClient::errorOccurred, this, &MainWindow::onError);
     QObject::connect(client_.get(), &ChatClient::peerUsernameResolved, this,
                      &MainWindow::onPeerUsernameResolved);
+    QObject::connect(client_.get(), &ChatClient::channelCallRoster, this,
+                     &MainWindow::onChannelCallRoster);
 
     // Settings menubar — recovery code + sign out. Lives in the global
     // menu bar (Cmd-comma on macOS) rather than chrome inside the window
@@ -442,27 +444,48 @@ void MainWindow::onShowRecoveryCode() {
 }
 
 void MainWindow::onCallVoiceClicked() {
-    if (!current_conv_.startsWith("dm:")) {
-        QMessageBox::information(this, "Voice call",
-            "Calls are 1:1 only — open a DM conversation first.");
+    if (current_conv_.startsWith("dm:")) {
+        const QString peer = current_conv_.section(':', 1);
+        client_->start_call(peer, /*with_video=*/false);
         return;
     }
-    const QString peer = current_conv_.section(':', 1);
-    client_->start_call(peer, /*with_video=*/false);
+    if (current_conv_.startsWith("chan:")) {
+        const QString chan = current_conv_.mid(5);
+        client_->join_channel_call(chan, /*with_video=*/false);
+        active_channel_call_ = chan;
+        call_banner_label_->setText(QString("📞 In #%1 — full-mesh").arg(chan));
+        call_banner_->show();
+        return;
+    }
+    QMessageBox::information(this, "Voice call",
+        "Open a DM or a channel from the sidebar first.");
 }
 
 void MainWindow::onCallVideoClicked() {
-    if (!current_conv_.startsWith("dm:")) {
-        QMessageBox::information(this, "Video call",
-            "Calls are 1:1 only — open a DM conversation first.");
+    if (current_conv_.startsWith("dm:")) {
+        const QString peer = current_conv_.section(':', 1);
+        client_->start_call(peer, /*with_video=*/true);
         return;
     }
-    const QString peer = current_conv_.section(':', 1);
-    client_->start_call(peer, /*with_video=*/true);
+    if (current_conv_.startsWith("chan:")) {
+        const QString chan = current_conv_.mid(5);
+        client_->join_channel_call(chan, /*with_video=*/true);
+        active_channel_call_ = chan;
+        call_banner_label_->setText(QString("📹 In #%1 — full-mesh").arg(chan));
+        call_banner_->show();
+        return;
+    }
+    QMessageBox::information(this, "Video call",
+        "Open a DM or a channel from the sidebar first.");
 }
 
 void MainWindow::onHangupClicked() {
+    if (!active_channel_call_.isEmpty()) {
+        client_->leave_channel_call(active_channel_call_);
+        active_channel_call_.clear();
+    }
     client_->hangup_call();
+    call_banner_->hide();
 }
 
 void MainWindow::onIncomingCall(const QString& peerLabel, const QString& peerFingerprint) {
@@ -843,6 +866,26 @@ void MainWindow::onVerifyClicked() {
         details += QStringLiteral("Peer fingerprint:\n   %1").arg(peer_fp);
     }
     QMessageBox::information(this, "Safety numbers", details);
+}
+
+void MainWindow::onChannelCallRoster(const QString& channel,
+                                      const QStringList& fingerprints) {
+    if (channel.isEmpty()) return;
+    if (active_channel_call_ != channel) return;   // stale event for another room
+    QStringList shown = fingerprints;
+    // Drop ourselves from the displayed roster — the banner is for "who
+    // ELSE is in the call".
+    shown.removeAll(my_fingerprint_);
+    if (shown.isEmpty()) {
+        call_banner_label_->setText(
+            QString("📞 In #%1 — alone (waiting for others)").arg(channel));
+    } else {
+        call_banner_label_->setText(
+            QString("📞 In #%1 — with: %2").arg(channel, shown.join(", ")));
+    }
+    call_banner_->show();
+    appendLog(QString("channel call roster #%1: %2 other(s)")
+                  .arg(channel).arg(shown.size()));
 }
 
 void MainWindow::onToggleLog() {

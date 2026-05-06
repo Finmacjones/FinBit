@@ -62,6 +62,7 @@ private slots:
     void onConnected(const QString& my_fp);
     void onError(const QString& detail);
     void onPeerUsernameResolved(const QString& peer_fingerprint, const QString& username);
+    void onChannelCallRoster(const QString& channel, const QStringList& fingerprints);
     void onToggleLog();
 
 private:
@@ -120,6 +121,10 @@ private:
 
     QString my_fingerprint_;
     QString my_username_;
+    // Channel name we've issued RoomJoin for (empty if not in a channel
+    // call). Used by the Hang up button to know whether to send RoomLeave
+    // in addition to / instead of the 1:1 hangup_call().
+    QString active_channel_call_;
     // 32-byte Ed25519 seed unlocked by LoginDialog; fed to ChatClient on
     // connect. Held in memory only — never written to anything but the
     // .vault file (encrypted) at LoginDialog creation time.
