@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace fb::crypto {
+
+// Ed25519 sizes — matches libsodium crypto_sign_*BYTES.
+inline constexpr std::size_t kIdentityPubKeyBytes = 32;
+inline constexpr std::size_t kIdentitySecKeyBytes = 64;
+inline constexpr std::size_t kIdentitySigBytes    = 64;
+inline constexpr std::size_t kIdentitySeedBytes   = 32;
+
+using PubKey  = std::array<std::uint8_t, kIdentityPubKeyBytes>;
+using SecKey  = std::array<std::uint8_t, kIdentitySecKeyBytes>;
+using Sig     = std::array<std::uint8_t, kIdentitySigBytes>;
+using Seed    = std::array<std::uint8_t, kIdentitySeedBytes>;
+
+// Long-term Ed25519 identity. Owns secret key in a sodium-allocated, mlocked
+// buffer that zeroes on destruction.
+class Identity {
+public:
+    // Generate a fresh random identity. Calls sodium_init() on first use.
+    [[nodiscard]] static Identity generate();
+
+    // Reproduce an identity from a 32-byte seed (for deterministic tests
+    // and key-derivation flows; never use a low-entropy seed in production).
+    [[nodiscard]] static Identity from_seed(std::span<const std::uint8_t, kIdentitySeedBytes> seed);
+
+    Identity(const Identity&)            = delete;
+    Identity& operator=(const Identity&) = delete;
+    Identity(Identity&&) noexcept;
+    Identity& operator=(Identity&&) noexcept;
+    ~Identity();
+
+    [[nodiscard]] const PubKey& public_key() const noexcept { return pub_; }
+    [[nodiscard]] std::span<const std::uint8_t, kIdentitySecKeyBytes> secret_key() const noexcept;
+
+    // Detached Ed25519 signature over `message`.
+    [[nodiscard]] Sig sign(std::span<const std::uint8_t> message) const;
+
+    // Verify a detached Ed25519 signature against this identity's public key.
+    [[nodiscard]] static bool verify(const PubKey& pubkey,
+                                     std::span<const std::uint8_t> message,
+                                     const Sig& signature) noexcept;
+
+    // Short, human-readable fingerprint of the public key. Currently 10
+    // characters of base32 over the first 6 bytes of BLAKE2b-160(pubkey) —
+    // grouped as XXXXX-XXXXX. Stable for a given pubkey.
+    [[nodiscard]] static std::string fingerprint(const PubKey& pubkey);
+    [[nodiscard]] std::string fingerprint() const { return fingerprint(pub_); }
+
+private:
+    Identity() = default;
+    PubKey pub_{};
+    std::uint8_t* sec_locked_ = nullptr;  // sodium_malloc'd, mlocked, length=64
+};
+
+// Free helpers for serialization. Public keys are not secret; secret keys
+// must be persisted only via Identity's at-rest encryption path (TODO).
+[[nodiscard]] std::string         pubkey_to_base64(const PubKey& pubkey);
+[[nodiscard]] bool                pubkey_from_base64(std::string_view encoded, PubKey& out) noexcept;
+
+}  // namespace fb::crypto

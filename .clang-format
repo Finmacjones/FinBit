@@ -1,0 +1,34 @@
+---
+Language: Cpp
+BasedOnStyle: Google
+Standard: c++20
+
+ColumnLimit: 100
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+BreakBeforeBraces: Attach
+DerivePointerAlignment: false
+PointerAlignment: Left
+SpaceBeforeCpp11BracedList: false
+
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex:           '^"fb/'
+    Priority:        1
+  - Regex:           '^<(sodium\.h|asio|google/protobuf)'
+    Priority:        3
+  - Regex:           '^<.*\.h>'
+    Priority:        2
+  - Regex:           '^<.*>'
+    Priority:        4
+
+NamespaceIndentation: None
+FixNamespaceComments: true

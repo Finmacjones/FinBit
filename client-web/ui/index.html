@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FinBit</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Login overlay — gates the chat UI until the user unlocks an
+         identity vault. Hidden once login_ui.js resolves. -->
+    <div id="login-overlay">
+        <div class="login-card">
+            <div class="login-header">
+                <div class="login-title">FinBit</div>
+                <div class="login-sub" id="login-sub">end-to-end encrypted chat</div>
+            </div>
+
+            <!-- Pane: create new identity ("absent" status) -->
+            <form id="login-create-pane" class="login-pane" hidden>
+                <label>Username
+                    <input id="login-create-username" type="text"
+                           autocomplete="username" placeholder="alice"
+                           pattern="[A-Za-z0-9._-]{1,32}" required>
+                </label>
+                <label>Passphrase
+                    <input id="login-create-pass" type="password"
+                           autocomplete="new-password" placeholder="long, memorable, unique">
+                </label>
+                <label>Confirm passphrase
+                    <input id="login-create-pass2" type="password"
+                           autocomplete="new-password" placeholder="repeat">
+                </label>
+                <div class="login-error" id="login-create-error" hidden></div>
+                <div class="login-actions">
+                    <button type="submit" id="login-create-btn">Create identity</button>
+                </div>
+                <div class="login-hint">
+                    Identity is generated locally and never leaves your browser.
+                    Empty passphrase stores the seed unencrypted (you can upgrade later).
+                </div>
+                <div class="login-links">
+                    <a href="#" id="login-recover-link">I have a recovery code</a>
+                </div>
+            </form>
+
+            <!-- Pane: sign in to existing vault ("locked" or "legacy") -->
+            <form id="login-signin-pane" class="login-pane" hidden>
+                <div class="login-username-row">
+                    Signed in as <code id="login-signin-username">—</code>
+                </div>
+                <label id="login-signin-passlabel">Passphrase
+                    <input id="login-signin-pass" type="password"
+                           autocomplete="current-password" placeholder="passphrase" autofocus>
+                </label>
+                <div class="login-error" id="login-signin-error" hidden></div>
+                <div class="login-actions">
+                    <button type="submit" id="login-signin-btn">Sign in</button>
+                </div>
+                <div class="login-links">
+                    <a href="#" id="login-recover-link-2">Use recovery code</a>
+                    <a href="#" id="login-wipe-link">Wipe vault &amp; start over</a>
+                </div>
+            </form>
+
+            <!-- Pane: restore from recovery code -->
+            <form id="login-recover-pane" class="login-pane" hidden>
+                <label>Username
+                    <input id="login-recover-username" type="text"
+                           autocomplete="username" placeholder="alice"
+                           pattern="[A-Za-z0-9._-]{1,32}" required>
+                </label>
+                <label>Recovery code
+                    <textarea id="login-recover-hex" rows="3" required
+                              placeholder="24-word phrase  OR  64 hex characters"></textarea>
+                </label>
+                <label>New passphrase (optional)
+                    <input id="login-recover-pass" type="password"
+                           autocomplete="new-password" placeholder="leave blank to skip">
+                </label>
+                <div class="login-error" id="login-recover-error" hidden></div>
+                <div class="login-actions">
+                    <button type="submit" id="login-recover-btn">Restore</button>
+                    <button type="button" id="login-recover-back-btn">Back</button>
+                </div>
+            </form>
+
+            <div class="login-spinner" id="login-spinner" hidden>working… (Argon2id)</div>
+        </div>
+    </div>
+
+    <div id="app">
+        <!-- Server rail (Discord's leftmost column).
+             Populated dynamically from server_book.js — one icon per
+             known relay. The "+" opens the add-server form. -->
+        <nav id="server-rail">
+            <div id="server-list"></div>
+            <div class="rail-divider"></div>
+            <button class="server-icon plus" id="add-server-btn" title="Add a server">+</button>
+        </nav>
+
+        <!-- Add-server modal (hidden by default). -->
+        <div id="add-server-modal" hidden>
+            <div class="modal-card">
+                <div class="modal-title">Add a relay</div>
+                <div class="modal-sub">Connect this identity to another FinBit relay.
+                    Same username + identity work everywhere.</div>
+                <form id="add-server-form">
+                    <label>Relay URL
+                        <input id="add-server-url" type="text"
+                               placeholder="ws://example.com:8766 or wss://...">
+                    </label>
+                    <label>Username on this relay
+                        <input id="add-server-username" type="text"
+                               placeholder="alice">
+                    </label>
+                    <label>Label (optional)
+                        <input id="add-server-label" type="text"
+                               placeholder="e.g. friends-server">
+                    </label>
+                    <div class="login-error" id="add-server-error" hidden></div>
+                    <div class="modal-actions">
+                        <button type="submit">Add</button>
+                        <button type="button" id="add-server-cancel">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- Channels panel -->
+        <aside id="channels-panel">
+            <header id="channel-panel-header">
+                <span>FinBit</span>
+                <span class="caret">▾</span>
+            </header>
+
+            <div class="sidebar-section-label">Direct messages</div>
+            <ul id="dm-list" class="sidebar-list">
+                <li data-key="dm:alice"><span class="avatar" data-seed="alice">AL</span>alice</li>
+                <li data-key="dm:bob"><span class="avatar" data-seed="bob">BO</span>bob</li>
+            </ul>
+
+            <div class="sidebar-section-label-row">
+                <span class="sidebar-section-label">Channels</span>
+                <button id="add-channel-btn" class="icon-btn" title="New channel">+</button>
+            </div>
+            <ul id="channel-list" class="sidebar-list">
+                <!-- Channels are populated dynamically via the "+" button or
+                     when an invite arrives. SenderKeys channels are 32-byte
+                     ids, so there are no useful seed entries here. -->
+            </ul>
+
+            <!-- User panel at the bottom -->
+            <div id="user-panel">
+                <span class="avatar" id="user-avatar" data-seed="?">?</span>
+                <div class="user-panel-text">
+                    <div id="user-panel-name">not connected</div>
+                    <div id="user-panel-fp">click "Identity" to generate</div>
+                </div>
+                <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
+            </div>
+        </aside>
+
+        <!-- Main chat area -->
+        <main id="chat">
+            <header id="chat-header">
+                <span class="chat-header-icon">#</span>
+                <span id="chat-header-title">general</span>
+                <span class="chat-header-divider"></span>
+                <span id="chat-header-subtitle">end-to-end encrypted channel</span>
+                <div class="grow"></div>
+                <button id="call-voice-btn" class="icon-btn" title="Voice call (1:1 only)">📞</button>
+                <button id="call-video-btn" class="icon-btn" title="Video call (1:1 only)">🎥</button>
+                <button id="settings-toggle-btn" class="icon-btn" title="Crypto self-test panel">⚙</button>
+            </header>
+
+            <!-- Active-call banner. Hidden until a call is ringing/connecting/live. -->
+            <div id="call-banner" hidden>
+                <span id="call-banner-text">In call</span>
+                <audio id="remote-audio" autoplay playsinline></audio>
+                <video id="remote-video" autoplay playsinline hidden></video>
+                <video id="local-video"  autoplay playsinline muted hidden></video>
+                <button id="hangup-btn">Hang up</button>
+            </div>
+
+            <!-- Inbound-call modal. Shown when an OFFER signal arrives. -->
+            <div id="inbound-call-modal" hidden>
+                <div class="modal-card">
+                    <div class="modal-title">Incoming call</div>
+                    <div class="modal-sub" id="inbound-call-from">from —</div>
+                    <div class="modal-actions">
+                        <button id="accept-voice-btn">Accept (voice)</button>
+                        <button id="accept-video-btn">Accept (video)</button>
+                        <button id="decline-call-btn">Decline</button>
+                    </div>
+                </div>
+            </div>
+
+            <ul id="messages"></ul>
+
+            <div id="compose-row">
+                <button class="compose-side-btn" title="Coming soon">+</button>
+                <input id="compose-input" placeholder="Message #general"
+                       autocomplete="off" />
+                <button class="compose-side-btn" id="send-btn" title="Send">▸</button>
+            </div>
+        </main>
+
+        <!-- Right-side panel: connection + identity + crypto self-test. -->
+        <aside id="settings-panel">
+            <header>FinBit · Connect</header>
+            <div class="settings-block">
+                <div class="settings-block-title">WebSocket relay</div>
+                <input id="conn-url"  placeholder="ws://127.0.0.1:8766"
+                       value="ws://127.0.0.1:8766">
+                <input id="conn-user" placeholder="username" value="alice">
+                <button id="connect-btn">Connect</button>
+                <div id="conn-status" class="aead-display">disconnected</div>
+            </div>
+            <div class="settings-block">
+                <div class="settings-block-title">Identity</div>
+                <div id="identity-display">—</div>
+                <button id="show-recovery-btn"
+                        title="Reveal the 64-hex recovery code (back this up offline)">
+                    Show recovery code</button>
+                <button id="signout-btn"
+                        title="Forget the in-memory identity and return to the login screen">
+                    Sign out</button>
+                <button id="wipe-vault-btn"
+                        title="Erase the persisted vault from IndexedDB"
+                        style="background:var(--error-red)">Wipe vault</button>
+                <div id="recovery-display" hidden></div>
+            </div>
+            <div class="settings-block">
+                <div class="settings-block-title">Notifications</div>
+                <button id="enable-notifications-btn">Enable desktop notifications</button>
+                <div id="notifications-status" class="kv">disabled</div>
+            </div>
+            <div class="settings-block">
+                <div class="settings-block-title">TURN server (optional, for symmetric NATs)</div>
+                <input id="turn-url"  placeholder="turn:turn.example.com:3478">
+                <input id="turn-user" placeholder="username">
+                <input id="turn-pass" type="password" placeholder="password">
+                <button id="turn-save-btn">Save TURN config</button>
+                <div id="turn-status" class="kv">not configured</div>
+            </div>
+            <div class="settings-block">
+                <div class="settings-block-title">AEAD self-test (XChaCha20-Poly1305)</div>
+                <input id="aead-input" placeholder="plaintext to encrypt + decrypt">
+                <button id="aead-btn">Run AEAD round-trip</button>
+                <div id="aead-display" class="aead-display">—</div>
+            </div>
+            <div class="settings-block">
+                <div class="settings-block-title">Build info</div>
+                <div class="kv">WASM module: <code>finbit.wasm</code></div>
+                <div class="kv">AES-256-GCM available: <span id="aes-avail">?</span></div>
+                <div class="kv">XChaCha20-Poly1305: <span style="color:#3ba55d">always</span></div>
+            </div>
+        </aside>
+    </div>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

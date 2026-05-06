@@ -1,0 +1,59 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+syntax = "proto3";
+
+package fb.proto;
+
+import "sender_keys.proto";
+
+option optimize_for = LITE_RUNTIME;
+
+// =============================================================================
+// DM inner-message wrapper.
+//
+// Every DM body that travels through the Double Ratchet is a serialized
+// `DmPayload`. Today there are two kinds:
+//
+//   text         — a regular chat message
+//   channel_key  — an invite to a SenderKeys group; carries the channel id,
+//                  display name, and the sender's distribution. Receiver
+//                  installs the distribution against the sender's identity
+//                  pubkey (which the receiver already knows because the DM
+//                  itself is from them) and subscribes to the channel.
+//
+// Adding more inner types later is purely additive — bump the oneof.
+// =============================================================================
+message ChannelKeyDistribution {
+    bytes  channel_id   = 1;   // 32 bytes; matches Envelope.channel_group_id
+    string channel_name = 2;   // user-friendly name; receiver uses for UI label
+    SenderKeysDistribution distribution = 3;
+}
+
+// Media call signaling (1:1 voice / video). Carries SDP offers/answers, ICE
+// candidates, an SFrame base key for end-to-end frame encryption (so an SFU
+// or TURN relay sees only ciphertext), and call-state transitions.
+//
+// `call_id` is a 16-byte random nonce that disambiguates concurrent calls
+// between the same pair (and also feeds the SFrame key derivation, so a
+// fresh call gets a fresh frame key even with the same ratchet session).
+//
+// `kind` identifies what `payload` carries:
+//   1 = OFFER     — payload is an SDP offer (UTF-8)
+//   2 = ANSWER    — payload is an SDP answer (UTF-8)
+//   3 = ICE       — payload is a single ICE candidate (UTF-8 JSON: {candidate, sdpMid, sdpMLineIndex})
+//   4 = HANGUP    — payload is empty; receiver tears down the call
+//   5 = SFRAME_KEY — payload is the 32-byte SFrame base key (encrypted within the
+//                    ratchet so only the peer sees it)
+message MediaSignal {
+    bytes  call_id = 1;
+    uint32 kind    = 2;
+    bytes  payload = 3;
+    uint32 epoch   = 4;   // for SFRAME_KEY rotations; ignored otherwise
+}
+
+message DmPayload {
+    oneof body {
+        string                  text         = 1;
+        ChannelKeyDistribution  channel_key  = 2;
+        MediaSignal             media_signal = 3;
+    }
+}

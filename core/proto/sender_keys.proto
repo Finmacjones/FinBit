@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+syntax = "proto3";
+
+package fb.proto;
+
+option optimize_for = LITE_RUNTIME;
+
+// Wire format for a single application message in a SenderKeys group.
+//
+// `index` is the position of this message in the sender's chain (0 = first
+// after distribution). The receiver derives the matching message key by
+// stepping the chain forward `index` times from the seed.
+//
+// `ciphertext` is AES-256-GCM(plaintext, mk, nonce=0, aad = (chain_id ||
+// index || outer_aad)).
+message SenderKeysMessage {
+    bytes  chain_id   = 1;  // 16 bytes random; new value when sender re-keys
+    uint32 index      = 2;
+    bytes  ciphertext = 3;
+}
+
+// Distribution payload sent to each new group member (or after re-keying)
+// over the recipient's pairwise Double Ratchet session. Carries the seed
+// they need to start decrypting our future SenderKeysMessages.
+message SenderKeysDistribution {
+    bytes  chain_id   = 1;  // matches the chain_id in subsequent messages
+    bytes  chain_seed = 2;  // 32 bytes — the initial chain key for this chain
+    uint32 start_index = 3; // 0 for a fresh chain; non-zero when fast-forwarding
+}
