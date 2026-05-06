@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+// =============================================================================
+// Signal Double Ratchet — Phase 0 implementation.
+//
+// Reference: https://signal.org/docs/specifications/doubleratchet/
+//
+// Implemented:
+//   - DH ratchet on every received message with a new peer DH public key
+//   - Symmetric chain ratchet via HMAC-SHA256(ck, 0x01)/HMAC-SHA256(ck, 0x02)
+//   - HKDF-SHA256 root-key step
+//   - AES-256-GCM AEAD with fresh per-message keys (zero nonce is safe because
+//     each key is used at most once)
+//   - Skipped message keys cached up to MAX_SKIP per chain; out-of-order and
+//     reordered delivery work
+//   - Replay rejection (a key is consumed on first successful decrypt)
+//
+// NOT implemented in Phase 0 (deferred):
+//   - Header encryption (HE) variant
+//   - Cross-chain skipped-key migration (only the most recent receive chain's
+//     skipped keys are retained — sufficient for normal Signal-style sessions)
+//   - X3DH initial key agreement (caller supplies a 32-byte shared secret)
+// =============================================================================
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <span>
+#include <vector>
+
+namespace fb::crypto {
+
+class DoubleRatchet {
+public:
+    static constexpr std::size_t kMaxSkip = 1000;
+
+    // Initialize the initiator's side of a fresh session.
+    //   shared_secret : 32 bytes from the prior key agreement (Noise / X3DH).
+    //   peer_dh_pub   : the responder's signed-prekey public X25519 key.
+    [[nodiscard]] static DoubleRatchet init_alice(std::span<const std::uint8_t, 32> shared_secret,
+                                                  std::span<const std::uint8_t, 32> peer_dh_pub);
+
+    // Initialize the responder's side. The responder uses its signed-prekey
+    // X25519 keypair as the initial DHs.
+    [[nodiscard]] static DoubleRatchet init_bob(
+        std::span<const std::uint8_t, 32> shared_secret,
+        std::span<const std::uint8_t, 32> our_dh_keypair_priv,
+        std::span<const std::uint8_t, 32> our_dh_keypair_pub);
+
+    DoubleRatchet(const DoubleRatchet&)            = delete;
+    DoubleRatchet& operator=(const DoubleRatchet&) = delete;
+    DoubleRatchet(DoubleRatchet&&) noexcept;
+    DoubleRatchet& operator=(DoubleRatchet&&) noexcept;
+    ~DoubleRatchet();
+
+    // Serialize-and-encrypt a plaintext message. Returns serialized
+    // RatchetMessage protobuf bytes.
+    [[nodiscard]] std::vector<std::uint8_t> encrypt(std::span<const std::uint8_t> plaintext,
+                                                    std::span<const std::uint8_t> aad);
+
+    // Decrypt a serialized RatchetMessage. Returns plaintext on success;
+    // std::nullopt on tag mismatch / replay / older-than-MAX_SKIP / malformed
+    // header.
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>> decrypt(
+        std::span<const std::uint8_t> ratchet_msg, std::span<const std::uint8_t> aad);
+
+    // PIMPL — full definition lives in ratchet.cpp. Public so internal
+    // helpers in the .cpp can take `State&` without friend declarations;
+    // the type is forward-only here so consumers see no internals.
+    struct State;
+
+private:
+    DoubleRatchet();
+    std::unique_ptr<State> state_;
+};
+
+}  // namespace fb::crypto

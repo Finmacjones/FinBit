@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+syntax = "proto3";
+
+package fb.proto;
+
+option optimize_for = LITE_RUNTIME;
+
+// Per-message Double Ratchet header. Carried inside Envelope.ciphertext after
+// AEAD decryption, OR carried in the clear with the AEAD-protected body — for
+// FinBit Phase 0 we keep the header in the clear to avoid header-encryption
+// complexity (HE variant deferred to Phase 1).
+message RatchetMessage {
+    bytes header_dh_pub = 1;  // 32-byte X25519 public key for current send chain
+    uint32 pn           = 2;  // length of the previous send chain
+    uint32 n            = 3;  // message number in current send chain
+    bytes ciphertext    = 4;  // AES-256-GCM(plaintext, key=mk, nonce=0, aad=header||outer_aad)
+}
+
+// Initial Double Ratchet bootstrap envelope, sent by Alice as the very first
+// message. Bob uses it together with his (consumed) one-time prekey + signed
+// prekey to derive the initial shared secret, then processes the included
+// RatchetMessage.
+message RatchetInit {
+    bytes  alice_identity_pubkey = 1;  // Ed25519 identity (32 bytes)
+    bytes  alice_ephemeral_pubkey = 2; // X25519 ephemeral (32 bytes)
+    uint32 used_one_time_prekey_id = 3; // which OTPK was consumed
+    bytes  signed_prekey_pubkey  = 4;  // copy of Bob's signed prekey at the time
+    RatchetMessage first_message = 5;
+}

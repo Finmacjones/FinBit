@@ -1,0 +1,197 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Release workflow.  Cut a release by pushing a git tag matching v*:
+#
+#   git tag v1.0.2
+#   git push origin v1.0.2
+#
+# That kicks off this workflow, which:
+#   1. builds the full Linux release on ubuntu-24.04
+#   2. runs the test suite (refuse to ship a broken binary)
+#   3. packages fb_server + fb_desktop + fb-cli + docs into
+#      finbit-linux-x86_64-${tag}.tar.gz
+#   4. creates a GitHub Release with the tag, auto-generated notes
+#      from commit history since the previous tag, and the tarball
+#      attached as a downloadable asset
+#
+# The Release shows up under github.com/<owner>/<repo>/releases —
+# anyone visiting the repo can download a working binary without
+# needing the build toolchain.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # required for softprops/action-gh-release to create the Release
+
+jobs:
+  build-and-release:
+    name: build linux release tarball + publish to GitHub Releases
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed for auto-generated notes (diff vs prev tag)
+
+      - name: install build prereqs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential ninja-build pkg-config \
+            libsodium-dev libsqlite3-dev libprotobuf-dev protobuf-compiler \
+            libfmt-dev libspdlog-dev libgtest-dev \
+            libbrotli-dev libssl-dev \
+            qt6-base-dev qt6-base-dev-tools qt6-tools-dev \
+            libgl-dev libxkbcommon-dev libfontconfig1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+
+      - name: configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFB_BUILD_DESKTOP_CLIENT=ON
+
+      - name: build
+        run: cmake --build build -j
+
+      - name: ctest
+        working-directory: build
+        # Refuse to publish a release if any test fails.
+        run: ctest --output-on-failure --schedule-random
+
+      - name: stage release tarball
+        run: |
+          # github.ref_name is the tag string (e.g. "v1.0.1").
+          STAGE=finbit-linux-x86_64-${{ github.ref_name }}
+          mkdir -p $STAGE/bin $STAGE/lib $STAGE/share
+
+          # Refuse to publish a release that's missing the server — every
+          # other binary depends on having a relay to talk to.
+          if [ ! -x build/server/fb_server ]; then
+              echo "::error::fb_server didn't build — refusing to release"
+              exit 1
+          fi
+
+          # Move the real ELF to bin/<name>.bin and ship a wrapper at
+          # bin/<name> that sets LD_LIBRARY_PATH to the bundled libs.
+          # Same approach as ci.yml — makes the tarball portable across
+          # distros (Arch ships libsodium.so.26, Ubuntu 24.04 ships
+          # .so.23; bundling decouples us from host SONAMEs).
+          missing=""
+          for src in build/server/fb_server \
+                     build/client-desktop/fb_desktop \
+                     build/tools/fb-cli/fb-cli; do
+              if [ -x "$src" ]; then
+                  base=$(basename "$src")
+                  cp "$src" $STAGE/bin/$base.bin
+                  cat > $STAGE/bin/$base <<'WRAPPER'
+          #!/bin/sh
+          HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+          LIB="${HERE%/bin}/lib"
+          export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$HERE/$(basename "$0").bin" "$@"
+          WRAPPER
+                  chmod +x $STAGE/bin/$base
+                  echo "  + $base"
+              else
+                  echo "  - $(basename "$src") (not built — skipping)"
+                  missing="$missing $(basename "$src")"
+              fi
+          done
+          if [ -n "$missing" ]; then
+              echo "::warning::Release tarball missing:$missing"
+              echo "Missing binaries:$missing — see the build log." \
+                  > $STAGE/share/MISSING_BINARIES.txt
+          fi
+
+          # Bundle every dynamic dep ldd reports, except glibc / libstdc++
+          # / libgcc_s (those have ABI guarantees within compatible glibc
+          # families and bundling them can break in subtle ways).
+          for src in $STAGE/bin/*.bin; do
+              ldd "$src" 2>/dev/null | awk '/=> \// { print $3 }' | while read lib; do
+                  case "$lib" in
+                      /lib/ld-linux-*|/lib64/ld-linux-*)        continue ;;
+                      */libc.so.*|*/libm.so.*|*/libdl.so.*)     continue ;;
+                      */librt.so.*|*/libpthread.so.*)           continue ;;
+                      */libresolv.so.*|*/libnsl.so.*)           continue ;;
+                      */libstdc++.so.*|*/libgcc_s.so.*)         continue ;;
+                  esac
+                  cp -Ln "$lib" $STAGE/lib/ 2>/dev/null || true
+              done
+          done
+          # Qt6 dlopen()s its platform plugins (xcb, wayland) at runtime.
+          if [ -x $STAGE/bin/fb_desktop.bin ]; then
+              if [ -d /usr/lib/x86_64-linux-gnu/qt6/plugins ]; then
+                  mkdir -p $STAGE/lib/qt6
+                  cp -r /usr/lib/x86_64-linux-gnu/qt6/plugins $STAGE/lib/qt6/
+                  cat > $STAGE/bin/fb_desktop <<'QWRAPPER'
+          #!/bin/sh
+          HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+          LIB="${HERE%/bin}/lib"
+          export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export QT_PLUGIN_PATH="$LIB/qt6/plugins"
+          exec "$HERE/fb_desktop.bin" "$@"
+          QWRAPPER
+                  chmod +x $STAGE/bin/fb_desktop
+              fi
+          fi
+          echo "--- bundled libs ($(ls $STAGE/lib | wc -l) files, $(du -sh $STAGE/lib | cut -f1)) ---"
+          ls $STAGE/lib | head -20
+
+          cp LICENSE README.md CHANGELOG.md docs/ROADMAP.md $STAGE/share/
+          cat > $STAGE/share/RUNTIME_DEPS.md <<'EOF'
+          # FinBit Linux runtime dependencies
+
+          The shipped tarball BUNDLES every dynamic library the binaries
+          link against (libsodium, libprotobuf, libsqlite3, libbrotli*,
+          libssl, libQt6*, libgstreamer*, etc.) under `lib/`, and each
+          binary at `bin/` is a tiny shell wrapper that sets
+          LD_LIBRARY_PATH to the bundled libs before exec'ing the real
+          ELF. So you should NOT need to install anything on a typical
+          modern Linux box (glibc 2.35+).
+
+          Quick start:
+            tar xzf finbit-linux-x86_64*.tar.gz
+            cd finbit-linux-x86_64*/
+            ./bin/fb_server --help
+
+          What's NOT bundled (relies on the host system):
+            * glibc / libstdc++ / libgcc_s     — ABI-stable family compat
+            * the Linux kernel ABI             — fb_server uses epoll
+            * Wayland / X11 server, audio (PulseAudio / PipeWire) and
+              v4l2 (camera) for fb_desktop / voice / video
+
+          On older distros (Ubuntu 22.04, RHEL 8, Debian 11) the binaries
+          MAY work depending on glibc version; if `./bin/fb_server` prints
+          a `GLIBC_2.XX not found` error, the system is too old — build
+          from source instead.
+          EOF
+
+          tar czf finbit-linux-x86_64-${{ github.ref_name }}.tar.gz $STAGE
+          # Print the SHA-256 so users can verify the download.
+          sha256sum finbit-linux-x86_64-${{ github.ref_name }}.tar.gz \
+            | tee finbit-linux-x86_64-${{ github.ref_name }}.tar.gz.sha256
+
+      - name: publish github release
+        uses: softprops/action-gh-release@v2
+        with:
+          # ${{ github.ref_name }} is the tag (e.g. "v1.0.1"); becomes
+          # the release title and the tag name.
+          name: FinBit ${{ github.ref_name }}
+          # Auto-generates a section listing the merged PRs / commits
+          # since the previous tag. If you also write a body in this
+          # field, the auto-notes are appended below it.
+          generate_release_notes: true
+          # v0.x tags (if you ever cut any pre-1.0 fixup tags) are
+          # marked as pre-release; v1.x and later are full releases.
+          prerelease: ${{ startsWith(github.ref_name, 'v0.') }}
+          files: |
+            finbit-linux-x86_64-${{ github.ref_name }}.tar.gz
+            finbit-linux-x86_64-${{ github.ref_name }}.tar.gz.sha256
+          fail_on_unmatched_files: true

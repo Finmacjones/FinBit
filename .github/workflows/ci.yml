@@ -1,0 +1,278 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# CI for FinBit.
+#
+#   native-tests-linux : build + ctest on Ubuntu, ALSO uploads release
+#                        binaries (fb_server, fb_desktop, fb-cli) as
+#                        artifacts on every push to main.
+#   build-windows      : DEFERRED — see comment below. The codebase uses
+#                        epoll / POSIX sockets / termios / ifaddrs etc.
+#                        directly; a Windows build needs a multi-day port.
+#                        Stub job included so the gap is visible in CI.
+#
+# Web smokes need a built WASM module (libsodium-wasm + protoc-cpp +
+# emsdk are several minutes of CI time) and are intentionally excluded
+# here — run them locally.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Required for the "rolling nightly" release update on every push to main.
+# softprops/action-gh-release@v2 uses the default GITHUB_TOKEN; with
+# contents: write it can create / overwrite the `nightly` release.
+permissions:
+  contents: write
+
+jobs:
+  native-tests-linux:
+    name: linux build + tests + artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build prereqs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential ninja-build pkg-config \
+            libsodium-dev libsqlite3-dev libprotobuf-dev protobuf-compiler \
+            libfmt-dev libspdlog-dev libgtest-dev \
+            libbrotli-dev libssl-dev \
+            qt6-base-dev qt6-base-dev-tools qt6-tools-dev \
+            libgl-dev libxkbcommon-dev libfontconfig1-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+
+      - name: configure
+        # FB_BUILD_DESKTOP_CLIENT defaults OFF in the top-level CMakeLists
+        # so the typical "just build the server" case stays minimal — but
+        # CI ships the full release tarball and needs fb_desktop too.
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFB_BUILD_DESKTOP_CLIENT=ON
+
+      - name: build
+        run: cmake --build build -j
+
+      - name: ctest
+        working-directory: build
+        run: ctest --output-on-failure --schedule-random
+
+      # -----------------------------------------------------------------
+      # Bundle the three release binaries into a tarball with the LICENSE
+      # so users can `wget` + extract + run.  Includes the runtime deps
+      # list in the README pointer so they know what to apt install.
+      - name: list built binaries
+        run: |
+          echo "--- binaries produced ---"
+          find build -maxdepth 3 -type f -executable \
+              \( -name 'fb_server' -o -name 'fb_desktop' -o -name 'fb-cli' \) -print
+
+      - name: stage release tarball
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          STAGE=finbit-linux-x86_64
+          mkdir -p $STAGE/bin $STAGE/lib $STAGE/share
+
+          # Copy each binary IF it built. Desktop client may be missing if
+          # Qt6 wasn't found in CI — server + fb-cli still ship and are
+          # usable on their own.
+          missing=""
+          for src in build/server/fb_server \
+                     build/client-desktop/fb_desktop \
+                     build/tools/fb-cli/fb-cli; do
+              if [ -x "$src" ]; then
+                  base=$(basename "$src")
+                  # Move the real ELF to bin/<name>.bin; the wrapper at
+                  # bin/<name> sets LD_LIBRARY_PATH so the bundled libs
+                  # in $STAGE/lib are found before the system's. This is
+                  # what makes the tarball portable across distros — Arch
+                  # has libsodium.so.26, Ubuntu 24.04 ships .so.23, etc.;
+                  # bundling the exact SONAMEs the binary was linked
+                  # against decouples us from the host distro.
+                  cp "$src" $STAGE/bin/$base.bin
+                  cat > $STAGE/bin/$base <<'WRAPPER'
+          #!/bin/sh
+          HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+          LIB="${HERE%/bin}/lib"
+          export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$HERE/$(basename "$0").bin" "$@"
+          WRAPPER
+                  chmod +x $STAGE/bin/$base
+                  echo "  + $base"
+              else
+                  echo "  - $(basename "$src") (not built — skipping)"
+                  missing="$missing $(basename "$src")"
+              fi
+          done
+          if [ ! -x build/server/fb_server ] && [ ! -x build/tools/fb-cli/fb-cli ]; then
+              echo "::error::No binaries built at all — refusing to package empty tarball"
+              exit 1
+          fi
+          if [ -n "$missing" ]; then
+              echo "::warning::Tarball missing binaries:$missing"
+              echo "Missing binaries:$missing — see CI build log for find_package errors." \
+                  > $STAGE/share/MISSING_BINARIES.txt
+          fi
+
+          # Bundle the dynamic libs each binary depends on. ldd lists every
+          # .so the loader needs; we filter to non-system libs (skip glibc /
+          # ld-linux / libstdc++ — those have ABI guarantees within a
+          # compatible glibc family, and bundling them could break in subtle
+          # ways). Everything else (libsodium, libprotobuf, libsqlite3,
+          # libbrotli*, libssl, libQt6*, libgstreamer*, libgst*-plugins-*)
+          # gets copied alongside.
+          for src in $STAGE/bin/*.bin; do
+              ldd "$src" 2>/dev/null | awk '/=> \// { print $3 }' | while read lib; do
+                  case "$lib" in
+                      /lib/ld-linux-*|/lib64/ld-linux-*)        continue ;;
+                      */libc.so.*|*/libm.so.*|*/libdl.so.*)     continue ;;
+                      */librt.so.*|*/libpthread.so.*)           continue ;;
+                      */libresolv.so.*|*/libnsl.so.*)           continue ;;
+                      */libstdc++.so.*|*/libgcc_s.so.*)         continue ;;
+                  esac
+                  # cp -L derefs the symlink so we get the actual SONAME
+                  # file, not a versioned alias chain.
+                  cp -Ln "$lib" $STAGE/lib/ 2>/dev/null || true
+              done
+          done
+          # Qt6 also dlopen()s its platform plugins (xcb, wayland) at runtime
+          # — those aren't in the binary's NEEDED list and ldd won't pick
+          # them up. Bundle the Qt plugin tree so QT_QPA_PLATFORM works.
+          if [ -x $STAGE/bin/fb_desktop.bin ]; then
+              QT_PLUGINS=$(find /usr/lib/x86_64-linux-gnu/qt6/plugins -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1 || true)
+              if [ -n "$QT_PLUGINS" ]; then
+                  mkdir -p $STAGE/lib/qt6
+                  cp -r /usr/lib/x86_64-linux-gnu/qt6/plugins $STAGE/lib/qt6/
+                  # Wrapper for fb_desktop also exports QT_PLUGIN_PATH.
+                  cat > $STAGE/bin/fb_desktop <<'QWRAPPER'
+          #!/bin/sh
+          HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+          LIB="${HERE%/bin}/lib"
+          export LD_LIBRARY_PATH="$LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export QT_PLUGIN_PATH="$LIB/qt6/plugins"
+          exec "$HERE/fb_desktop.bin" "$@"
+          QWRAPPER
+                  chmod +x $STAGE/bin/fb_desktop
+              fi
+          fi
+          echo "--- bundled libs ($(ls $STAGE/lib | wc -l) files, $(du -sh $STAGE/lib | cut -f1)) ---"
+          ls $STAGE/lib | head -20
+
+          cp LICENSE README.md CHANGELOG.md docs/ROADMAP.md $STAGE/share/
+          # Quick "what runtime libs do I need?" hint — almost nothing,
+          # since we now bundle them.
+          cat > $STAGE/share/RUNTIME_DEPS.md <<'EOF'
+          # FinBit Linux runtime dependencies
+
+          The shipped tarball BUNDLES every dynamic library the binaries
+          link against (libsodium, libprotobuf, libsqlite3, libbrotli*,
+          libssl, libQt6*, libgstreamer*, etc.) under `lib/`, and each
+          binary at `bin/` is a tiny shell wrapper that sets
+          LD_LIBRARY_PATH to the bundled libs before exec'ing the real
+          ELF. So you should NOT need to install anything on a typical
+          modern Linux box (glibc 2.35+).
+
+          Quick start:
+            tar xzf finbit-linux-x86_64*.tar.gz
+            cd finbit-linux-x86_64*/
+            ./bin/fb_server --help
+
+          What's NOT bundled (relies on the host system):
+            * glibc itself                      — built against 2.39 on
+                                                  Ubuntu 24.04
+            * libstdc++ / libgcc_s              — same family-compat rule
+            * the Linux kernel ABI              — fb_server uses epoll
+                                                  (Linux ≥ 2.5.45) and
+                                                  modern socket APIs
+            * Wayland / X11 server, audio (PulseAudio / PipeWire) and
+              v4l2 (camera) for fb_desktop / voice / video
+
+          On older distros (Ubuntu 22.04, RHEL 8, Debian 11) the binaries
+          MAY work depending on glibc version; if `./bin/fb_server` prints
+          a `GLIBC_2.XX not found` error, the system is too old — build
+          from source instead.
+          EOF
+          tar czf finbit-linux-x86_64.tar.gz $STAGE
+
+      - name: upload release tarball (CI artifact, 30-day retention)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: finbit-linux-x86_64
+          path: finbit-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+      # -----------------------------------------------------------------
+      # Rolling "nightly" release: every push to main updates a single
+      # release tagged `nightly`, marked as prerelease so it doesn't
+      # replace the project's actual "Latest release" badge (which
+      # belongs to the most recent v* tag built by release.yml).
+      #
+      # softprops/action-gh-release@v2 deletes + re-creates the release
+      # on each run, so users grabbing nightly always get the head-of-
+      # main binaries. Tagged versions (v1.0.1, v1.0.2, ...) live
+      # alongside untouched.
+      - name: stage nightly metadata
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: nightly_meta
+        run: |
+          # Compute a SHA-256 so users can verify the download.
+          sha256sum finbit-linux-x86_64.tar.gz \
+            | tee finbit-linux-x86_64.tar.gz.sha256
+          # Short SHA + commit subject for the release notes body.
+          short_sha=$(git rev-parse --short HEAD)
+          subject=$(git log -1 --pretty=%s)
+          {
+            echo "## Nightly build (head of \`main\`)"
+            echo
+            echo "Built from commit [\`${short_sha}\`](../../commit/${{ github.sha }}) — *${subject}*"
+            echo "Updated automatically on every push to \`main\`."
+            echo
+            echo "**For tagged stable releases (v1.x.x), see the [Releases page](../../releases) — those are full releases, not pre-release.**"
+            echo
+            echo "### Verify the download"
+            echo "\`\`\`"
+            cat finbit-linux-x86_64.tar.gz.sha256
+            echo "\`\`\`"
+          } > NIGHTLY_NOTES.md
+
+      - name: publish / update nightly release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "FinBit nightly (head of main)"
+          body_path: NIGHTLY_NOTES.md
+          prerelease: true        # keeps "Latest" badge on the most recent v* tag
+          # Replace the existing release's assets in place — no asset spam,
+          # always one set of nightly downloads.
+          files: |
+            finbit-linux-x86_64.tar.gz
+            finbit-linux-x86_64.tar.gz.sha256
+          fail_on_unmatched_files: true
+          # Move the `nightly` tag to point at the latest commit on main
+          # so users following the tag always land on head-of-main.
+          target_commitish: ${{ github.sha }}
+
+  # NOTE: no Windows job today.  The codebase calls epoll / sys/socket /
+  # termios / ifaddrs / sigaction / posix_openpt directly (see
+  # core/src/net/io_loop.cpp, core/src/net/tcp.cpp, core/src/mesh/
+  # serial_bridge.cpp, server/src/main.cpp).  A real Windows build needs
+  # a platform abstraction layer:
+  #
+  #   * fb::net::IoLoop          → swap epoll for WSAPoll / IOCP
+  #   * fb::net::Socket          → WinSock2 (WSAStartup, closesocket,
+  #                                GetLastError instead of errno)
+  #   * SerialBridge             → CreateFile + DCB instead of termios
+  #   * external_addresses()     → GetAdaptersAddresses
+  #   * server signal handlers   → SetConsoleCtrlHandler
+  #
+  # Multi-day port; tracked in docs/ROADMAP.md.

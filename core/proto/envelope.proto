@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+syntax = "proto3";
+
+package fb.proto;
+
+import "handshake.proto";
+
+option optimize_for = LITE_RUNTIME;
+
+// =============================================================================
+// Envelope — the only thing the server (or a relaying peer) ever sees.
+// =============================================================================
+//
+// The server cannot decrypt `ciphertext`. It uses the `recipient` oneof to
+// route, persists the envelope for offline delivery, and enforces token-bucket
+// rate limits keyed off `sender_pubkey` (when present). Everything else is
+// opaque.
+//
+// `aad` (additional authenticated data) is the concatenation
+// `envelope_id || timestamp_ms` and is bound by the AEAD tag — a relay cannot
+// rewrite the envelope id or shift its timestamp without invalidating it.
+//
+// `aead_alg` selects the AEAD algorithm. `1 = AES-256-GCM` is the only value
+// shipped in the initial release; the field exists so we can negotiate other
+// ciphers later (e.g. XChaCha20-Poly1305 = 2) without a wire-protocol break.
+//
+// `signature` is an optional Ed25519 signature over `aad || ciphertext` from
+// the sender's long-term identity key. Used when the sender chooses to disclose
+// authorship at the envelope layer (e.g. for public channel posts). For DMs the
+// sender is authenticated via the inner ratchet message and this field is left
+// empty.
+// =============================================================================
+message Envelope {
+    bytes  envelope_id      = 1;   // 16 bytes, cryptographically random
+    uint64 timestamp_ms     = 2;   // ms since Unix epoch
+    bytes  sender_pubkey    = 3;   // Ed25519 pubkey, optional (32 bytes)
+    bytes  ciphertext       = 4;   // AEAD output, opaque to relay
+    bytes  aad              = 5;   // envelope_id || timestamp_ms (BE)
+    uint32 aead_alg         = 6;   // see fb::config::aead_alg::*
+    uint32 protocol_version = 7;   // see fb::config::kProtocolVersion
+    bytes  signature        = 8;   // Ed25519(aad || ciphertext), optional
+
+    oneof recipient {
+        bytes user_pubkey       = 16;  // 32 bytes, for DMs
+        bytes channel_group_id  = 17;  // MLS group ID, for channels
+        bytes broadcast_topic   = 18;  // gossipsub topic, for P2P discovery
+    }
+}
+
+// A batch wrapper used for offline catch-up and store-and-forward delivery.
+message EnvelopeBatch {
+    repeated Envelope envelopes = 1;
+    uint64 high_watermark_ms    = 2;  // newest timestamp in batch
+}
+
+// Server -> sender response when the sender exceeds rate limits or attempts
+// to send to an unreachable recipient. Payload is unencrypted because the
+// server is the issuer.
+message ControlMessage {
+    enum Code {
+        UNKNOWN              = 0;
+        OK                   = 1;
+        RATE_EXCEEDED        = 2;
+        RECIPIENT_UNKNOWN    = 3;
+        PROTOCOL_VERSION_BAD = 4;
+        AUTH_REQUIRED        = 5;
+        SERVER_OVERLOADED    = 6;
+        // The username the client claimed in its ClientHello is already
+        // bound to a different identity public key. Sent right before the
+        // server closes the connection.
+        USERNAME_TAKEN       = 7;
+    }
+
+    Code   code              = 1;
+    string detail            = 2;
+    bytes  in_reply_to_envelope_id = 3;
+    uint64 retry_after_ms    = 4;
+}
+
+// First frame on a fresh connection. Client tells the server who it is so the
+// relay can route incoming envelopes back to the right socket. The server is
+// still blind: it learns a username <-> pubkey association but cannot read
+// any message body.
+message ClientHello {
+    bytes  identity_pubkey = 1;
+    string username        = 2;
+    uint32 protocol_version = 3;
+}
+
+// Server's response to ClientHello. `server_random` is a 32-byte challenge
+// the client must sign with its identity Ed25519 key and return in HelloAck.
+// The connection is not bound to the user pubkey until that signature
+// verifies, so the relay never delivers messages to a connection that
+// hasn't proven control of the claimed key.
+message ServerHello {
+    bool   accepted = 1;
+    string detail   = 2;
+    bytes  server_random = 3;  // 32-byte challenge
+}
+
+// Client's response to ServerHello.
+message HelloAck {
+    bytes signature = 1;       // Ed25519 over server_random
+}
+
+// Reverse-lookup: client knows a sender_pubkey from an inbound envelope and
+// wants to display the registered username (if any). Server returns the
+// most-recent username bound to that pubkey via IdentityClaim. Lookup is
+// best-effort: peers can refuse to register a username, in which case the
+// client renders a fingerprint instead.
+message UsernameLookup {
+    bytes pubkey = 1;          // 32-byte Ed25519 identity pubkey
+}
+message UsernameLookupResponse {
+    bytes  pubkey   = 1;
+    string username = 2;
+    bool   found    = 3;
+}
+
+// Client uploads a prekey bundle to the server's directory so others can
+// initiate Noise_IK / X3DH sessions while the client is offline.
+message KeyBundleUpload {
+    PreKeyBundle bundle = 1;
+}
+
+// Client asks for a peer's most recent prekey bundle.
+//
+// `request_id` is an opaque client-chosen 64-bit nonce echoed back in the
+// response so the client can match concurrent fetches without relying on
+// FIFO ordering. Field is OPTIONAL for backwards compat: clients that
+// don't set it (proto3 default 0) and servers that don't echo it both
+// fall back to the legacy oldest-first matching.
+message KeyBundleFetch {
+    string username   = 1;
+    uint64 request_id = 2;
+}
+
+message KeyBundleFetchResponse {
+    bool         found      = 1;
+    PreKeyBundle bundle     = 2;
+    uint64       request_id = 3;   // echo of KeyBundleFetch.request_id
+}
+
+// Client claims a username (one-time per identity). Persisted by the
+// directory; conflicting claims rejected.
+message RegisterRequest {
+    IdentityClaim claim = 1;
+}
+
+message RegisterResponse {
+    bool   accepted = 1;
+    string detail   = 2;
+}
+
+// Subscribe to a channel/group so the server fans out future Envelopes for
+// that group to this connection. The client is responsible for handing the
+// channel its own SenderKeysDistribution out-of-band (over pairwise DM
+// sessions); the server merely tracks subscriptions.
+message ChannelSubscribe {
+    bytes channel_group_id = 1;  // 32-byte opaque GUID
+}
+
+message ChannelUnsubscribe {
+    bytes channel_group_id = 1;
+}
+
+// Top-level frame on the wire. Client <-> server TCP and peer<->peer
+// libp2p streams both carry these.
+message Frame {
+    oneof body {
+        Envelope                envelope        = 1;
+        EnvelopeBatch           batch           = 2;
+        ControlMessage          control         = 3;
+        ClientHello             hello           = 4;
+        ServerHello             server_hello    = 5;
+        KeyBundleUpload         key_upload      = 6;
+        KeyBundleFetch          key_fetch       = 7;
+        KeyBundleFetchResponse  key_fetch_resp  = 8;
+        RegisterRequest         register_req    = 9;
+        RegisterResponse        register_resp   = 10;
+        ChannelSubscribe        chan_subscribe   = 11;
+        ChannelUnsubscribe      chan_unsubscribe = 12;
+        HelloAck                hello_ack        = 13;
+        UsernameLookup          username_lookup  = 14;
+        UsernameLookupResponse  username_resp    = 15;
+    }
+}

@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+syntax = "proto3";
+
+package fb.proto;
+
+option optimize_for = LITE_RUNTIME;
+
+// Peer identity within the FinBit DHT. node_id = SHA-256(identity_pubkey)
+// truncated to 20 bytes (Kademlia 160-bit address space, matching libp2p
+// PeerIDs).
+message PeerInfo {
+    bytes  node_id = 1;          // 20 bytes
+    string addr    = 2;          // "ip:port" — Phase-0 simplification of multiaddr
+}
+
+message Ping {
+    PeerInfo from = 1;
+    bytes    nonce = 2;
+}
+message Pong {
+    PeerInfo from = 1;
+    bytes    nonce = 2;
+}
+
+// Kademlia FIND_NODE request: "give me up to k peers closest to target".
+message FindNode {
+    PeerInfo from = 1;
+    bytes    target_node_id = 2;
+}
+message FindNodeResponse {
+    PeerInfo from = 1;
+    repeated PeerInfo peers = 2;
+}
+
+// Pub/sub.
+message Subscribe {
+    PeerInfo from  = 1;
+    string   topic = 2;
+}
+message Unsubscribe {
+    PeerInfo from  = 1;
+    string   topic = 2;
+}
+message Publish {
+    PeerInfo from        = 1;
+    string   topic       = 2;
+    bytes    message_id  = 3;   // 16 bytes random
+    bytes    payload     = 4;   // opaque (typically a serialized Envelope)
+    uint32   ttl         = 5;   // hop budget; decremented per relay
+}
+
+// Top-level wrapper.
+message P2PMessage {
+    oneof body {
+        Ping             ping             = 1;
+        Pong             pong             = 2;
+        FindNode         find_node        = 3;
+        FindNodeResponse find_node_resp   = 4;
+        Subscribe        subscribe        = 5;
+        Unsubscribe      unsubscribe      = 6;
+        Publish          publish          = 7;
+    }
+}

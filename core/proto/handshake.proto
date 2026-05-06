@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+syntax = "proto3";
+
+package fb.proto;
+
+option optimize_for = LITE_RUNTIME;
+
+// =============================================================================
+// Noise Protocol Framework messages — Noise_IK pattern.
+//
+// Noise_IK requires the initiator to know the responder's static public key
+// up-front. We retrieve it from the server's key directory (signed by the
+// responder's identity key) before sending the first message.
+//
+// Pattern:
+//     <- s            (responder's static key, fetched out-of-band)
+//     ...
+//     -> e, es, s, ss (NoiseHandshakeInit)
+//     <- e, ee, se    (NoiseHandshakeResponse)
+//
+// After the handshake, both sides have a CipherState pair and switch to the
+// ratchet protocol for ongoing messages.
+// =============================================================================
+
+message NoiseHandshakeInit {
+    bytes ephemeral_pubkey = 1;  // 32 bytes (X25519)
+    bytes encrypted_static = 2;  // initiator's static key, encrypted under es
+    bytes encrypted_payload = 3; // optional: prekey id, ratchet root key seed
+}
+
+message NoiseHandshakeResponse {
+    bytes ephemeral_pubkey  = 1;  // 32 bytes (X25519)
+    bytes encrypted_payload = 2;  // ratchet root key seed, ack
+}
+
+// Pre-key bundle published by each user to the server's key directory.
+// Initiators fetch a bundle before starting a Noise_IK session so they can
+// begin a conversation with offline recipients.
+message PreKeyBundle {
+    bytes  identity_pubkey      = 1;  // Ed25519 long-term key
+    bytes  signed_prekey        = 2;  // X25519 medium-term key
+    bytes  signed_prekey_sig    = 3;  // Ed25519 signature over signed_prekey
+    bytes  one_time_prekey      = 4;  // X25519 one-shot, consumed on use
+    uint32 one_time_prekey_id   = 5;
+    uint64 published_at_ms      = 6;
+}
+
+// User registration / identity claim posted to the server. Server verifies
+// `signature` over `(identity_pubkey || username || timestamp)` and rejects if
+// the username is taken.
+message IdentityClaim {
+    bytes  identity_pubkey  = 1;  // Ed25519
+    string username         = 2;
+    uint64 timestamp_ms     = 3;
+    bytes  signature        = 4;  // Ed25519
+}

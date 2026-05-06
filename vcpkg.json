@@ -1,0 +1,46 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+    "name": "finbit",
+    "version": "0.0.1",
+    "description": "FinBit — E2E encrypted, mesh-bridged, eventually decentralized chat",
+    "builtin-baseline": "f7423ee180c4b7f40d43402c2feb3859161ef625",
+    "dependencies": [
+        "libsodium",
+        "asio",
+        {
+            "name": "protobuf",
+            "version>=": "3.21.12"
+        },
+        "sqlcipher",
+        "sqlite-orm",
+        "nlohmann-json",
+        "spdlog",
+        "fmt",
+        {
+            "name": "gtest",
+            "features": ["bench"]
+        },
+        "benchmark"
+    ],
+    "features": {
+        "server": {
+            "description": "Build the relay server (uWebSockets)",
+            "dependencies": [
+                "openssl",
+                "zlib"
+            ]
+        },
+        "mesh": {
+            "description": "Build mesh bridge (Paho MQTT)",
+            "dependencies": [
+                "paho-mqttpp3"
+            ]
+        },
+        "mls": {
+            "description": "Build with MLS group crypto (mlspp)",
+            "dependencies": [
+                "mlspp"
+            ]
+        }
+    }
+}
