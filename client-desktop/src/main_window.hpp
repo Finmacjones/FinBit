@@ -55,7 +55,8 @@ private slots:
     void onChannelSelectionChanged();
     void onVerifyClicked();
     void appendLog(const QString& s);
-    void appendIncoming(const QString& peer_fp, const QString& text);
+    void appendIncoming(const QString& peer_fp, const QString& peer_username,
+                        const QString& text);
     void appendChannelIncoming(const QString& channel, const QString& sender_fp, const QString& text);
     void onChannelJoined(const QString& channel);
     void onConnected(const QString& my_fp);

@@ -52,6 +52,12 @@ public:
     void join_channel(const QString& name, const QString& dist_file_path);
     void send_to_channel(const QString& name, const QString& text);
 
+    // Create a channel locally — generate own SenderKeys chain + subscribe,
+    // but DON'T write a distribution file or DM any peer. This is the
+    // initial "+" flow in the desktop UI: the user creates the channel,
+    // then optionally invites peers separately via invite_peer_to_channel().
+    void create_local_channel(const QString& name);
+
     // In-band invite: create the channel locally if needed, then DM the
     // current SenderKeysDistribution to `peer` so they can decrypt future
     // channel messages without exchanging a file.
@@ -106,7 +112,12 @@ public:
 signals:
     void connected(QString fingerprint);
     void log(QString line);
-    void messageReceived(QString peerFingerprint, QString text);
+    // Inbound DM. `peerUsername` is the resolved registered username if the
+    // local cache has it (so the UI can file the message under "dm:<user>"
+    // immediately rather than under the fingerprint and migrating later);
+    // empty string means "not yet known — show the fingerprint until
+    // peerUsernameResolved arrives".
+    void messageReceived(QString peerFingerprint, QString peerUsername, QString text);
     void channelMessageReceived(QString channelName, QString senderFingerprint, QString text);
     void channelJoined(QString channelName);
     // Server resolved a sender pubkey to a registered username. Emitted on

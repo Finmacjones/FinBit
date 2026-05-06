@@ -136,7 +136,7 @@ MainWindow::MainWindow(QWidget* parent)
     sidebar_btn_row->setContentsMargins(8, 8, 8, 8);
     sidebar_btn_row->setSpacing(6);
     new_chan_btn_ = new QPushButton("+", channel_panel);
-    new_chan_btn_->setToolTip("New channel + invite first peer (in-band, DM-delivered key)");
+    new_chan_btn_->setToolTip("Create a new channel (use the Invite button to add peers)");
     new_chan_btn_->setEnabled(false);
     new_chan_btn_->setFixedWidth(36);
     invite_btn_ = new QPushButton("Invite", channel_panel);
@@ -633,11 +633,10 @@ void MainWindow::onNewChannelClicked() {
                                                "Channel name:", QLineEdit::Normal,
                                                "general", &ok);
     if (!ok || name.isEmpty()) return;
-    const QString peer = QInputDialog::getText(
-        this, "New channel — first peer to invite",
-        "Username:", QLineEdit::Normal, "", &ok);
-    if (!ok || peer.isEmpty()) return;
-    client_->invite_peer_to_channel(name, peer);
+    // Channel creation no longer also asks for a first peer — that was a
+    // confusing two-step modal and the prekey fetch could hang if the
+    // chosen username wasn't registered. Use the Invite button afterwards.
+    client_->create_local_channel(name);
 }
 
 void MainWindow::onInviteClicked() {
@@ -713,13 +712,18 @@ void MainWindow::appendLog(const QString& s) {
                                    .arg(s));
 }
 
-void MainWindow::appendIncoming(const QString& peer_fp, const QString& text) {
-    // Use a fingerprint-based conv key here AND record it on the sidebar
-    // item via Qt::UserRole so onDmListSelectionChanged can read the same
-    // key back. Previously this filed messages under "dm-pub:<fp>" while
-    // the click handler computed "dm:<text>" — the buffer was orphaned
-    // and the recipient saw nothing in the UI.
-    const QString key = QStringLiteral("dm:") + peer_fp;
+void MainWindow::appendIncoming(const QString& peer_fp, const QString& peer_username,
+                                 const QString& text) {
+    // Prefer the cached username (carried alongside the fp by ChatClient
+    // when the local store already has a name for the sender pubkey) for
+    // the conv key + sidebar label, so the recipient sees "alice" right
+    // away and a reply targets the username rather than the fingerprint.
+    // If the cache misses, fall back to the fp; onPeerUsernameResolved
+    // will migrate the entry once the server-side lookup returns.
+    const bool have_username = !peer_username.isEmpty();
+    const QString display_label = have_username ? peer_username : peer_fp;
+    const QString key = have_username ? ConvKey::dm_user(peer_username)
+                                      : (QStringLiteral("dm:") + peer_fp);
     QListWidgetItem* item = nullptr;
     for (int i = 0; i < dm_list_->count(); ++i) {
         if (dm_list_->item(i)->data(Qt::UserRole).toString() == key) {
@@ -728,10 +732,11 @@ void MainWindow::appendIncoming(const QString& peer_fp, const QString& text) {
         }
     }
     if (!item) {
-        item = sidebar_item(peer_fp, peer_fp, 28, dm_list_);
+        item = sidebar_item(display_label, display_label, 28, dm_list_);
         item->setData(Qt::UserRole, key);
     }
-    appendMessage(key, peer_fp, peer_fp, text, QDateTime::currentMSecsSinceEpoch(),
+    appendMessage(key, display_label, display_label, text,
+                  QDateTime::currentMSecsSinceEpoch(),
                   /*is_self=*/false, /*is_history=*/false);
 }
 

@@ -9,6 +9,7 @@
 
 #include <QMetaObject>
 #include <QString>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -120,7 +121,7 @@ struct PendingSend {
 };
 
 struct PendingChannelOp {
-    enum class Kind { kCreate, kJoin, kSend, kInvite, kLeave };
+    enum class Kind { kCreate, kCreateLocal, kJoin, kSend, kInvite, kLeave };
     Kind        kind;
     std::string channel_name;
     std::string dist_path;   // for create / join
@@ -223,6 +224,12 @@ struct ChatClient::Impl {
     std::deque<PendingSend> queue;
     std::deque<PendingChannelOp> chan_queue;
     std::deque<PendingMediaSignal> media_queue;
+    // FIFO of usernames for which we have an in-flight KeyBundleFetch.
+    // Tracks both DM-send and channel-invite fetches so the response
+    // handler can pop the correct queued op on success/failure (the wire
+    // format predates the request_id field on these clients, so we
+    // disambiguate by send order).
+    std::deque<std::string> pending_fetch_targets;
     bool stop_requested = false;
 
     QString username;
@@ -512,6 +519,23 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             emit errorOccurred(
                                 QString("create channel failed: %1").arg(e.what()));
                         }
+                    } else if (op.kind == PendingChannelOp::Kind::kCreateLocal) {
+                        // Lightweight create: own SenderKeys chain + subscribe,
+                        // but no distribution file and no peer DM. The user
+                        // invites peers separately via the Invite button.
+                        try {
+                            if (cs.own_dist.empty()) {
+                                cs.own_dist = cs.session->create_own_send_chain();
+                            }
+                            subscribe_now();
+                            persist_chan_meta(op.channel_name, cs);
+                            persist_chan_session(op.channel_name, cs);
+                            emit log(QString("created local channel #%1 (no peers yet)")
+                                         .arg(QString::fromStdString(op.channel_name)));
+                        } catch (const std::exception& e) {
+                            emit errorOccurred(
+                                QString("create channel failed: %1").arg(e.what()));
+                        }
                     } else if (op.kind == PendingChannelOp::Kind::kJoin) {
                         try {
                             auto dist_blob = read_file_bytes(op.dist_path);
@@ -640,6 +664,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             emit log(QString("fetching prekey for %1 to deliver invite")
                                          .arg(QString::fromStdString(op.peer)));
                             std::lock_guard lk(impl_->mu);
+                            impl_->pending_fetch_targets.push_back(op.peer);
                             impl_->chan_queue.push_front(std::move(op));
                             break;
                         }
@@ -732,6 +757,30 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                     to_send.swap(impl_->queue);
                 }
                 for (auto& s : to_send) {
+                    // If the target looks like a fingerprint ("XXXXX-XXXXX")
+                    // — which is what the UI puts in the field when the user
+                    // replies to a peer whose username hasn't resolved yet —
+                    // try to find an existing session whose peer_pub matches
+                    // the fingerprint, and rebind this send to that session's
+                    // original key. Without this, key_fetch goes out for the
+                    // fingerprint-as-username, the server returns not-found,
+                    // and the failsafe fires "no such user" even though we
+                    // already have a working ratchet for the actual peer.
+                    if (s.peer.size() == 11 && s.peer[5] == '-' &&
+                        !impl_->sessions.count(s.peer)) {
+                        for (const auto& [name, sess_existing] : impl_->sessions) {
+                            if (!sess_existing.rat) continue;
+                            fb::crypto::PubKey pk{};
+                            std::memcpy(pk.data(), sess_existing.peer_pub.data(), 32);
+                            if (fb::crypto::Identity::fingerprint(pk) == s.peer) {
+                                emit log(QString("rebinding reply: fp %1 -> session '%2'")
+                                             .arg(QString::fromStdString(s.peer))
+                                             .arg(QString::fromStdString(name)));
+                                s.peer = name;
+                                break;
+                            }
+                        }
+                    }
                     auto& sess = impl_->sessions[s.peer];
                     if (!sess.rat) {
                         // Need to fetch peer bundle first.
@@ -743,6 +792,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                         // Re-enqueue; we'll handle the response in the read
                         // loop and re-try.
                         std::lock_guard lk(impl_->mu);
+                        impl_->pending_fetch_targets.push_back(s.peer);
                         impl_->queue.push_front(std::move(s));
                         break;
                     }
@@ -844,43 +894,63 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                         }
                         if (f.body_case() == fb::proto::Frame::kKeyFetchResp) {
                             const auto& r = f.key_fetch_resp();
-                            if (!r.found() || r.bundle().identity_pubkey().size() != 32 ||
-                                r.bundle().signed_prekey().size() != 32) {
-                                // Failsafe — without popping the queued send,
-                                // the worker would re-fire key_fetch every
-                                // 100 ms forever. The send is the front of
-                                // the queue (we re-enqueued it via push_front
-                                // when we sent the lookup); drop it now and
-                                // surface a real error to the UI.
-                                std::string failed_peer;
-                                {
-                                    std::lock_guard lk(impl_->mu);
-                                    if (!impl_->queue.empty()) {
-                                        failed_peer = impl_->queue.front().peer;
-                                        impl_->queue.pop_front();
-                                    }
-                                }
-                                if (!failed_peer.empty()) {
-                                    emit errorOccurred(QString(
-                                        "no such user: '%1' is not registered on "
-                                        "this server (or hasn't connected yet) — "
-                                        "the queued message was dropped")
-                                        .arg(QString::fromStdString(failed_peer)));
-                                } else {
-                                    emit log("key_fetch_resp not-found with empty queue");
-                                }
-                                continue;
-                            }
-                            // Find which queued send this is for: we just
-                            // re-enqueued the front, so the next pending
-                            // send is the one we need to bind.
-                            std::string peer_name;
+                            // Pull the username this fetch was for off the
+                            // FIFO. Both DM-send and channel-invite paths
+                            // record their fetches here, so this works
+                            // whichever path triggered the lookup.
+                            std::string fetched_for;
                             {
                                 std::lock_guard lk(impl_->mu);
-                                if (!impl_->queue.empty()) peer_name = impl_->queue.front().peer;
+                                if (!impl_->pending_fetch_targets.empty()) {
+                                    fetched_for = impl_->pending_fetch_targets.front();
+                                    impl_->pending_fetch_targets.pop_front();
+                                }
                             }
-                            if (peer_name.empty()) continue;
-                            auto& sess = impl_->sessions[peer_name];
+                            if (fetched_for.empty()) {
+                                emit log("key_fetch_resp without an in-flight fetch — "
+                                          "ignoring");
+                                continue;
+                            }
+                            if (!r.found() || r.bundle().identity_pubkey().size() != 32 ||
+                                r.bundle().signed_prekey().size() != 32) {
+                                // Failsafe — drop every queued op (DM or
+                                // invite) targeting this nonexistent peer
+                                // so we don't loop firing key_fetch forever,
+                                // then surface a single error to the UI.
+                                std::size_t dm_dropped = 0, inv_dropped = 0;
+                                {
+                                    std::lock_guard lk(impl_->mu);
+                                    auto qend = std::remove_if(
+                                        impl_->queue.begin(), impl_->queue.end(),
+                                        [&](const PendingSend& s){
+                                            return s.peer == fetched_for;
+                                        });
+                                    dm_dropped = static_cast<std::size_t>(
+                                        std::distance(qend, impl_->queue.end()));
+                                    impl_->queue.erase(qend, impl_->queue.end());
+                                    auto cend = std::remove_if(
+                                        impl_->chan_queue.begin(), impl_->chan_queue.end(),
+                                        [&](const PendingChannelOp& o){
+                                            return o.kind == PendingChannelOp::Kind::kInvite
+                                                && o.peer == fetched_for;
+                                        });
+                                    inv_dropped = static_cast<std::size_t>(
+                                        std::distance(cend, impl_->chan_queue.end()));
+                                    impl_->chan_queue.erase(cend, impl_->chan_queue.end());
+                                }
+                                emit errorOccurred(QString(
+                                    "no such user: '%1' is not registered on "
+                                    "this server (or hasn't connected yet) — "
+                                    "%2 message(s) and %3 invite(s) dropped")
+                                    .arg(QString::fromStdString(fetched_for))
+                                    .arg(dm_dropped).arg(inv_dropped));
+                                continue;
+                            }
+                            // Successful fetch: bind a session keyed by the
+                            // username we asked for. The queue's front entry
+                            // (DM or invite) will pick this session up on
+                            // the next worker pass.
+                            auto& sess = impl_->sessions[fetched_for];
                             std::memcpy(sess.peer_pub.data(),
                                         r.bundle().identity_pubkey().data(), 32);
                             std::memcpy(sess.peer_x.data(), r.bundle().signed_prekey().data(),
@@ -893,7 +963,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                 std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32)));
                             sess.initialized_as_alice = true;
                             emit log(QString("ratchet ready for %1")
-                                         .arg(QString::fromStdString(peer_name)));
+                                         .arg(QString::fromStdString(fetched_for)));
                             // Notify so the queue is re-processed on the
                             // next loop iteration immediately.
                             impl_->cv.notify_all();
@@ -1016,18 +1086,27 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                 emit log("DmPayload parse failed");
                                 continue;
                             }
-                            // Issue a username lookup for unknown senders so
-                            // the UI can render "alice" instead of just the
-                            // fingerprint.
-                            if (impl_->store && !impl_->store->peer_name(
-                                                     std::span<const std::uint8_t>(
-                                                         peer_pub_arr.data(),
-                                                         peer_pub_arr.size()))) {
-                                fb::proto::Frame qf;
-                                qf.mutable_username_lookup()->set_pubkey(
-                                    std::string(env.sender_pubkey().begin(),
-                                                env.sender_pubkey().end()));
-                                blocking_send(*impl_->sock, serialize(qf));
+                            // Resolve sender's registered username from the
+                            // local cache up front; if absent, kick off a
+                            // server-side lookup so the UI rename arrives
+                            // shortly. The cached name (if any) rides along
+                            // on messageReceived so MainWindow can file the
+                            // message under "dm:<username>" immediately and
+                            // skip the fingerprint-shown-then-renamed dance.
+                            QString cached_username;
+                            if (impl_->store) {
+                                auto cached = impl_->store->peer_name(
+                                    std::span<const std::uint8_t>(peer_pub_arr.data(),
+                                                                   peer_pub_arr.size()));
+                                if (cached) {
+                                    cached_username = QString::fromStdString(*cached);
+                                } else {
+                                    fb::proto::Frame qf;
+                                    qf.mutable_username_lookup()->set_pubkey(
+                                        std::string(env.sender_pubkey().begin(),
+                                                    env.sender_pubkey().end()));
+                                    blocking_send(*impl_->sock, serialize(qf));
+                                }
                             }
                             if (payload.body_case() == fb::proto::DmPayload::kText) {
                                 const auto rx_ms = static_cast<std::uint64_t>(
@@ -1047,8 +1126,9 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                                                        raw_text.size()),
                                         rx_ms);
                                 }
-                                emit messageReceived(peer_fp,
-                                                     QString::fromStdString(payload.text()));
+                                emit messageReceived(
+                                    peer_fp, cached_username,
+                                    QString::fromStdString(payload.text()));
                             } else if (payload.body_case() ==
                                        fb::proto::DmPayload::kChannelKey) {
                                 const auto& ck = payload.channel_key();
@@ -1239,6 +1319,15 @@ void ChatClient::send_to_channel(const QString& name, const QString& text) {
         std::lock_guard lk(impl_->mu);
         impl_->chan_queue.push_back({PendingChannelOp::Kind::kSend, name.toStdString(),
                                       {}, text.toStdString(), {}});
+    }
+    impl_->cv.notify_all();
+}
+
+void ChatClient::create_local_channel(const QString& name) {
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->chan_queue.push_back({PendingChannelOp::Kind::kCreateLocal,
+                                      name.toStdString(), {}, {}, {}});
     }
     impl_->cv.notify_all();
 }
