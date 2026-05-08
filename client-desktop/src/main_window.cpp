@@ -221,11 +221,25 @@ MainWindow::MainWindow(QWidget* parent)
     call_banner_->hide();
     auto* cb_l = new QHBoxLayout(call_banner_);
     cb_l->setContentsMargins(12, 6, 12, 6);
+    cb_l->setSpacing(8);
     call_banner_label_ = new QLabel("In call", call_banner_);
     call_banner_label_->setStyleSheet("color: white; font-weight: 600;");
-    hangup_btn_ = new QPushButton("Hang up", call_banner_);
     cb_l->addWidget(call_banner_label_);
+    // Roster panel: a horizontal strip of avatar+name chips, one per
+    // other participant in the room. Built dynamically each time
+    // onChannelCallRoster fires; hidden for 1:1 DM calls.
+    roster_panel_ = new QWidget(call_banner_);
+    roster_panel_->setObjectName("callRoster");
+    auto* rp_l = new QHBoxLayout(roster_panel_);
+    rp_l->setContentsMargins(0, 0, 0, 0);
+    rp_l->setSpacing(6);
+    cb_l->addWidget(roster_panel_);
     cb_l->addStretch(1);
+    mute_btn_ = new QPushButton("Mute", call_banner_);
+    mute_btn_->setCheckable(true);
+    mute_btn_->setToolTip("Mute outbound audio on every active call");
+    cb_l->addWidget(mute_btn_);
+    hangup_btn_ = new QPushButton("Hang up", call_banner_);
     // Remote video preview, embedded in the banner. Hidden until a video
     // frame actually arrives (audio-only calls leave it collapsed).
     remote_video_ = new QLabel(call_banner_);
@@ -239,7 +253,9 @@ MainWindow::MainWindow(QWidget* parent)
         "#callBanner { background: #5865f2; }"
         "#callBanner QPushButton { background: rgba(0,0,0,0.25); color: white;"
         "  border: none; border-radius: 4px; padding: 4px 12px; }"
-        "#callBanner QPushButton:hover { background: rgba(0,0,0,0.45); }");
+        "#callBanner QPushButton:hover { background: rgba(0,0,0,0.45); }"
+        "#callBanner QPushButton:checked { background: rgba(255,80,80,0.7); }"
+        "#callRoster QLabel { color: white; font-size: 11px; }");
     chat_l->addWidget(call_banner_);
 
     // Message list with the rich delegate.
@@ -356,6 +372,8 @@ MainWindow::MainWindow(QWidget* parent)
                      &MainWindow::onCallVideoClicked);
     QObject::connect(hangup_btn_, &QPushButton::clicked, this,
                      &MainWindow::onHangupClicked);
+    QObject::connect(mute_btn_, &QPushButton::toggled, this,
+                     &MainWindow::onMuteToggled);
     QObject::connect(client_.get(), &ChatClient::incomingCall, this,
                      &MainWindow::onIncomingCall);
     QObject::connect(client_.get(), &ChatClient::callStateChanged, this,
@@ -914,19 +932,50 @@ void MainWindow::onChannelCallRoster(const QString& channel,
     if (channel.isEmpty()) return;
     if (active_channel_call_ != channel) return;   // stale event for another room
     QStringList shown = fingerprints;
-    // Drop ourselves from the displayed roster — the banner is for "who
-    // ELSE is in the call".
     shown.removeAll(my_fingerprint_);
-    if (shown.isEmpty()) {
-        call_banner_label_->setText(
-            QString("📞 In #%1 — alone (waiting for others)").arg(channel));
-    } else {
-        call_banner_label_->setText(
-            QString("📞 In #%1 — with: %2").arg(channel, shown.join(", ")));
+    call_banner_label_->setText(
+        shown.isEmpty()
+            ? QString("📞 #%1 — alone").arg(channel)
+            : QString("📞 #%1").arg(channel));
+
+    // Rebuild the roster strip: clear old chips, add one avatar+label
+    // chip per remaining participant. Width caps at the parent's stretch
+    // so the strip can scroll horizontally if a room gets large.
+    if (auto* layout = qobject_cast<QHBoxLayout*>(roster_panel_->layout())) {
+        while (auto* item = layout->takeAt(0)) {
+            if (auto* w = item->widget()) w->deleteLater();
+            delete item;
+        }
+        for (const QString& fp : shown) {
+            auto* chip = new QWidget(roster_panel_);
+            auto* cl = new QHBoxLayout(chip);
+            cl->setContentsMargins(4, 2, 4, 2);
+            cl->setSpacing(4);
+            auto* av = new QLabel(chip);
+            av->setFixedSize(20, 20);
+            av->setPixmap(make_avatar(fp, 20));
+            auto* lbl = new QLabel(fp.left(11), chip);
+            lbl->setStyleSheet("color: white; font-size: 11px;");
+            lbl->setToolTip("Fingerprint: " + fp);
+            cl->addWidget(av);
+            cl->addWidget(lbl);
+            chip->setStyleSheet(
+                "background: rgba(255,255,255,0.12); border-radius: 12px;");
+            layout->addWidget(chip);
+        }
     }
+    roster_panel_->setVisible(!shown.isEmpty());
     call_banner_->show();
     appendLog(QString("channel call roster #%1: %2 other(s)")
                   .arg(channel).arg(shown.size()));
+}
+
+void MainWindow::onMuteToggled() {
+    const bool muted = mute_btn_->isChecked();
+    mute_btn_->setText(muted ? "Un-mute" : "Mute");
+    if (client_) client_->set_self_muted(muted);
+    appendLog(muted ? "self-muted (every active call)"
+                     : "self-un-muted");
 }
 
 void MainWindow::test_create_local_channel(const QString& name) {

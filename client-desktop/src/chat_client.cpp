@@ -284,6 +284,32 @@ struct ChatClient::Impl {
     // re-rosters don't redial existing peers, and departed peers get
     // their MediaCall torn down.
     std::map<std::string /*room_id*/, std::set<std::string /*peer_pub*/>> room_mesh_peers;
+
+    // Lazy session bootstrap for mesh-dial. When the roster surfaces a
+    // peer we've never DM'd, we can't immediately encrypt outbound media
+    // signals — there's no ratchet session for them yet. The worker
+    // queues a username_lookup, then a key_fetch, then re-dispatches
+    // start_call_to_pub on the main thread once sessions[username] is
+    // populated. Cleans up automatically on success or NOT_FOUND.
+    struct PendingMeshDial {
+        std::string room_id;
+        bool        with_video;
+        QString     label;
+    };
+    // Keyed by 32-byte peer pubkey (raw string). Entries created when
+    // mesh-dial sees a new roster member with no session; cleared once
+    // start_call_to_pub is re-dispatched (or the username_lookup /
+    // key_fetch returns NOT_FOUND and we give up).
+    std::map<std::string, PendingMeshDial> pending_mesh_dials;
+    // Reverse mapping: an in-flight username (sent via key_fetch as part
+    // of mesh-bootstrap) → the peer_pub string we're trying to dial.
+    // kKeyFetchResp consults this on success to know whether to retry
+    // a mesh-dial after standing up the session.
+    std::map<std::string, std::string> mesh_bootstrap_pending;
+
+    // Single self-mute flag applied to every active call. Newly-created
+    // MediaCalls inherit it via the same set_self_muted hook.
+    bool self_muted = false;
 };
 
 ChatClient::ChatClient(QObject* parent) : QObject(parent), impl_(std::make_unique<Impl>()) {}
@@ -1013,9 +1039,38 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                 std::memcpy(arr.data(), peer_pub_arr.data(), 32);
                                 const QString fp_label = QString::fromStdString(
                                     fb::crypto::Identity::fingerprint(arr));
-                                to_dial.push_back(peer_pub_arr);
-                                emit log(QString("mesh-dial: room #%1 → %2")
-                                             .arg(chan_name).arg(fp_label));
+                                // Decide here whether we have a usable session
+                                // for this peer or need to bootstrap one. If
+                                // bootstrap, queue the username_lookup right
+                                // now — the response handler will follow
+                                // through with key_fetch and ultimately
+                                // re-dispatch start_call_to_pub.
+                                bool have_session = false;
+                                for (const auto& [_, s] : impl_->sessions) {
+                                    if (s.rat && s.peer_pub == peer_pub_arr) {
+                                        have_session = true;
+                                        break;
+                                    }
+                                }
+                                if (have_session) {
+                                    to_dial.push_back(peer_pub_arr);
+                                    emit log(QString("mesh-dial: room #%1 → %2")
+                                                 .arg(chan_name).arg(fp_label));
+                                } else {
+                                    Impl::PendingMeshDial pd;
+                                    pd.room_id    = room_id_str;
+                                    pd.with_video = false;
+                                    pd.label      = fp_label;
+                                    impl_->pending_mesh_dials[peer_key] = pd;
+                                    fb::proto::Frame qf;
+                                    qf.mutable_username_lookup()->set_pubkey(
+                                        std::string(peer_key.begin(), peer_key.end()));
+                                    blocking_send(*impl_->sock, serialize(qf));
+                                    emit log(QString("mesh-bootstrap: %1 has no "
+                                                      "session yet, resolving "
+                                                      "username for key fetch")
+                                                 .arg(fp_label));
+                                }
                             }
                             // Dispatch dials on the main thread.
                             for (const auto& peer_pub_arr : to_dial) {
@@ -1055,6 +1110,36 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                     QString::fromStdString(
                                         fb::crypto::Identity::fingerprint(arr)),
                                     QString::fromStdString(r.username()));
+                                // Mesh-bootstrap step 2: if we asked who this
+                                // peer is because we want to mesh-dial them,
+                                // follow through with a key_fetch now that we
+                                // have a username. The kKeyFetchResp success
+                                // path will retry start_call_to_pub once the
+                                // session is up.
+                                const std::string peer_pub_str(r.pubkey().begin(),
+                                                                r.pubkey().end());
+                                if (impl_->pending_mesh_dials.count(peer_pub_str)) {
+                                    fb::proto::Frame kf;
+                                    kf.mutable_key_fetch()->set_username(r.username());
+                                    blocking_send(*impl_->sock, serialize(kf));
+                                    impl_->pending_fetch_targets.push_back(r.username());
+                                    impl_->mesh_bootstrap_pending[r.username()] =
+                                        peer_pub_str;
+                                    emit log(QString("mesh-bootstrap: fetching "
+                                                      "prekey for %1")
+                                                 .arg(QString::fromStdString(
+                                                     r.username())));
+                                }
+                            } else if (r.pubkey().size() == 32) {
+                                // username_lookup returned NOT_FOUND for a
+                                // peer we wanted to dial. Drop the pending
+                                // bootstrap so we don't leak state.
+                                const std::string peer_pub_str(r.pubkey().begin(),
+                                                                r.pubkey().end());
+                                if (impl_->pending_mesh_dials.erase(peer_pub_str)) {
+                                    emit log("mesh-bootstrap: server doesn't "
+                                              "know this peer — giving up");
+                                }
                             }
                             continue;
                         }
@@ -1110,6 +1195,14 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                     "%2 message(s) and %3 invite(s) dropped")
                                     .arg(QString::fromStdString(fetched_for))
                                     .arg(dm_dropped).arg(inv_dropped));
+                                // Mesh-bootstrap cleanup: if this failed
+                                // fetch was a mesh-dial bootstrap, drop the
+                                // pending dial state so we don't leak it.
+                                auto bit = impl_->mesh_bootstrap_pending.find(fetched_for);
+                                if (bit != impl_->mesh_bootstrap_pending.end()) {
+                                    impl_->pending_mesh_dials.erase(bit->second);
+                                    impl_->mesh_bootstrap_pending.erase(bit);
+                                }
                                 continue;
                             }
                             // Successful fetch: bind a session keyed by the
@@ -1130,6 +1223,35 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             sess.initialized_as_alice = true;
                             emit log(QString("ratchet ready for %1")
                                          .arg(QString::fromStdString(fetched_for)));
+                            // Mesh-bootstrap step 3: if this fetch was for a
+                            // mesh-dial we deferred, the session is now ready
+                            // — retry start_call_to_pub on the main thread
+                            // so the call actually fires. Without this the
+                            // call slot in calls_by_peer never gets created
+                            // even though the ratchet exists.
+                            auto bit = impl_->mesh_bootstrap_pending.find(fetched_for);
+                            if (bit != impl_->mesh_bootstrap_pending.end()) {
+                                const std::string peer_pub_str = bit->second;
+                                impl_->mesh_bootstrap_pending.erase(bit);
+                                auto dit = impl_->pending_mesh_dials.find(peer_pub_str);
+                                if (dit != impl_->pending_mesh_dials.end()) {
+                                    std::array<std::uint8_t, 32> peer_pub_arr{};
+                                    std::memcpy(peer_pub_arr.data(),
+                                                peer_pub_str.data(), 32);
+                                    QString label = dit->second.label;
+                                    bool with_video = dit->second.with_video;
+                                    std::string room_id = dit->second.room_id;
+                                    impl_->pending_mesh_dials.erase(dit);
+                                    emit log(QString("mesh-bootstrap: session ready, "
+                                                      "retrying dial to %1").arg(label));
+                                    QMetaObject::invokeMethod(this,
+                                        [this, peer_pub_arr, label, with_video,
+                                         room_id]() {
+                                            start_call_to_pub(peer_pub_arr, label,
+                                                              with_video, room_id);
+                                        }, Qt::QueuedConnection);
+                                }
+                            }
                             // Notify so the queue is re-processed on the
                             // next loop iteration immediately.
                             impl_->cv.notify_all();
@@ -1518,6 +1640,9 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                                           "channel call)");
                                                 call->accept_incoming(
                                                     /*with_video=*/false);
+                                                if (impl_->self_muted) {
+                                                    call->set_self_muted(true);
+                                                }
                                                 return;
                                             }
                                             // 1:1 DM call — surface the modal
@@ -1656,6 +1781,15 @@ void ChatClient::leave_channel_call(const QString& channel_name) {
     impl_->cv.notify_all();
 }
 
+void ChatClient::set_self_muted(bool muted) {
+    impl_->self_muted = muted;
+    for (auto& [_, entry] : impl_->calls_by_peer) {
+        if (entry.call) entry.call->set_self_muted(muted);
+    }
+}
+
+bool ChatClient::self_muted() const { return impl_->self_muted; }
+
 void ChatClient::leave_channel(const QString& channel_name) {
     {
         std::lock_guard lk(impl_->mu);
@@ -1779,6 +1913,10 @@ bool ChatClient::start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub_
         &ChatClient::remoteVideoFrame);
 
     call->start_outgoing(peer_pub_arr, with_video);
+    // Newly-built pipeline starts un-muted; honour the per-client toggle
+    // so a user who muted before joining a channel call stays silent on
+    // the new mesh leg too.
+    if (impl_->self_muted) call->set_self_muted(true);
     return true;
 }
 

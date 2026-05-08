@@ -87,6 +87,12 @@ public:
     void join_channel_call(const QString& channel_name, bool with_video);
     void leave_channel_call(const QString& channel_name);
 
+    // Mute / un-mute outbound audio on every active call. Affects both
+    // 1:1 calls and every mesh leg simultaneously — the user clicking
+    // Mute in the chat banner expects to be silent to ALL peers.
+    void set_self_muted(bool muted);
+    [[nodiscard]] bool self_muted() const;
+
     // Stop the worker and release sockets. Blocks until the thread exits.
     void disconnect();
 

@@ -74,6 +74,11 @@ public:
     void receive_answer(const QByteArray& sdp);
     void receive_ice(const QByteArray& candidate_json);
 
+    // Toggle outbound audio mute. Flips the `mute` property on the
+    // pipeline's volume element; the peer receives silence (or zero RTP)
+    // until we un-mute. No-op if the pipeline isn't built yet.
+    void set_self_muted(bool muted);
+
     // End the call. Sends HANGUP to the peer unless `silent` (used when
     // the peer hung up first).
     void hangup(bool silent = false);

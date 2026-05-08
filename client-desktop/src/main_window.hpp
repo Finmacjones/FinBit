@@ -73,6 +73,7 @@ private slots:
     void onError(const QString& detail);
     void onPeerUsernameResolved(const QString& peer_fingerprint, const QString& username);
     void onChannelCallRoster(const QString& channel, const QStringList& fingerprints);
+    void onMuteToggled();
     void onToggleLog();
 
 private:
@@ -117,6 +118,11 @@ private:
     QLabel*      call_banner_label_ = nullptr;
     QLabel*      remote_video_     = nullptr;   // QImage frames painted here
     QPushButton* hangup_btn_       = nullptr;
+    // Channel-call extras: a horizontal strip of avatar+label chips for
+    // every other participant, plus a self-mute toggle. Hidden along with
+    // the banner when no call is active.
+    QWidget*     roster_panel_     = nullptr;
+    QPushButton* mute_btn_         = nullptr;
 
     // Compose row.
     QLineEdit*      target_edit_ = nullptr;

@@ -112,8 +112,12 @@ GstElement* build_pipeline(bool add_video, GstElement** out_webrtc, QString* err
     // element. Use an explicit capsfilter instead; semantically identical
     // and immune to the parser's bin-end edge case.
     {
+        // The named `mute_volume` element lets MediaCall::set_self_muted
+        // toggle outbound audio without ripping the pipeline down. Other
+        // participants stop hearing us instantly; flip back and we resume.
         const gchar* desc =
             "pulsesrc ! audioconvert ! audioresample ! "
+            "volume name=mute_volume mute=false ! "
             "queue ! opusenc ! rtpopuspay pt=96 ! "
             "capsfilter caps=application/x-rtp,media=(string)audio,"
             "encoding-name=(string)OPUS,payload=(int)96";
@@ -856,6 +860,15 @@ void MediaCall::receive_ice(const QByteArray& candidate_json) {
     if (cand.isEmpty()) return;
     g_signal_emit_by_name(impl_->webrtc, "add-ice-candidate",
                           mline, cand.toUtf8().constData());
+}
+
+void MediaCall::set_self_muted(bool muted) {
+    if (!impl_->pipeline) return;
+    GstElement* vol = gst_bin_get_by_name(GST_BIN(impl_->pipeline), "mute_volume");
+    if (!vol) return;
+    g_object_set(vol, "mute", muted ? TRUE : FALSE, nullptr);
+    gst_object_unref(vol);
+    emit log(muted ? "outbound audio muted" : "outbound audio un-muted");
 }
 
 void MediaCall::hangup(bool silent) {
