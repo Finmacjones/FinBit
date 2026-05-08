@@ -1700,6 +1700,23 @@ bool ChatClient::start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub_
     if (impl_->calls_by_peer.count(peer_key)) {
         return false;   // already calling this peer
     }
+    // Verify a ratchet session for this peer exists — without one the
+    // worker's media-queue drain has nothing to encrypt outbound media
+    // signals against and they get silently dropped. Lazy session
+    // bootstrap (username_lookup → key_fetch → init_alice on first
+    // mesh-dial) is a planned follow-up; for now require the user to
+    // have exchanged at least one DM with the peer, which is the common
+    // case if they're already in a shared channel.
+    bool have_session = false;
+    for (const auto& [_, s] : impl_->sessions) {
+        if (s.rat && s.peer_pub == peer_pub_arr) { have_session = true; break; }
+    }
+    if (!have_session) {
+        emit log(QString("start_call_to_pub: skipping %1 — no ratchet session "
+                          "(send a DM first to bootstrap; lazy auto-bootstrap "
+                          "is on the roadmap)").arg(display_label));
+        return false;
+    }
     auto* call = new MediaCall(this);
     Impl::CallEntry entry;
     entry.call    = call;
