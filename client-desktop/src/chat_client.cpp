@@ -341,16 +341,13 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
             impl_->store = fb::store::SqliteStore::open(impl_->store_path);
 
             impl_->identity = fb::crypto::Identity::from_seed(impl_->seed);
-            // Best-effort: persist the pub/secret rows so legacy code paths
-            // (older builds) keep working. Defensive — the LoginDialog seed
-            // is the source of truth going forward.
-            const auto& pub = impl_->identity->public_key();
-            const auto sec = impl_->identity->secret_key();
-            impl_->store->save_identity(
-                std::span<const std::uint8_t>(pub.data(), pub.size()),
-                std::span<const std::uint8_t>(sec.data(), sec.size()),
-                impl_->username.toStdString());
-            // Wipe the in-memory copy of the raw seed once Identity owns it.
+            // We intentionally no longer call save_identity() — it was a
+            // legacy path that wrote the secret key into the SQLite store
+            // in cleartext. Now that LoginDialog + identity_vault are the
+            // source of truth, that on-disk copy was redundant *and* the
+            // single biggest at-rest secret leak (see
+            // docs/security-audit.md). Wipe the in-memory raw seed once
+            // Identity::from_seed has copied it into mlock'd memory.
             sodium_memzero(impl_->seed.data(), impl_->seed.size());
             emit log(QString("identity unlocked from vault, store=%1")
                          .arg(QString::fromStdString(impl_->store_path)));
