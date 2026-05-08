@@ -106,11 +106,17 @@ GstElement* build_pipeline(bool add_video, GstElement** out_webrtc, QString* err
     gst_bin_add(GST_BIN(pipe), webrtc);
 
     // ---- audio branch -------------------------------------------------
+    // Trailing-caps shorthand ("rtpopuspay ! application/x-rtp,...") used to
+    // work but now trips the parser on GStreamer 1.28+ ("no element
+    // 'application'") — the parser tries to instantiate `application` as an
+    // element. Use an explicit capsfilter instead; semantically identical
+    // and immune to the parser's bin-end edge case.
     {
         const gchar* desc =
             "pulsesrc ! audioconvert ! audioresample ! "
             "queue ! opusenc ! rtpopuspay pt=96 ! "
-            "application/x-rtp,media=audio,encoding-name=OPUS,payload=96";
+            "capsfilter caps=application/x-rtp,media=(string)audio,"
+            "encoding-name=(string)OPUS,payload=(int)96";
         GError* gerr = nullptr;
         GstElement* abin = gst_parse_bin_from_description(desc, TRUE, &gerr);
         if (!abin) {
@@ -135,7 +141,8 @@ GstElement* build_pipeline(bool add_video, GstElement** out_webrtc, QString* err
             "v4l2src ! videoconvert ! videoscale ! "
             "video/x-raw,width=640,height=360,framerate=30/1 ! "
             "queue ! vp8enc deadline=1 cpu-used=4 ! rtpvp8pay pt=97 ! "
-            "application/x-rtp,media=video,encoding-name=VP8,payload=97";
+            "capsfilter caps=application/x-rtp,media=(string)video,"
+            "encoding-name=(string)VP8,payload=(int)97";
         GError* gerr = nullptr;
         GstElement* vbin = gst_parse_bin_from_description(desc, TRUE, &gerr);
         if (!vbin) {
@@ -146,7 +153,8 @@ GstElement* build_pipeline(bool add_video, GstElement** out_webrtc, QString* err
                 "videotestsrc is-live=true pattern=ball ! "
                 "video/x-raw,width=640,height=360,framerate=30/1 ! "
                 "videoconvert ! queue ! vp8enc deadline=1 cpu-used=4 ! rtpvp8pay pt=97 ! "
-                "application/x-rtp,media=video,encoding-name=VP8,payload=97";
+                "capsfilter caps=application/x-rtp,media=(string)video,"
+                "encoding-name=(string)VP8,payload=(int)97";
             vbin = gst_parse_bin_from_description(fb, TRUE, nullptr);
         }
         if (vbin) {
@@ -245,6 +253,7 @@ void post_to_qt(QObject* obj, std::function<void()> fn) {
 
 void on_negotiation_needed(GstElement* webrtc, gpointer user) {
     auto* call = static_cast<MediaCall*>(user);
+    post_to_qt(call, [call]() { emit call->log("negotiation-needed: creating OFFER"); });
     GstPromise* promise = gst_promise_new_with_change_func(
         [](GstPromise* p, gpointer u) {
             auto* call_ = static_cast<MediaCall*>(u);
@@ -253,11 +262,16 @@ void on_negotiation_needed(GstElement* webrtc, gpointer user) {
             gst_structure_get(reply, "offer",
                               GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, nullptr);
             gst_promise_unref(p);
-            if (!offer) return;
+            if (!offer) {
+                post_to_qt(call_, [call_]() {
+                    emit call_->log("create-offer reply had no 'offer' field");
+                });
+                return;
+            }
 
             // Set local description and serialise SDP to send to peer.
             GstPromise* set_p = gst_promise_new();
-            g_signal_emit_by_name(GST_ELEMENT(g_object_get_data(G_OBJECT(call_), "webrtc")),
+            g_signal_emit_by_name(GST_ELEMENT(call_->_webrtc_raw()),
                                   "set-local-description", offer, set_p);
             gst_promise_interrupt(set_p);
             gst_promise_unref(set_p);
@@ -267,7 +281,9 @@ void on_negotiation_needed(GstElement* webrtc, gpointer user) {
             g_free(sdp_str);
             gst_webrtc_session_description_free(offer);
 
-            post_to_qt(call_, [call_, sdp_bytes]() {
+            const int sdp_len = sdp_bytes.size();
+            post_to_qt(call_, [call_, sdp_bytes, sdp_len]() {
+                emit call_->log(QString("OFFER created (%1 bytes), sending").arg(sdp_len));
                 emit call_->sendSignal(static_cast<int>(MediaCall::SignalKind::kOffer), sdp_bytes);
             });
         }, call, nullptr);
@@ -525,14 +541,74 @@ void on_pad_added(GstElement* webrtc, GstPad* new_pad, gpointer user) {
     gst_object_unref(sink_pad);
 }
 
+// Fires every time webrtcbin's `connection-state` property changes — that's
+// the WebRTC PeerConnectionState aggregate over ICE + DTLS-SRTP. Values
+// match GstWebRTCPeerConnectionState (new=0, connecting=1, connected=2,
+// disconnected=3, failed=4, closed=5). Without this listener the UI banner
+// stays "connecting" forever even though media flows fine — set_state()
+// to kLive is gated on this signal.
+void on_connection_state_changed(GstElement* webrtc, GParamSpec* /*pspec*/,
+                                  gpointer user) {
+    auto* call = static_cast<MediaCall*>(user);
+    gint state_int = 0;
+    g_object_get(webrtc, "connection-state", &state_int, nullptr);
+    post_to_qt(call, [call, state_int]() {
+        call->_on_connection_state(state_int);
+    });
+}
+
+void on_ice_gathering_state_changed(GstElement* webrtc, GParamSpec* /*pspec*/,
+                                     gpointer user) {
+    auto* call = static_cast<MediaCall*>(user);
+    gint state_int = 0;
+    g_object_get(webrtc, "ice-gathering-state", &state_int, nullptr);
+    static const char* names[] = { "new", "gathering", "complete" };
+    const char* name = (state_int >= 0 && state_int < 3) ? names[state_int] : "?";
+    post_to_qt(call, [call, name]() {
+        emit call->log(QString("ice-gathering-state: %1").arg(name));
+    });
+}
+
+void on_ice_connection_state_changed(GstElement* webrtc, GParamSpec* /*pspec*/,
+                                      gpointer user) {
+    auto* call = static_cast<MediaCall*>(user);
+    gint state_int = 0;
+    g_object_get(webrtc, "ice-connection-state", &state_int, nullptr);
+    static const char* names[] = {
+        "new", "checking", "connected", "completed",
+        "failed", "disconnected", "closed"
+    };
+    const char* name = (state_int >= 0 && state_int < 7) ? names[state_int] : "?";
+    post_to_qt(call, [call, name]() {
+        emit call->log(QString("ice-connection-state: %1").arg(name));
+    });
+}
+
+void on_signaling_state_changed(GstElement* webrtc, GParamSpec* /*pspec*/,
+                                 gpointer user) {
+    auto* call = static_cast<MediaCall*>(user);
+    gint state_int = 0;
+    g_object_get(webrtc, "signaling-state", &state_int, nullptr);
+    post_to_qt(call, [call, state_int]() {
+        emit call->log(QString("signaling-state: %1").arg(state_int));
+    });
+}
+
 void on_ice_candidate(GstElement* /*webrtc*/, guint mline, gchar* candidate, gpointer user) {
     auto* call = static_cast<MediaCall*>(user);
+    QString cand_qs = QString::fromUtf8(candidate);
     QJsonObject obj;
-    obj["candidate"] = QString::fromUtf8(candidate);
+    obj["candidate"] = cand_qs;
     obj["sdpMid"] = QString::number(mline);          // best-effort
     obj["sdpMLineIndex"] = static_cast<int>(mline);
     QByteArray payload = QJsonDocument(obj).toJson(QJsonDocument::Compact);
-    post_to_qt(call, [call, payload]() {
+    // Truncate the candidate string for logging — full SDP candidate
+    // strings are noisy (host:port + foundation + priority + raddr).
+    const QString cand_short = cand_qs.left(60) +
+        (cand_qs.size() > 60 ? "…" : "");
+    post_to_qt(call, [call, payload, cand_short, mline]() {
+        emit call->log(QString("local ICE candidate (mline=%1): %2")
+                           .arg(mline).arg(cand_short));
         emit call->sendSignal(static_cast<int>(MediaCall::SignalKind::kIce), payload);
     });
 }
@@ -544,7 +620,19 @@ gboolean on_bus_message(GstBus*, GstMessage* msg, gpointer user) {
             GError* err = nullptr;
             gchar* dbg = nullptr;
             gst_message_parse_error(msg, &err, &dbg);
-            QString s = QString("gst error: %1").arg(err ? err->message : "?");
+            QString s = QString("gst error: %1 (dbg=%2)")
+                            .arg(err ? err->message : "?")
+                            .arg(dbg ? dbg : "");
+            if (err) g_error_free(err);
+            g_free(dbg);
+            post_to_qt(call, [call, s]() { emit call->log(s); });
+            break;
+        }
+        case GST_MESSAGE_WARNING: {
+            GError* err = nullptr;
+            gchar* dbg = nullptr;
+            gst_message_parse_warning(msg, &err, &dbg);
+            QString s = QString("gst warn: %1").arg(err ? err->message : "?");
             if (err) g_error_free(err);
             g_free(dbg);
             post_to_qt(call, [call, s]() { emit call->log(s); });
@@ -553,9 +641,35 @@ gboolean on_bus_message(GstBus*, GstMessage* msg, gpointer user) {
         case GST_MESSAGE_EOS:
             post_to_qt(call, [call]() { call->hangup(); });
             break;
-        case GST_MESSAGE_STATE_CHANGED:
-            // Fires for every element; ignore unless from the pipeline.
+        case GST_MESSAGE_STATE_CHANGED: {
+            // Only log pipeline-level transitions — every element transition
+            // would be noise.
+            if (GST_MESSAGE_SRC(msg) &&
+                std::strcmp(GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)), "call-pipeline") == 0) {
+                GstState old_st, new_st, pend_st;
+                gst_message_parse_state_changed(msg, &old_st, &new_st, &pend_st);
+                QString s = QString("pipeline state: %1 -> %2")
+                                .arg(gst_element_state_get_name(old_st))
+                                .arg(gst_element_state_get_name(new_st));
+                post_to_qt(call, [call, s]() { emit call->log(s); });
+            }
             break;
+        }
+        case GST_MESSAGE_LATENCY:
+            // Quiet — fired on every join.
+            break;
+        case GST_MESSAGE_ELEMENT: {
+            // webrtcbin posts custom messages here — surface their structure
+            // names so we can tell what's flowing internally even if no
+            // notify signal fires.
+            const GstStructure* s = gst_message_get_structure(msg);
+            const gchar* sname = s ? gst_structure_get_name(s) : nullptr;
+            if (sname) {
+                QString line = QString("gst element-msg: %1").arg(sname);
+                post_to_qt(call, [call, line]() { emit call->log(line); });
+            }
+            break;
+        }
         default: break;
     }
     return TRUE;
@@ -579,13 +693,23 @@ void MediaCall::start_outgoing(const std::array<std::uint8_t, 32>& peer_pub,
         set_state(State::kClosed);
         return;
     }
-    g_object_set_data(G_OBJECT(this), "webrtc", impl_->webrtc);
+    // (Stale workaround removed: g_object_set_data on `this` is invalid —
+    // this is a QObject not a GObject. Lambdas now retrieve webrtc via
+    // MediaCall::_webrtc_raw().)
     g_signal_connect(impl_->webrtc, "on-negotiation-needed",
                      G_CALLBACK(on_negotiation_needed), this);
     g_signal_connect(impl_->webrtc, "on-ice-candidate",
                      G_CALLBACK(on_ice_candidate), this);
     g_signal_connect(impl_->webrtc, "pad-added",
                      G_CALLBACK(on_pad_added), this);
+    g_signal_connect(impl_->webrtc, "notify::connection-state",
+                     G_CALLBACK(on_connection_state_changed), this);
+    g_signal_connect(impl_->webrtc, "notify::ice-gathering-state",
+                     G_CALLBACK(on_ice_gathering_state_changed), this);
+    g_signal_connect(impl_->webrtc, "notify::ice-connection-state",
+                     G_CALLBACK(on_ice_connection_state_changed), this);
+    g_signal_connect(impl_->webrtc, "notify::signaling-state",
+                     G_CALLBACK(on_signaling_state_changed), this);
 
     impl_->bus       = gst_element_get_bus(impl_->pipeline);
     impl_->bus_watch = gst_bus_add_watch(impl_->bus, on_bus_message, this);
@@ -598,6 +722,8 @@ void MediaCall::start_outgoing(const std::array<std::uint8_t, 32>& peer_pub,
 void MediaCall::accept_incoming(bool with_video) {
     if (state_ != State::kRinging || is_caller_) return;
     with_video_ = with_video;
+    emit log(QString("accept_incoming(video=%1) — building callee pipeline")
+                 .arg(with_video ? "yes" : "no"));
 
     QString err;
     impl_->pipeline = build_pipeline(with_video, &impl_->webrtc, &err);
@@ -606,11 +732,19 @@ void MediaCall::accept_incoming(bool with_video) {
         set_state(State::kClosed);
         return;
     }
-    g_object_set_data(G_OBJECT(this), "webrtc", impl_->webrtc);
+    // (Stale workaround removed: see start_outgoing.)
     g_signal_connect(impl_->webrtc, "on-ice-candidate",
                      G_CALLBACK(on_ice_candidate), this);
     g_signal_connect(impl_->webrtc, "pad-added",
                      G_CALLBACK(on_pad_added), this);
+    g_signal_connect(impl_->webrtc, "notify::connection-state",
+                     G_CALLBACK(on_connection_state_changed), this);
+    g_signal_connect(impl_->webrtc, "notify::ice-gathering-state",
+                     G_CALLBACK(on_ice_gathering_state_changed), this);
+    g_signal_connect(impl_->webrtc, "notify::ice-connection-state",
+                     G_CALLBACK(on_ice_connection_state_changed), this);
+    g_signal_connect(impl_->webrtc, "notify::signaling-state",
+                     G_CALLBACK(on_signaling_state_changed), this);
 
     impl_->bus       = gst_element_get_bus(impl_->pipeline);
     impl_->bus_watch = gst_bus_add_watch(impl_->bus, on_bus_message, this);
@@ -649,8 +783,7 @@ void MediaCall::accept_incoming(bool with_video) {
                               GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &answer, nullptr);
             gst_promise_unref(prom);
             if (!answer) return;
-            GstElement* webrtc = static_cast<GstElement*>(
-                g_object_get_data(G_OBJECT(self), "webrtc"));
+            GstElement* webrtc = static_cast<GstElement*>(self->_webrtc_raw());
             GstPromise* sl = gst_promise_new();
             g_signal_emit_by_name(webrtc, "set-local-description", answer, sl);
             gst_promise_interrupt(sl);
@@ -671,11 +804,18 @@ void MediaCall::accept_incoming(bool with_video) {
 
 void MediaCall::receive_offer(const QByteArray& sdp) {
     pending_offer_ = sdp;
+    emit log(QString("OFFER received (%1 bytes); waiting for accept_incoming")
+                 .arg(sdp.size()));
     set_state(State::kRinging);
 }
 
 void MediaCall::receive_answer(const QByteArray& sdp) {
-    if (!impl_->webrtc) return;
+    if (!impl_->webrtc) {
+        emit log("ANSWER arrived but no pipeline yet — dropped");
+        return;
+    }
+    emit log(QString("ANSWER received (%1 bytes); applying remote description")
+                 .arg(sdp.size()));
     GstSDPMessage* sdp_msg = nullptr;
     if (gst_sdp_message_new_from_text(sdp.constData(), &sdp_msg) != GST_SDP_OK) {
         emit log("could not parse ANSWER SDP");
@@ -690,6 +830,10 @@ void MediaCall::receive_answer(const QByteArray& sdp) {
     gst_webrtc_session_description_free(answer);
 
     // Drain buffered ICE now that the remote description is set.
+    if (!pending_ice_.empty()) {
+        emit log(QString("draining %1 buffered ICE candidate(s)")
+                     .arg(pending_ice_.size()));
+    }
     for (const QByteArray& cand_json : pending_ice_) {
         receive_ice(cand_json);
     }
@@ -734,6 +878,28 @@ void MediaCall::set_state(State s) {
     if (state_ == s) return;
     state_ = s;
     emit stateChanged(s);
+}
+
+void* MediaCall::_webrtc_raw() const { return impl_->webrtc; }
+
+void MediaCall::_on_connection_state(int gst_state) {
+    // GstWebRTCPeerConnectionState: new=0, connecting=1, connected=2,
+    // disconnected=3, failed=4, closed=5.
+    if (state_ == State::kClosed) return;
+    switch (gst_state) {
+        case 2:                       // connected
+            emit log("webrtc connection-state: connected");
+            set_state(State::kLive);
+            break;
+        case 4:                       // failed
+            emit log("webrtc connection-state: failed");
+            hangup(/*silent=*/false);
+            break;
+        case 3:                       // disconnected — could recover; log only
+            emit log("webrtc connection-state: disconnected");
+            break;
+        default: break;
+    }
 }
 
 }  // namespace fb::desktop

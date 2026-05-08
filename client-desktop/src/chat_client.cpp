@@ -751,7 +751,14 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             if (s.peer_pub == sig.peer_pub) { sess = &s; break; }
                         }
                         if (!sess || !sess->rat) {
-                            emit log("media signal dropped — no session for peer");
+                            fb::crypto::PubKey want{};
+                            std::memcpy(want.data(), sig.peer_pub.data(), 32);
+                            const QString want_fp = QString::fromStdString(
+                                fb::crypto::Identity::fingerprint(want));
+                            emit log(QString("media signal dropped — no session "
+                                             "for peer (kind=%1 want_fp=%2 sessions=%3)")
+                                         .arg(sig.kind).arg(want_fp)
+                                         .arg(impl_->sessions.size()));
                             continue;
                         }
                         auto pt = pack_media_signal_payload(
@@ -1107,10 +1114,31 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                 continue;
                             }
                             // (DM envelope path follows below — unchanged)
-                            // Find or create session keyed by sender pubkey.
-                            // We don't know their username here; use base64
-                            // of pubkey as the session name for now.
-                            std::string sname = "peer:" + sender_pub_bytes.substr(0, 8);
+                            // Reuse an existing session for this peer if we
+                            // have one — bob may have already created
+                            // sessions["alice"] (init_alice) by sending a
+                            // DM to alice, in which case all subsequent
+                            // inbound from alice MUST decrypt through that
+                            // same session. Spinning up a parallel
+                            // sessions["peer:<alice_8>"] (init_bob) gives
+                            // us two ratchets for one logical peer, the DH
+                            // chains never line up, and every inbound
+                            // decrypt fails.
+                            std::array<std::uint8_t, 32> sender_pub_arr{};
+                            std::memcpy(sender_pub_arr.data(),
+                                        sender_pub_bytes.data(), 32);
+                            std::string sname;
+                            for (auto& [name, s] : impl_->sessions) {
+                                if (s.rat && s.peer_pub == sender_pub_arr) {
+                                    sname = name;
+                                    break;
+                                }
+                            }
+                            if (sname.empty()) {
+                                // First-time peer — create a fresh init_bob
+                                // session keyed by an opaque "peer:<8>" tag.
+                                sname = "peer:" + sender_pub_bytes.substr(0, 8);
+                            }
                             auto& sess = impl_->sessions[sname];
                             if (!sess.rat) {
                                 std::array<std::uint8_t, 32> peer_x{};
@@ -1130,6 +1158,11 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                                                        32),
                                     std::span<const std::uint8_t, 32>(impl_->x25519.pub.data(),
                                                                        32)));
+                                // Stash peer keys so the media_queue drain
+                                // can find this session by peer_pub later.
+                                std::memcpy(sess.peer_pub.data(),
+                                            sender_pub_bytes.data(), 32);
+                                sess.peer_x = peer_x;
                             }
                             auto pt = sess.rat->decrypt(
                                 std::span<const std::uint8_t>(
@@ -1263,6 +1296,19 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                                         static_cast<int>(ms.payload().size()));
                                 const auto kind =
                                     static_cast<MediaCall::SignalKind>(ms.kind());
+                                // Diagnostic: trace every inbound media signal
+                                // so call-failure logs show which step the
+                                // peer-to-peer signaling stops at.
+                                {
+                                    static const char* names[] = {
+                                        "(0)", "OFFER", "ANSWER", "ICE", "HANGUP", "SFRAME_KEY"
+                                    };
+                                    const int k = static_cast<int>(kind);
+                                    const char* label = (k >= 0 && k < 6) ? names[k] : "?";
+                                    emit log(QString("inbound media signal: %1 (%2 bytes)")
+                                                 .arg(label)
+                                                 .arg(static_cast<int>(sig_payload.size())));
+                                }
 
                                 // Marshal the inbound dispatch onto the Qt
                                 // main thread — MediaCall lives there.
@@ -1277,7 +1323,11 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                         // create a callee MediaCall and surface
                                         // incomingCall so the UI can prompt.
                                         if (kind == MediaCall::SignalKind::kOffer) {
-                                            if (impl_->active_call) return;  // glare
+                                            if (impl_->active_call) {
+                                                emit log("inbound OFFER ignored — "
+                                                          "another call is already active");
+                                                return;
+                                            }
                                             auto* call = new MediaCall(this);
                                             impl_->active_call      = call;
                                             impl_->active_call_peer = peer_pub;
@@ -1328,8 +1378,16 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                                     fb::crypto::Identity::fingerprint(arr)));
                                             return;
                                         }
-                                        if (!impl_->active_call ||
-                                            impl_->active_call_peer != peer_pub) return;
+                                        if (!impl_->active_call) {
+                                            emit log("inbound media signal ignored — "
+                                                      "no active call");
+                                            return;
+                                        }
+                                        if (impl_->active_call_peer != peer_pub) {
+                                            emit log("inbound media signal ignored — "
+                                                      "active call is for a different peer");
+                                            return;
+                                        }
                                         switch (kind) {
                                             case MediaCall::SignalKind::kAnswer:
                                                 impl_->active_call->receive_answer(sig_payload);
@@ -1574,20 +1632,38 @@ std::vector<ChatClient::CachedPeer> ChatClient::cached_dm_peers() {
 std::vector<ChatClient::HistoryEntry> ChatClient::load_recent_history(std::size_t limit) {
     std::vector<HistoryEntry> out;
     if (!impl_->store) return out;
-    auto rows = impl_->store->recent_inbox(limit);
-    out.reserve(rows.size());
-    for (const auto& r : rows) {
+    // Pull the most-recent `limit` rows from BOTH directions and merge by
+    // timestamp. Earlier we only loaded inbox, so a logged-back-in user saw
+    // only messages they had received — every reply they had sent was
+    // silently missing on reconnect.
+    auto inbox = impl_->store->recent_inbox(limit);
+    auto outbox = impl_->store->recent_outbox(limit);
+    out.reserve(inbox.size() + outbox.size());
+
+    auto build = [&](const auto& r, bool outgoing) {
         HistoryEntry e;
-        e.outgoing = false;
+        e.outgoing = outgoing;
         e.text = QString::fromStdString(std::string(r.plaintext.begin(), r.plaintext.end()));
         e.timestamp_ms = static_cast<std::int64_t>(r.timestamp_ms);
         if (r.peer_pub.size() == 32) {
             fb::crypto::PubKey k{};
             std::memcpy(k.data(), r.peer_pub.data(), 32);
             e.peer_fingerprint = QString::fromStdString(fb::crypto::Identity::fingerprint(k));
+            auto cached = impl_->store->peer_name(
+                std::span<const std::uint8_t>(r.peer_pub.data(), r.peer_pub.size()));
+            if (cached) e.peer_username = QString::fromStdString(*cached);
         }
-        out.push_back(std::move(e));
-    }
+        return e;
+    };
+    for (const auto& r : inbox)  out.push_back(build(r, /*outgoing=*/false));
+    for (const auto& r : outbox) out.push_back(build(r, /*outgoing=*/true));
+    // Sort newest-first so the caller can reverse-iterate to render
+    // oldest-first into the message buffer.
+    std::sort(out.begin(), out.end(),
+              [](const HistoryEntry& a, const HistoryEntry& b) {
+                  return a.timestamp_ms > b.timestamp_ms;
+              });
+    if (out.size() > limit) out.resize(limit);
     return out;
 }
 

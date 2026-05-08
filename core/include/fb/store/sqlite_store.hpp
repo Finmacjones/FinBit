@@ -82,6 +82,17 @@ public:
     };
     [[nodiscard]] std::vector<InboxRow> recent_inbox(std::size_t limit) const;
 
+    // Outbox row shape mirrors InboxRow on purpose — the column named
+    // `ciphertext` actually stores the plaintext bytes that were sent,
+    // not the wire-encrypted blob (see append_outbox call sites).
+    struct OutboxRow {
+        std::vector<std::uint8_t> envelope_id;
+        std::vector<std::uint8_t> peer_pub;
+        std::vector<std::uint8_t> plaintext;
+        std::uint64_t timestamp_ms;
+    };
+    [[nodiscard]] std::vector<OutboxRow> recent_outbox(std::size_t limit) const;
+
     // ---- carry-credit ledger (Phase 5; data model lives now) --------------
     void record_carry(std::span<const std::uint8_t> peer_pub, std::int64_t delta_bytes);
     [[nodiscard]] std::int64_t carry_balance(std::span<const std::uint8_t> peer_pub) const;

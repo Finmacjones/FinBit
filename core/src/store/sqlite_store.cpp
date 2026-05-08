@@ -283,6 +283,26 @@ std::vector<SqliteStore::InboxRow> SqliteStore::recent_inbox(std::size_t limit) 
     return rows;
 }
 
+std::vector<SqliteStore::OutboxRow> SqliteStore::recent_outbox(std::size_t limit) const {
+    // Note: column is named `ciphertext` but holds plaintext bytes — see
+    // the append_outbox call site comment in chat_client.cpp.
+    auto* stmt =
+        impl_->prep("SELECT envelope_id, peer_pub, ciphertext, ts_ms FROM outbox "
+                    "ORDER BY ts_ms DESC LIMIT ?;");
+    sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(limit));
+    std::vector<OutboxRow> rows;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        OutboxRow r;
+        r.envelope_id = column_blob(stmt, 0);
+        r.peer_pub = column_blob(stmt, 1);
+        r.plaintext = column_blob(stmt, 2);
+        r.timestamp_ms = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
+        rows.push_back(std::move(r));
+    }
+    sqlite3_finalize(stmt);
+    return rows;
+}
+
 void SqliteStore::record_carry(std::span<const std::uint8_t> peer_pub,
                                std::int64_t delta_bytes) {
     auto* stmt = impl_->prep(

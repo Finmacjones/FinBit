@@ -86,6 +86,18 @@ public:
     // .cpp's anonymous namespace. NOT part of the public ABI.
     bool _sframe_enabled() const { return sframe_enabled_; }
     void* _sframe_ctx_raw();
+    // Lets the on_connection_state_changed callback advance state out
+    // of kConnecting once webrtcbin reports peer-connection-state =
+    // CONNECTED (DTLS-SRTP up + ICE consent). Without this the UI's
+    // call banner gets stuck on "connecting" even after media flows.
+    void _on_connection_state(int gst_webrtc_peer_state);
+    // Raw webrtcbin pointer for the GstPromise change-callbacks that
+    // need to call set-local-description on the same element they
+    // came from. Earlier code stashed this on `g_object_set_data
+    // (G_OBJECT(this), ...)` — but `this` is a QObject, not a GObject,
+    // so the assertion failed silently and the lambdas got NULL back,
+    // which is why ICE never started.
+    void* _webrtc_raw() const;
 
 signals:
     // Outbound signal that needs to reach the peer over the ratchet.

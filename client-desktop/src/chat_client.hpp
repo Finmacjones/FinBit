@@ -94,6 +94,10 @@ public:
     struct HistoryEntry {
         bool        outgoing;        // true = me → peer; false = peer → me
         QString     peer_fingerprint;
+        // Resolved registered username for the peer, if the local
+        // peer_name_cache has it. Empty when only the fingerprint is
+        // known — UI falls back to displaying the fingerprint.
+        QString     peer_username;
         QString     text;
         std::int64_t timestamp_ms;
     };

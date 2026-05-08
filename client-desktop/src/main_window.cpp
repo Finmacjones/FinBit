@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "main_window.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <sodium.h>
 #include <QAction>
 #include <QApplication>
@@ -730,9 +732,17 @@ void MainWindow::onChannelSelectionChanged() {
 }
 
 void MainWindow::appendLog(const QString& s) {
-    log_view_->appendPlainText(QString("[%1] %2")
-                                   .arg(QDateTime::currentDateTime().toString("HH:mm:ss"))
-                                   .arg(s));
+    const QString line = QString("[%1] %2")
+                             .arg(QDateTime::currentDateTime().toString("HH:mm:ss"))
+                             .arg(s);
+    log_view_->appendPlainText(line);
+    // Mirror to stderr so headless / automation runs can capture the
+    // call-signaling trace without screen-scraping the QPlainTextEdit.
+    if (std::getenv("FB_LOG_TO_STDERR")) {
+        std::fprintf(stderr, "[%s] %s\n",
+                     my_username_.isEmpty() ? "?" : my_username_.toUtf8().constData(),
+                     line.toUtf8().constData());
+    }
 }
 
 void MainWindow::appendIncoming(const QString& peer_fp, const QString& peer_username,
@@ -796,14 +806,45 @@ void MainWindow::onConnected(const QString& my_fp) {
 
     const auto history = client_->load_recent_history(50);
     for (auto it = history.rbegin(); it != history.rend(); ++it) {
-        const QString key = ConvKey::dm_pub(it->peer_fingerprint);
-        appendMessage(key, it->peer_fingerprint, it->peer_fingerprint, it->text,
-                      it->timestamp_ms, /*is_self=*/false, /*is_history=*/true);
+        // Prefer the username when the local cache has resolved it — file
+        // history under the same "dm:<username>" buffer the live messages
+        // use, and let the existing username sidebar entry (created above
+        // by rememberDmPeer) cover this peer rather than spawning a
+        // duplicate fingerprint-labeled item.
+        const bool have_username = !it->peer_username.isEmpty();
+        const QString peer_label = have_username ? it->peer_username
+                                                  : it->peer_fingerprint;
+        // Match appendIncoming's no-username convention ("dm:<fp>") so a
+        // live message arriving for the same peer files into the same
+        // buffer / sidebar entry. The legacy "dm-pub:<fp>" key is still
+        // recognized in selectConversation / onPeerUsernameResolved for
+        // backwards compatibility but is no longer produced here.
+        const QString key = have_username
+            ? ConvKey::dm_user(it->peer_username)
+            : (QStringLiteral("dm:") + it->peer_fingerprint);
+        // Sender for the bubble: my username (and avatar seed) for outgoing
+        // entries, the peer label for inbound. Without this both directions
+        // were rendered as if the peer had said them and the user's own
+        // history was visually attributed to the other side.
+        const QString sender = it->outgoing ? my_username_ : peer_label;
+        appendMessage(key, sender, sender, it->text,
+                      it->timestamp_ms, /*is_self=*/it->outgoing, /*is_history=*/true);
+        // Only invent a fingerprint-labeled sidebar entry as a fallback
+        // when we have no username for this peer at all. Username peers
+        // are already represented via cached_dm_peers above.
+        if (have_username) continue;
         bool found = false;
         for (int i = 0; i < dm_list_->count(); ++i) {
-            if (dm_list_->item(i)->text() == it->peer_fingerprint) { found = true; break; }
+            const QString role = dm_list_->item(i)->data(Qt::UserRole).toString();
+            if (role == key || dm_list_->item(i)->text() == it->peer_fingerprint) {
+                found = true; break;
+            }
         }
-        if (!found) sidebar_item(it->peer_fingerprint, it->peer_fingerprint, 28, dm_list_);
+        if (!found) {
+            auto* item = sidebar_item(it->peer_fingerprint, it->peer_fingerprint,
+                                       28, dm_list_);
+            item->setData(Qt::UserRole, key);
+        }
     }
 }
 
