@@ -929,6 +929,26 @@ void MainWindow::onChannelCallRoster(const QString& channel,
                   .arg(channel).arg(shown.size()));
 }
 
+void MainWindow::test_create_local_channel(const QString& name) {
+    if (!client_) return;
+    client_->create_local_channel(name);
+}
+
+void MainWindow::test_invite_peer_to_channel(const QString& channel_name,
+                                              const QString& peer_username) {
+    if (!client_) return;
+    client_->invite_peer_to_channel(channel_name, peer_username);
+}
+
+void MainWindow::test_join_channel_voice(const QString& channel_name) {
+    if (!client_) return;
+    // Mirror the user clicking Call while a channel is selected.
+    active_channel_call_ = channel_name;
+    call_banner_label_->setText(QString("📞 In #%1 — full-mesh").arg(channel_name));
+    call_banner_->show();
+    client_->join_channel_call(channel_name, /*with_video=*/false);
+}
+
 void MainWindow::onToggleLog() {
     const bool was_visible = log_panel_->isVisible();
     log_panel_->setVisible(!was_visible);

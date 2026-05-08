@@ -141,6 +141,39 @@ int main(int argc, char* argv[]) {
             });
         }
 
+        // FB_AUTO_CHANNEL_CREATE=name — create a channel locally (no
+        // peer prompt). Fires shortly after auto-DM so the inviter has
+        // a session ready for any subsequent invite.
+        if (const char* chan_create = std::getenv("FB_AUTO_CHANNEL_CREATE")) {
+            const QString chan = QString::fromUtf8(chan_create);
+            QTimer::singleShot(3000, [&w, chan]() {
+                w.test_create_local_channel(chan);
+            });
+        }
+        // FB_AUTO_CHANNEL_INVITE=peer — after the channel is created,
+        // DM the SenderKeys distribution to PEER so they see the channel
+        // in their sidebar too. Combined with FB_AUTO_CHANNEL_CREATE.
+        if (const char* chan_invite = std::getenv("FB_AUTO_CHANNEL_INVITE")) {
+            const char* chan_name = std::getenv("FB_AUTO_CHANNEL_CREATE");
+            if (chan_name) {
+                const QString chan = QString::fromUtf8(chan_name);
+                const QString peer = QString::fromUtf8(chan_invite);
+                QTimer::singleShot(3500, [&w, chan, peer]() {
+                    w.test_invite_peer_to_channel(chan, peer);
+                });
+            }
+        }
+        // FB_AUTO_CHANNEL_VOICE=name — after sessions + channel are
+        // up, join the voice room for `#name`. Each participant launched
+        // with this env var triggers RoomJoin → roster broadcast → mesh
+        // dial of every other roster member with whom we have a session.
+        if (const char* chan_voice = std::getenv("FB_AUTO_CHANNEL_VOICE")) {
+            const QString chan = QString::fromUtf8(chan_voice);
+            QTimer::singleShot(5500, [&w, chan]() {
+                w.test_join_channel_voice(chan);
+            });
+        }
+
         // FB_AUTO_ACCEPT_CALLS=1 — when an incoming-call dialog pops up,
         // auto-click "Accept (voice)". Implementation: install an event
         // filter that watches for QMessageBox creation and clicks the

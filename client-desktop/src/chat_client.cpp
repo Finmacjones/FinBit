@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <set>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -264,11 +265,25 @@ struct ChatClient::Impl {
     // inbound envelope's channel_group_id can be resolved back.
     std::map<std::string, std::string> chan_id_to_name;
 
-    // Active 1:1 call. Held by ChatClient (owner thread = Qt main) so the
-    // worker thread reads it via Qt signals only — never directly.
-    MediaCall* active_call = nullptr;
-    std::array<std::uint8_t, 32> active_call_peer{};
-    std::array<std::uint8_t, 16> active_call_id{};
+    // Active calls, keyed by peer pubkey (raw 32-byte string). Held by
+    // ChatClient (owner thread = Qt main) so the worker thread reads it
+    // via Qt signals only — never directly. v0 supports one MediaCall per
+    // peer (no glare with the same person), but multiple peers
+    // simultaneously — that's what makes mesh channel calls possible.
+    struct CallEntry {
+        MediaCall*                          call    = nullptr;
+        std::array<std::uint8_t, 16>        call_id = {};
+        // Optional: room_id this call belongs to (32 raw bytes, empty for
+        // 1:1 DM calls). Set when the call was started by mesh-dial on a
+        // RoomRoster delta — used by hangup-fanout when leaving a room.
+        std::string                         room_id;
+    };
+    std::map<std::string, CallEntry> calls_by_peer;
+    // Per-room set of peer-pubkey strings we've already mesh-dialed (or
+    // accepted from). Diffed against incoming RoomRoster broadcasts so
+    // re-rosters don't redial existing peers, and departed peers get
+    // their MediaCall torn down.
+    std::map<std::string /*room_id*/, std::set<std::string /*peer_pub*/>> room_mesh_peers;
 };
 
 ChatClient::ChatClient(QObject* parent) : QObject(parent), impl_(std::make_unique<Impl>()) {}
@@ -937,14 +952,90 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                          .arg(chan_name.isEmpty() ? "<unknown>" : chan_name)
                                          .arg(fps.size()));
                             emit channelCallRoster(chan_name, fps);
-                            // TODO(mesh-dial): diff `fps` against per-room set
-                            // of mesh peers we already have a MediaCall to;
-                            // for each new peer where my_fp > peer_fp (glare
-                            // tiebreak), start_call(peer_username,
-                            // with_video). For each departed peer, tear down
-                            // their MediaCall. Requires lifting the
-                            // single-active-call constraint in start_call /
-                            // active_call → map<peer_pub, MediaCall*>.
+
+                            // Mesh-dial: build the set of OTHER participants
+                            // in the room, diff against who we've already
+                            // dialed/accepted, and dispatch start_call_to_pub
+                            // on the Qt main thread for each new peer where
+                            // we're on the higher side of the pubkey
+                            // tiebreak (the lower side waits for our OFFER).
+                            // Departed peers get their MediaCall hung up.
+                            std::set<std::string> roster_peer_keys;
+                            std::vector<std::array<std::uint8_t, 32>> to_dial;
+                            const std::string room_id_str(rr.room_id().begin(),
+                                                           rr.room_id().end());
+                            const auto& my_pub = impl_->identity->public_key();
+                            for (const auto& p : rr.participants()) {
+                                if (p.identity_pubkey().size() != 32) continue;
+                                if (std::equal(my_pub.begin(), my_pub.end(),
+                                               p.identity_pubkey().begin())) {
+                                    continue;   // skip self
+                                }
+                                roster_peer_keys.insert(std::string(
+                                    p.identity_pubkey().begin(),
+                                    p.identity_pubkey().end()));
+                            }
+                            auto& meshed = impl_->room_mesh_peers[room_id_str];
+                            // Hang up calls for peers that left.
+                            std::vector<std::string> to_drop;
+                            for (const auto& peer_key : meshed) {
+                                if (!roster_peer_keys.count(peer_key)) {
+                                    to_drop.push_back(peer_key);
+                                }
+                            }
+                            for (const auto& peer_key : to_drop) {
+                                meshed.erase(peer_key);
+                                MediaCall* call = nullptr;
+                                {
+                                    auto it = impl_->calls_by_peer.find(peer_key);
+                                    if (it != impl_->calls_by_peer.end()) {
+                                        call = it->second.call;
+                                    }
+                                }
+                                if (call) {
+                                    QMetaObject::invokeMethod(call, [call]() {
+                                        call->hangup();
+                                    }, Qt::QueuedConnection);
+                                }
+                            }
+                            // Dial new peers (only on the higher-pubkey side).
+                            for (const auto& peer_key : roster_peer_keys) {
+                                if (meshed.count(peer_key)) continue;
+                                std::array<std::uint8_t, 32> peer_pub_arr{};
+                                std::memcpy(peer_pub_arr.data(),
+                                            peer_key.data(), 32);
+                                const bool i_dial = std::lexicographical_compare(
+                                    peer_pub_arr.begin(), peer_pub_arr.end(),
+                                    my_pub.begin(), my_pub.end());
+                                meshed.insert(peer_key);   // claim it either way
+                                if (!i_dial) continue;     // wait for inbound
+                                fb::crypto::PubKey arr{};
+                                std::memcpy(arr.data(), peer_pub_arr.data(), 32);
+                                const QString fp_label = QString::fromStdString(
+                                    fb::crypto::Identity::fingerprint(arr));
+                                to_dial.push_back(peer_pub_arr);
+                                emit log(QString("mesh-dial: room #%1 → %2")
+                                             .arg(chan_name).arg(fp_label));
+                            }
+                            // Dispatch dials on the main thread.
+                            for (const auto& peer_pub_arr : to_dial) {
+                                std::array<std::uint8_t, 32> pub_copy = peer_pub_arr;
+                                fb::crypto::PubKey arr{};
+                                std::memcpy(arr.data(), pub_copy.data(), 32);
+                                const QString label = QString::fromStdString(
+                                    fb::crypto::Identity::fingerprint(arr));
+                                std::string room_copy = room_id_str;
+                                QMetaObject::invokeMethod(this,
+                                    [this, pub_copy, label, room_copy]() {
+                                        if (!start_call_to_pub(
+                                                pub_copy, label,
+                                                /*with_video=*/false, room_copy)) {
+                                            emit log(QString(
+                                                "mesh-dial: already calling %1")
+                                                .arg(label));
+                                        }
+                                    }, Qt::QueuedConnection);
+                            }
                             continue;
                         }
                         if (f.body_case() == fb::proto::Frame::kUsernameResp) {
@@ -1319,27 +1410,47 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                         std::memcpy(a.data(), ms.call_id().data(), 16);
                                         return a;
                                      }())]() {
-                                        // OFFER from a brand-new peer →
-                                        // create a callee MediaCall and surface
-                                        // incomingCall so the UI can prompt.
+                                        // Multi-call dispatch: every call is
+                                        // keyed by peer pubkey in calls_by_peer.
+                                        // For 1:1 the map has one entry; for
+                                        // mesh channel calls there's one per
+                                        // peer in the room.
+                                        const std::string peer_key(
+                                            reinterpret_cast<const char*>(peer_pub.data()),
+                                            peer_pub.size());
                                         if (kind == MediaCall::SignalKind::kOffer) {
-                                            if (impl_->active_call) {
+                                            // Glare at the per-peer level only:
+                                            // we already have a call going with
+                                            // THIS peer. Ignore — both ends
+                                            // would otherwise race two
+                                            // PeerConnections to the same
+                                            // partner.
+                                            if (impl_->calls_by_peer.count(peer_key)) {
                                                 emit log("inbound OFFER ignored — "
-                                                          "another call is already active");
+                                                          "already have an active call "
+                                                          "with this peer");
                                                 return;
                                             }
                                             auto* call = new MediaCall(this);
-                                            impl_->active_call      = call;
-                                            impl_->active_call_peer = peer_pub;
-                                            impl_->active_call_id   = ms_call_id;
+                                            Impl::CallEntry entry;
+                                            entry.call    = call;
+                                            entry.call_id = ms_call_id;
+                                            impl_->calls_by_peer[peer_key] = entry;
                                             const QString label = peer_label_for(
                                                 std::span<const std::uint8_t>(
                                                     peer_pub.data(), peer_pub.size()));
+                                            // Capture peer_pub + ms_call_id BY
+                                            // VALUE in the sendSignal lambda so
+                                            // each call's outbound signaling
+                                            // routes back to the right peer
+                                            // even when there are several
+                                            // simultaneous calls.
                                             QObject::connect(call, &MediaCall::sendSignal, this,
-                                                [this](int kind_, const QByteArray& bytes) {
+                                                [this, peer_pub, ms_call_id](
+                                                    int kind_, const QByteArray& bytes) {
                                                     PendingMediaSignal pms;
-                                                    pms.peer_pub = impl_->active_call_peer;
-                                                    pms.call_id  = impl_->active_call_id;
+                                                    pms.peer_pub = peer_pub;
+                                                    pms.call_id  = ms_call_id;
                                                     pms.kind     = static_cast<std::uint32_t>(kind_);
                                                     pms.payload.assign(
                                                         bytes.constBegin(), bytes.constEnd());
@@ -1350,11 +1461,22 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                                     impl_->cv.notify_all();
                                                 });
                                             QObject::connect(call, &MediaCall::stateChanged, this,
-                                                [this, label](MediaCall::State s) {
+                                                [this, label, peer_key](MediaCall::State s) {
                                                     emit callStateChanged(label, static_cast<int>(s));
-                                                    if (s == MediaCall::State::kClosed && impl_->active_call) {
-                                                        impl_->active_call->deleteLater();
-                                                        impl_->active_call = nullptr;
+                                                    if (s == MediaCall::State::kClosed) {
+                                                        auto it = impl_->calls_by_peer.find(peer_key);
+                                                        if (it != impl_->calls_by_peer.end()) {
+                                                            it->second.call->deleteLater();
+                                                            impl_->calls_by_peer.erase(it);
+                                                        }
+                                                        // Drop any room-mesh
+                                                        // tracking for this peer
+                                                        // so a re-join correctly
+                                                        // re-dials.
+                                                        for (auto& [rid, peers] :
+                                                             impl_->room_mesh_peers) {
+                                                            peers.erase(peer_key);
+                                                        }
                                                     }
                                                 });
                                             QObject::connect(call, &MediaCall::log, this,
@@ -1371,6 +1493,35 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                                 call->set_sframe_context(shared, ms_call_id);
                                             }
                                             call->receive_offer(sig_payload);
+                                            // Mesh-call auto-accept: if this
+                                            // peer is in a room we've joined,
+                                            // the user already opted in by
+                                            // clicking Voice on that channel
+                                            // — popping a per-peer Accept
+                                            // modal for every other roster
+                                            // member would be hostile UX.
+                                            // Tag the entry with the matching
+                                            // room_id and accept immediately.
+                                            std::string matched_room;
+                                            for (const auto& [rid, peers] :
+                                                 impl_->room_mesh_peers) {
+                                                if (peers.count(peer_key)) {
+                                                    matched_room = rid;
+                                                    break;
+                                                }
+                                            }
+                                            if (!matched_room.empty()) {
+                                                impl_->calls_by_peer[peer_key]
+                                                    .room_id = matched_room;
+                                                emit log("auto-accepting mesh "
+                                                          "OFFER (peer in active "
+                                                          "channel call)");
+                                                call->accept_incoming(
+                                                    /*with_video=*/false);
+                                                return;
+                                            }
+                                            // 1:1 DM call — surface the modal
+                                            // for explicit accept/decline.
                                             fb::crypto::PubKey arr{};
                                             std::memcpy(arr.data(), peer_pub.data(), 32);
                                             emit incomingCall(label,
@@ -1378,25 +1529,24 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                                     fb::crypto::Identity::fingerprint(arr)));
                                             return;
                                         }
-                                        if (!impl_->active_call) {
+                                        // Non-OFFER signals: dispatch to the
+                                        // matching call (if any).
+                                        auto it = impl_->calls_by_peer.find(peer_key);
+                                        if (it == impl_->calls_by_peer.end()) {
                                             emit log("inbound media signal ignored — "
-                                                      "no active call");
+                                                      "no active call for this peer");
                                             return;
                                         }
-                                        if (impl_->active_call_peer != peer_pub) {
-                                            emit log("inbound media signal ignored — "
-                                                      "active call is for a different peer");
-                                            return;
-                                        }
+                                        MediaCall* call = it->second.call;
                                         switch (kind) {
                                             case MediaCall::SignalKind::kAnswer:
-                                                impl_->active_call->receive_answer(sig_payload);
+                                                call->receive_answer(sig_payload);
                                                 break;
                                             case MediaCall::SignalKind::kIce:
-                                                impl_->active_call->receive_ice(sig_payload);
+                                                call->receive_ice(sig_payload);
                                                 break;
                                             case MediaCall::SignalKind::kHangup:
-                                                impl_->active_call->hangup(/*silent=*/true);
+                                                call->hangup(/*silent=*/true);
                                                 break;
                                             default: break;
                                         }
@@ -1479,6 +1629,24 @@ void ChatClient::join_channel_call(const QString& channel_name, bool with_video)
 }
 
 void ChatClient::leave_channel_call(const QString& channel_name) {
+    // Tear down every mesh MediaCall in this room before we tell the
+    // server we've left — otherwise their pipelines linger as the user's
+    // RTP keeps flowing toward peers who'll never hear it again.
+    const auto chan_id = channel_id_from_name(channel_name.toStdString());
+    const std::string room_id_str(
+        reinterpret_cast<const char*>(chan_id.data()), chan_id.size());
+    std::vector<MediaCall*> to_hangup;
+    for (auto& [_, entry] : impl_->calls_by_peer) {
+        if (entry.room_id == room_id_str && entry.call) {
+            to_hangup.push_back(entry.call);
+        }
+    }
+    for (MediaCall* call : to_hangup) {
+        call->hangup();   // already on the Qt main thread (this method is
+                          // invoked from the UI hangup button)
+    }
+    impl_->room_mesh_peers.erase(room_id_str);
+
     {
         std::lock_guard lk(impl_->mu);
         impl_->chan_queue.push_back({PendingChannelOp::Kind::kRoomLeave,
@@ -1498,36 +1666,48 @@ void ChatClient::leave_channel(const QString& channel_name) {
 }
 
 void ChatClient::disconnect() {
-    if (impl_->active_call) { impl_->active_call->hangup(); impl_->active_call = nullptr; }
+    // Tear down every active call before we shut the worker down — without
+    // this, GStreamer pipelines outlive their owning ChatClient and the
+    // process can exit with stranded webrtcbin instances.
+    for (auto& [_, entry] : impl_->calls_by_peer) {
+        if (entry.call) entry.call->hangup();
+    }
+    impl_->calls_by_peer.clear();
+    impl_->room_mesh_peers.clear();
     impl_->running = false;
     impl_->cv.notify_all();
     if (impl_->worker.joinable()) impl_->worker.join();
 }
 
 // =============================================================================
-// 1:1 voice/video — public surface.
+// Voice / video calls — public surface.
 //
 // All MediaCall state lives on the Qt main thread (the same one that owns
 // `this`). The worker thread only ever observes it via the media_queue
 // (outbound signals) and via QMetaObject::invokeMethod for inbound signals.
+//
+// Multiple concurrent calls are supported: calls_by_peer maps a peer
+// pubkey to a CallEntry. 1:1 DM calls produce one entry. Mesh channel
+// calls produce N-1 entries, one per other participant in the room.
 // =============================================================================
 
-void ChatClient::start_call(const QString& peer_username, bool with_video) {
-    auto sit = impl_->sessions.find(peer_username.toStdString());
-    if (sit == impl_->sessions.end() || !sit->second.rat) {
-        emit log(QString("start_call: no ratchet session for %1 — send a DM first to bootstrap")
-                     .arg(peer_username));
-        return;
-    }
-    if (impl_->active_call) {
-        emit log("start_call: another call is already in progress");
-        return;
+bool ChatClient::start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub_arr,
+                                    const QString& display_label,
+                                    bool with_video,
+                                    const std::string& room_id) {
+    const std::string peer_key(
+        reinterpret_cast<const char*>(peer_pub_arr.data()), peer_pub_arr.size());
+    if (impl_->calls_by_peer.count(peer_key)) {
+        return false;   // already calling this peer
     }
     auto* call = new MediaCall(this);
-    impl_->active_call      = call;
-    impl_->active_call_peer = sit->second.peer_pub;
-    randombytes_buf(impl_->active_call_id.data(), impl_->active_call_id.size());
-    const QString label = peer_username;
+    Impl::CallEntry entry;
+    entry.call    = call;
+    entry.room_id = room_id;
+    randombytes_buf(entry.call_id.data(), entry.call_id.size());
+    const std::array<std::uint8_t, 16> call_id_arr = entry.call_id;
+    impl_->calls_by_peer[peer_key] = entry;
+    const QString label = display_label;
 
     // Derive the SFrame base key from the X3DH-shared secret + the fresh
     // call_id and hand it to MediaCall before start_outgoing — this turns
@@ -1537,21 +1717,23 @@ void ChatClient::start_call(const QString& peer_username, bool with_video) {
     {
         std::array<std::uint8_t, 32> peer_x{};
         if (crypto_sign_ed25519_pk_to_curve25519(
-                peer_x.data(), sit->second.peer_pub.data()) == 0) {
+                peer_x.data(), peer_pub_arr.data()) == 0) {
             const auto shared = derive_shared_secret(
                 impl_->x25519,
                 std::span<const std::uint8_t, 32>(peer_x.data(), 32));
-            call->set_sframe_context(shared, impl_->active_call_id);
+            call->set_sframe_context(shared, call_id_arr);
         }
     }
 
     // Outbound signals: MediaCall asks us to deliver bytes to the peer
-    // wrapped in DmPayload.media_signal. Push onto the worker's media queue.
+    // wrapped in DmPayload.media_signal. Push onto the worker's media
+    // queue. peer_pub + call_id captured by VALUE so each MediaCall's
+    // signaling routes to the right peer even with N concurrent calls.
     QObject::connect(call, &MediaCall::sendSignal, this,
-        [this](int kind, const QByteArray& bytes) {
+        [this, peer_pub_arr, call_id_arr](int kind, const QByteArray& bytes) {
             PendingMediaSignal pms;
-            pms.peer_pub = impl_->active_call_peer;
-            pms.call_id  = impl_->active_call_id;
+            pms.peer_pub = peer_pub_arr;
+            pms.call_id  = call_id_arr;
             pms.kind     = static_cast<std::uint32_t>(kind);
             pms.payload.assign(bytes.constBegin(), bytes.constEnd());
             {
@@ -1561,11 +1743,17 @@ void ChatClient::start_call(const QString& peer_username, bool with_video) {
             impl_->cv.notify_all();
         });
     QObject::connect(call, &MediaCall::stateChanged, this,
-        [this, label](MediaCall::State s) {
+        [this, label, peer_key](MediaCall::State s) {
             emit callStateChanged(label, static_cast<int>(s));
-            if (s == MediaCall::State::kClosed && impl_->active_call) {
-                impl_->active_call->deleteLater();
-                impl_->active_call = nullptr;
+            if (s == MediaCall::State::kClosed) {
+                auto it = impl_->calls_by_peer.find(peer_key);
+                if (it != impl_->calls_by_peer.end()) {
+                    it->second.call->deleteLater();
+                    impl_->calls_by_peer.erase(it);
+                }
+                for (auto& [rid, peers] : impl_->room_mesh_peers) {
+                    peers.erase(peer_key);
+                }
             }
         });
     QObject::connect(call, &MediaCall::log, this,
@@ -1573,21 +1761,52 @@ void ChatClient::start_call(const QString& peer_username, bool with_video) {
     QObject::connect(call, &MediaCall::remoteVideoFrame, this,
         &ChatClient::remoteVideoFrame);
 
-    call->start_outgoing(impl_->active_call_peer, with_video);
+    call->start_outgoing(peer_pub_arr, with_video);
+    return true;
 }
 
+void ChatClient::start_call(const QString& peer_username, bool with_video) {
+    auto sit = impl_->sessions.find(peer_username.toStdString());
+    if (sit == impl_->sessions.end() || !sit->second.rat) {
+        emit log(QString("start_call: no ratchet session for %1 — send a DM first to bootstrap")
+                     .arg(peer_username));
+        return;
+    }
+    if (!start_call_to_pub(sit->second.peer_pub, peer_username, with_video, /*room_id=*/{})) {
+        emit log(QString("start_call: a call to %1 is already in progress")
+                     .arg(peer_username));
+    }
+}
+
+// Accept the most recently rung incoming call. v0 surfaces just one
+// modal at a time; if multiple calls happen to be ringing simultaneously
+// (rare — would require two parallel inbound OFFERs in the same window)
+// the first one we find is accepted. Caller can hang up to advance.
 void ChatClient::accept_call(bool with_video) {
-    if (!impl_->active_call ||
-        impl_->active_call->state() != MediaCall::State::kRinging) return;
-    impl_->active_call->accept_incoming(with_video);
+    for (auto& [_, entry] : impl_->calls_by_peer) {
+        if (entry.call && entry.call->state() == MediaCall::State::kRinging) {
+            entry.call->accept_incoming(with_video);
+            return;
+        }
+    }
 }
 
 void ChatClient::decline_call() {
-    if (impl_->active_call) impl_->active_call->hangup();
+    for (auto& [_, entry] : impl_->calls_by_peer) {
+        if (entry.call && entry.call->state() == MediaCall::State::kRinging) {
+            entry.call->hangup();
+            return;
+        }
+    }
 }
 
 void ChatClient::hangup_call() {
-    if (impl_->active_call) impl_->active_call->hangup();
+    // 1:1 hangup: tear down every call that's NOT part of a room mesh.
+    // Room calls are torn down via leave_channel_call instead so the
+    // user can leave a single room without nuking unrelated DMs.
+    for (auto& [_, entry] : impl_->calls_by_peer) {
+        if (entry.call && entry.room_id.empty()) entry.call->hangup();
+    }
 }
 
 std::vector<ChatClient::ChannelHistoryEntry> ChatClient::load_recent_channel_history(

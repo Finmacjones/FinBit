@@ -152,6 +152,16 @@ signals:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+
+    // Internal: spin up a MediaCall to `peer_pub`, wire its signals, and
+    // set room_id on the entry so room-leave knows to tear it down. Used
+    // both by the public start_call(username) wrapper and by mesh-dial on
+    // RoomRoster delta. Returns true if the call was created (false if a
+    // call to this peer was already in progress).
+    bool start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub,
+                           const QString& display_label,
+                           bool with_video,
+                           const std::string& room_id);
 };
 
 }  // namespace fb::desktop

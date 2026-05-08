@@ -38,6 +38,16 @@ public:
     void adopt_session(const QString& username,
                         const std::array<std::uint8_t, 32>& seed);
 
+    // Test hooks invoked by main.cpp when the FB_AUTO_* env vars are set.
+    // Plumb directly into ChatClient bypassing the QInputDialog modals so
+    // automation can drive the mesh-call flow end-to-end without a human
+    // clicking through dialogs. Production behaviour is unchanged unless
+    // the env vars are present.
+    void test_create_local_channel(const QString& channel_name);
+    void test_invite_peer_to_channel(const QString& channel_name,
+                                      const QString& peer_username);
+    void test_join_channel_voice(const QString& channel_name);
+
 private slots:
     void onConnectClicked();
     void onShowRecoveryCode();
