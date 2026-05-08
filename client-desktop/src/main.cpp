@@ -9,6 +9,7 @@
 #include <QPushButton>
 #include <QTimer>
 #include <cstdlib>
+#include <stdlib.h>   // random()
 
 #include "discord_theme.hpp"
 #include "identity_vault.hpp"
@@ -59,18 +60,34 @@ int main(int argc, char* argv[]) {
         const QString username = QString::fromUtf8(auto_user);
         const QString path = fb::desktop::vault_path_for(username);
         auto blob = fb::desktop::load_vault_file(path);
-        if (!blob) {
-            std::fprintf(stderr, "auto-login: no vault file at %s\n",
+        fb::desktop::Seed seed{};
+        if (blob) {
+            auto opened = fb::desktop::open_seed(QString::fromUtf8(auto_pass), *blob);
+            if (!opened) {
+                std::fprintf(stderr, "auto-login: wrong passphrase for %s\n",
+                             auto_user);
+                return 2;
+            }
+            seed = *opened;
+        } else if (std::getenv("FB_AUTO_REGISTER")) {
+            // No vault yet AND register-on-missing requested — generate
+            // a fresh seed, seal it under the given passphrase, persist
+            // the vault, and proceed. Useful for headless smoke tests
+            // that need to spin up brand-new identities each run.
+            for (auto& b : seed) b = static_cast<std::uint8_t>(random());
+            auto fresh_blob = fb::desktop::seal_seed(
+                QString::fromUtf8(auto_pass), seed);
+            fb::desktop::save_vault_file(path, fresh_blob);
+            std::fprintf(stderr, "auto-login: registered fresh vault for %s\n",
+                         auto_user);
+        } else {
+            std::fprintf(stderr,
+                         "auto-login: no vault file at %s "
+                         "(set FB_AUTO_REGISTER=1 to create one)\n",
                          path.toUtf8().constData());
             return 2;
         }
-        auto seed = fb::desktop::open_seed(QString::fromUtf8(auto_pass), *blob);
-        if (!seed) {
-            std::fprintf(stderr, "auto-login: wrong passphrase for %s\n",
-                         auto_user);
-            return 2;
-        }
-        w.adopt_session(username, *seed);
+        w.adopt_session(username, seed);
         did_auto_login = true;
     } else {
         // Gate the chat window behind the identity vault. If the user closes

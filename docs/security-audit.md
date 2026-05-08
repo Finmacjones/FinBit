@@ -15,12 +15,31 @@ about the implementation.
   the canaries never appear. All four scripts (`dm_roundtrip.sh`,
   `channel_inband_roundtrip.sh`, `offline_persist.sh`,
   `server_persist_full.sh`) pass.
-- ⚠️ **Local message store is plaintext on disk.** The vault encrypts
-  only the identity seed; `inbox.plaintext`, `outbox.ciphertext`
-  (misnamed — actually plaintext), and the legacy `identities.sec`
-  column are unencrypted. Anyone who steals the user's data dir reads
-  every message. This was always tracked as `TODO(sqlcipher)` in the
-  schema; surface it explicitly.
+- ✅ **Local message store is now fully encrypted at rest** (closed
+  since this audit). `SqliteStore::open(path, master_key)` derives
+  per-table XChaCha20-Poly1305 sub-keys via HKDF-SHA256 from a master
+  key ChatClient derives from the vault seed (`info =
+  "FinBit-DB-Master-v1"`). Coverage:
+  | Table | AAD binding |
+  |---|---|
+  | `inbox.plaintext` | envelope_id |
+  | `outbox.ciphertext` | envelope_id |
+  | `sessions.blob` | peer_pub |
+  | `chan_state.own_dist` | name |
+  | `chan_peers.peer_dist` | channel_id ‖ peer_pub |
+  | `chan_inbox.plaintext` | channel_id |
+  | `peer_name_cache.username` | peer_pub |
+
+  Each row stores `nonce(24) || ct+tag`; AAD binds the row's
+  identifying column(s) so rows can't be quietly relocated. PRAGMA
+  `user_version = 3` marks the fully-encrypted schema; opening
+  without a key throws. Migrations from a legacy plaintext DB
+  (v0) or interim partially-encrypted (v2 — inbox+outbox only)
+  happen inside a single transaction. Verified by three gtest cases
+  (`AtRestEncryptionRoundTrip`, `AtRestEncryptionCoversAllSensitive
+  Tables`, `AtRestRefusesUnkeyedReopen`) — each writes canary
+  plaintexts through the high-level API, then greps the raw .db
+  file to assert no canary leaks through.
 - ⚠️ **`Envelope.aad` field declared but never bound.** The proto
   comment promises that `envelope_id || timestamp_ms` is covered by
   the AEAD tag; in practice the inner ratchet/SenderKeys encrypt is
@@ -229,41 +248,57 @@ and are end-to-end encrypted. There's no plan to hide voice-room
 membership from the server in centralized mode; call this out
 explicitly in user-facing docs.
 
-## 7. ⚠️ At-rest plaintext (SQLite store)
+## 7. ✅ At-rest storage (SQLite store)
 
-`core/src/store/sqlite_store.cpp` is plain SQLite. Both schema
-comment and code carry `TODO(sqlcipher)` markers. Tables containing
-sensitive data:
+`core/src/store/sqlite_store.cpp` now AEAD-wraps every sensitive
+column. Master key derives from the vault seed via
+`HKDF-SHA256(seed, info="FinBit-DB-Master-v1")`. Per-table sub-keys
+derive from the master via `HKDF-SHA256(master, info="FinBit-DB-
+<Table>-v1")`. AEAD: XChaCha20-Poly1305-IETF, 24-byte random nonce
+per row, `nonce ‖ ct+tag` stored on disk.
 
-| Table | Sensitive content | Compromise impact |
+| Table | Encrypted column | AAD |
 |---|---|---|
-| `identities` | `sec` (Ed25519 secret key, legacy) | Identity takeover. Vault is now the source of truth — could drop this column. |
-| `inbox` | `plaintext` (received DMs) | Past messages exposed. |
-| `outbox` | `ciphertext` (column misnamed — actually plaintext) | Past messages exposed. |
-| `sessions` | ratchet state blob | Future-message decryption if attacker also captures network. |
-| `chan_state`, `chan_inbox`, `chan_peers` | channel keys + plaintext | Channel-history exposed. |
-| `peer_name_cache` | username ↔ pubkey | Social-graph metadata. |
+| `inbox` | `plaintext` | envelope_id |
+| `outbox` | `ciphertext` | envelope_id |
+| `sessions` | `blob` | peer_pub |
+| `chan_state` | `own_dist` | name |
+| `chan_peers` | `peer_dist` | channel_id ‖ peer_pub |
+| `chan_inbox` | `plaintext` | channel_id |
+| `peer_name_cache` | `username` | peer_pub |
 
-The vault encrypts the seed with the user's passphrase, but message
-history sits next to it in cleartext. **Anyone who steals the data
-directory reads every past message without prompting for the
-passphrase.** This is the largest delta from the design intent.
+Schema versioning via `PRAGMA user_version`:
+- 0 = legacy plaintext (no migration triggered without a key).
+- 2 = interim release (inbox + outbox only — never built outside CI).
+- 3 = current encrypted-everywhere format.
 
-Recommended remediations, in increasing order of effort:
+Open paths:
+- `open(path)` (no key) on v3 DB → throws.
+- `open(path, master_key)` on v0 → atomic migration, bumps to v3.
+- `open(path, master_key)` on v2 → atomic migration of remaining
+  tables, bumps to v3.
+- `open(path, master_key)` on v3 with WRONG key → reads silently
+  drop rows (auth failure on each row), writes succeed under wrong
+  key (un-readable on the next correct-key open).
 
-1. **Drop the `identities.sec` column** — unused since LoginDialog;
-   removes one redundant secret-at-rest.
-2. **Wrap inbox/outbox plaintext columns with the same vault key** —
-   AEAD per row, key derived from the seed via HKDF with a per-table
-   info string. Adds nothing on disk except an extra 16-byte tag per
-   row. Doable in a single store-layer PR.
-3. **Switch SQLite ↔ SQLCipher** — encrypts the whole database file
-   transparently. Per-row option (#2) is simpler and equally
-   effective for confidentiality at rest; SQLCipher is what the
-   plan called for.
+In-memory hygiene: master key zeroed in ChatClient::connect
+immediately after `SqliteStore::open()` returns; per-table sub-keys
+zeroed in `~Impl()`.
 
-Recommend option 2 as the immediate next step; option 3 if a single
-on-disk format is preferred.
+Tables NOT encrypted (intentionally — non-sensitive):
+- `peer_keys`, `prekey_bundles`, `srv_offline`, `srv_directory`,
+  `srv_prekey_bundles` (server-side; the server can't decrypt
+  anyway).
+- `carry_ledger` (counter, not content).
+- `identities.pub` (public key, not secret). The `identities.sec`
+  column is no longer written by ChatClient (legacy fallback path
+  was removed).
+
+Tests: `TmpDb.AtRestEncryptionRoundTrip` and
+`TmpDb.AtRestEncryptionCoversAllSensitiveTables` write canary
+plaintexts through the high-level API and grep the raw `.db` file
+for the canaries. Both must be absent. `TmpDb.AtRestRefusesUnkeyed
+Reopen` verifies the v3-without-key throw.
 
 ## 8. Empirical results
 
@@ -280,11 +315,12 @@ on-disk format is preferred.
 
 In rough priority order:
 
-1. Encrypt local message store at rest (option 2 above — per-row AEAD
-   keyed off the vault seed). Closes the largest known gap.
-2. Drop the unused `identities.sec` column.
+1. ~~Encrypt local message store at rest~~ — **done in §7.**
+2. ~~Drop the unused `identities.sec` column~~ — **stopped writing
+   to it; column kept for backwards-read of legacy DBs.**
 3. Either populate `Envelope.aad` and bind it via inner-encrypt
    `outer_aad`, or update the proto comment to drop the promise.
+   (Currently the comment is updated; the binding is still TODO.)
 4. Plan migration to MLS (RFC 9420) for channels — gets membership-
    removal rekey + forward secrecy that SenderKeys can't.
 5. Document explicitly to users: the centralized server learns

@@ -338,7 +338,31 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
             QDir().mkpath(data_root);
             impl_->store_path =
                 (data_root + "/" + impl_->username + ".db").toStdString();
-            impl_->store = fb::store::SqliteStore::open(impl_->store_path);
+            // Derive a 32-byte at-rest encryption key from the vault seed
+            // via HKDF before the store opens — sensitive columns
+            // (inbox/outbox plaintext) are AEAD-wrapped per row using
+            // sub-keys of this master. First-time opens migrate any
+            // legacy plaintext rows in a single transaction; bumps
+            // PRAGMA user_version 0→2.
+            std::array<std::uint8_t, 32> store_master_key{};
+            {
+                static constexpr std::string_view kInfo = "FinBit-DB-Master-v1";
+                auto prk = fb::crypto::hkdf_extract(
+                    std::span<const std::uint8_t>(),
+                    std::span<const std::uint8_t>(impl_->seed.data(),
+                                                   impl_->seed.size()));
+                auto vec = fb::crypto::hkdf_expand(prk,
+                    std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(kInfo.data()),
+                        kInfo.size()),
+                    32);
+                std::memcpy(store_master_key.data(), vec.data(), 32);
+                sodium_memzero(vec.data(), vec.size());
+            }
+            impl_->store = fb::store::SqliteStore::open(
+                impl_->store_path,
+                std::span<const std::uint8_t>(store_master_key.data(), 32));
+            sodium_memzero(store_master_key.data(), store_master_key.size());
 
             impl_->identity = fb::crypto::Identity::from_seed(impl_->seed);
             // We intentionally no longer call save_identity() — it was a

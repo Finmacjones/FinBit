@@ -37,11 +37,27 @@ namespace fb::store {
 
 class SqliteStore {
 public:
-    // Open / create the store at `path`. If `passphrase` is non-empty AND
-    // SQLCipher is compiled in, the DB is keyed; otherwise passphrase is
-    // ignored with a warning logged.
-    [[nodiscard]] static std::unique_ptr<SqliteStore> open(const std::string& path,
-                                                           std::string_view passphrase = {});
+    // Open / create the store at `path`.
+    //
+    // When `master_key` is non-empty (32 bytes — typically derived from
+    // the user's vault seed via HKDF), at-rest encryption is enabled:
+    // sensitive columns (inbox/outbox plaintext, ratchet sessions,
+    // channel state, peer-name cache) are AEAD-wrapped per row using
+    // per-table sub-keys derived via HKDF-SHA256(master_key,
+    // info="FinBit-DB-<Table>-v1"). Each row carries its own 24-byte
+    // random XChaCha20-Poly1305 nonce; AAD binds the row's primary key
+    // so a row can't be moved between primary keys.
+    //
+    // The DB tracks its mode via PRAGMA user_version:
+    //   0 = legacy plaintext (no migration triggered)
+    //   2 = encrypted (master_key REQUIRED on every open)
+    //
+    // Opening an encrypted DB without a master_key throws. Opening a
+    // legacy-plaintext DB WITH a master_key migrates rows in place
+    // inside a single SQLite transaction, then bumps user_version to 2.
+    [[nodiscard]] static std::unique_ptr<SqliteStore> open(
+        const std::string& path,
+        std::span<const std::uint8_t> master_key = {});
 
     SqliteStore(const SqliteStore&)            = delete;
     SqliteStore& operator=(const SqliteStore&) = delete;

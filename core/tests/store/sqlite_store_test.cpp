@@ -167,3 +167,152 @@ TEST_F(TmpDb, PeerNameCache) {
     ASSERT_EQ(all.size(), 1u);
     EXPECT_EQ(all[0].username, "alicia");
 }
+
+// At-rest AEAD: opening with a master_key wraps inbox/outbox plaintext
+// columns; decryption is automatic on the read path; the canary
+// plaintext does NOT appear anywhere in the .db file once written.
+TEST_F(TmpDb, AtRestEncryptionRoundTrip) {
+    std::array<std::uint8_t, 32> master_key{};
+    for (std::size_t i = 0; i < master_key.size(); ++i) {
+        master_key[i] = static_cast<std::uint8_t>(i + 1);
+    }
+    const std::string canary = "ATREST_CANARY_NEEDLE_XYZZY";
+    auto envid = bytes({0x10, 0x11, 0x12, 0x13});
+    auto peer  = bytes({0x20, 0x21, 0x22, 0x23});
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        std::vector<std::uint8_t> pt(canary.begin(), canary.end());
+        s->append_inbox(span_of(envid), span_of(peer), span_of(pt), 12345);
+        s->append_outbox(span_of(envid), span_of(peer), span_of(pt), 12345);
+    }
+    // Re-open under the same key; decryption surfaces the canary.
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        auto rows = s->recent_inbox(10);
+        ASSERT_EQ(rows.size(), 1u);
+        std::string got(rows[0].plaintext.begin(), rows[0].plaintext.end());
+        EXPECT_EQ(got, canary);
+        auto out_rows = s->recent_outbox(10);
+        ASSERT_EQ(out_rows.size(), 1u);
+        std::string got_out(out_rows[0].plaintext.begin(), out_rows[0].plaintext.end());
+        EXPECT_EQ(got_out, canary);
+    }
+    // The canary must NOT appear in the raw on-disk bytes.
+    FILE* f = std::fopen(path.c_str(), "rb");
+    ASSERT_NE(f, nullptr);
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<char> file(static_cast<std::size_t>(sz));
+    ASSERT_EQ(std::fread(file.data(), 1, file.size(), f), file.size());
+    std::fclose(f);
+    const auto needle = std::string_view(canary);
+    EXPECT_EQ(std::string_view(file.data(), file.size()).find(needle),
+              std::string_view::npos)
+        << "canary plaintext leaked through to the SQLite file — at-rest "
+           "encryption is not active";
+    // Re-opening under a WRONG key drops rows on read (returns empty).
+    std::array<std::uint8_t, 32> wrong_key{};
+    for (auto& b : wrong_key) b = 0xff;
+    auto s = fb::store::SqliteStore::open(path,
+        std::span<const std::uint8_t>(wrong_key.data(), wrong_key.size()));
+    EXPECT_TRUE(s->recent_inbox(10).empty());
+    EXPECT_TRUE(s->recent_outbox(10).empty());
+}
+
+// At-rest AEAD also covers sessions, channels, and the peer-name
+// cache (the rest of the on-disk surface). Each test writes through
+// the high-level API, then greps the raw .db file for the canary
+// — must be absent. Reopens under the same key surface the canary
+// through the read path.
+TEST_F(TmpDb, AtRestEncryptionCoversAllSensitiveTables) {
+    std::array<std::uint8_t, 32> master_key{};
+    for (std::size_t i = 0; i < master_key.size(); ++i) {
+        master_key[i] = static_cast<std::uint8_t>(0xa0 + i);
+    }
+    const std::string canary_session = "SESSION_BLOB_CANARY_AAAAAAAA";
+    const std::string canary_chan_dist = "CHAN_DIST_CANARY_BBBBBBBB";
+    const std::string canary_peer_dist = "PEER_DIST_CANARY_CCCCCCCC";
+    const std::string canary_chan_msg = "CHAN_MSG_CANARY_DDDDDDDD";
+    const std::string canary_username = "CANARY_USERNAME_EEEEEEEE";
+    auto peer_pub = bytes({0x01, 0x02, 0x03, 0x04});
+    auto chan_id = bytes({0x10, 0x11, 0x12, 0x13});
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        std::vector<std::uint8_t> v;
+        v.assign(canary_session.begin(),    canary_session.end());
+        s->save_session(span_of(peer_pub), span_of(v));
+        v.assign(canary_chan_dist.begin(),  canary_chan_dist.end());
+        s->chan_save("general", span_of(chan_id), span_of(v));
+        v.assign(canary_peer_dist.begin(),  canary_peer_dist.end());
+        s->chan_save_peer(span_of(chan_id), span_of(peer_pub), span_of(v));
+        v.assign(canary_chan_msg.begin(),   canary_chan_msg.end());
+        s->chan_append_inbox(span_of(chan_id), span_of(peer_pub), span_of(v),
+                              42);
+        s->cache_peer_name(span_of(peer_pub), canary_username);
+    }
+    // Re-open under the same key; every read returns the canary.
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        auto sess = s->load_session(span_of(peer_pub));
+        ASSERT_TRUE(sess.has_value());
+        EXPECT_EQ(std::string(sess->begin(), sess->end()), canary_session);
+
+        auto chans = s->chan_list();
+        ASSERT_EQ(chans.size(), 1u);
+        EXPECT_EQ(std::string(chans[0].own_dist.begin(), chans[0].own_dist.end()),
+                  canary_chan_dist);
+
+        auto peers = s->chan_peers(span_of(chan_id));
+        ASSERT_EQ(peers.size(), 1u);
+        EXPECT_EQ(std::string(peers[0].peer_dist.begin(),
+                              peers[0].peer_dist.end()),
+                  canary_peer_dist);
+
+        auto msgs = s->chan_recent_inbox(span_of(chan_id), 10);
+        ASSERT_EQ(msgs.size(), 1u);
+        EXPECT_EQ(std::string(msgs[0].plaintext.begin(),
+                              msgs[0].plaintext.end()),
+                  canary_chan_msg);
+
+        EXPECT_EQ(*s->peer_name(span_of(peer_pub)), canary_username);
+    }
+    // None of the canaries appear in the raw on-disk bytes.
+    FILE* f = std::fopen(path.c_str(), "rb");
+    ASSERT_NE(f, nullptr);
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<char> file(static_cast<std::size_t>(sz));
+    ASSERT_EQ(std::fread(file.data(), 1, file.size(), f), file.size());
+    std::fclose(f);
+    const auto blob = std::string_view(file.data(), file.size());
+    for (const auto& canary : {canary_session, canary_chan_dist,
+                                canary_peer_dist, canary_chan_msg,
+                                canary_username}) {
+        EXPECT_EQ(blob.find(canary), std::string_view::npos)
+            << "leaked through to disk: " << canary;
+    }
+}
+
+// Reopening an encrypted DB with NO key throws — protects against
+// silently treating the wrapped blobs as plaintext.
+TEST_F(TmpDb, AtRestRefusesUnkeyedReopen) {
+    std::array<std::uint8_t, 32> master_key{};
+    for (std::size_t i = 0; i < master_key.size(); ++i) master_key[i] = 0x42;
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        auto envid = bytes({0xaa});
+        auto peer  = bytes({0xbb});
+        auto pt    = bytes({0xcc, 0xdd});
+        s->append_inbox(span_of(envid), span_of(peer), span_of(pt), 1);
+    }
+    EXPECT_THROW({
+        auto s = fb::store::SqliteStore::open(path);
+    }, std::runtime_error);
+}

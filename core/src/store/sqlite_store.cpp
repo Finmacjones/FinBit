@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/store/sqlite_store.hpp"
 
+#include <sodium.h>
 #include <sqlite3.h>
 
+#include <array>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
+
+#include "fb/crypto/hkdf.hpp"
 
 namespace fb::store {
 namespace {
@@ -95,11 +99,97 @@ void throw_sqlite(const std::string& ctx, sqlite3* db) {
     throw std::runtime_error(ctx + ": " + (db ? sqlite3_errmsg(db) : "no db"));
 }
 
+// XChaCha20-Poly1305-IETF parameters.
+constexpr std::size_t kXNonce = crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;   // 24
+constexpr std::size_t kXTag   = crypto_aead_xchacha20poly1305_ietf_ABYTES;      // 16
+constexpr std::size_t kKeyLen = 32;
+
+// HKDF-SHA256 expand-only with no salt (master_key acts as the
+// pseudo-random key already; we just label the output per table).
+std::array<std::uint8_t, kKeyLen> derive_table_key(
+    std::span<const std::uint8_t> master_key, const char* info) {
+    auto prk = fb::crypto::hkdf_extract(
+        std::span<const std::uint8_t>(),
+        std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+    auto vec = fb::crypto::hkdf_expand(prk,
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(info),
+            std::strlen(info)),
+        kKeyLen);
+    std::array<std::uint8_t, kKeyLen> out{};
+    std::memcpy(out.data(), vec.data(), kKeyLen);
+    return out;
+}
+
+// Wrap `plaintext` as `nonce(24) || ct+tag`. AAD binds `aad` (typically
+// the row's primary-key bytes) so a row can't be quietly relocated.
+std::vector<std::uint8_t> aead_wrap(
+    const std::array<std::uint8_t, kKeyLen>& key,
+    std::span<const std::uint8_t> plaintext,
+    std::span<const std::uint8_t> aad) {
+    std::vector<std::uint8_t> out(kXNonce + plaintext.size() + kXTag);
+    std::uint8_t* nonce = out.data();
+    std::uint8_t* ct    = nonce + kXNonce;
+    randombytes_buf(nonce, kXNonce);
+    unsigned long long ct_len = 0;
+    if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+            ct, &ct_len, plaintext.data(), plaintext.size(),
+            aad.data(), aad.size(), nullptr, nonce, key.data()) != 0) {
+        throw std::runtime_error("aead_wrap: encrypt failed");
+    }
+    out.resize(kXNonce + ct_len);
+    return out;
+}
+
+// Inverse of aead_wrap. Returns nullopt on tag-mismatch (corruption,
+// wrong key, or row-relocation attack — the AAD-as-PK binding makes
+// the last case detectable).
+std::optional<std::vector<std::uint8_t>> aead_unwrap(
+    const std::array<std::uint8_t, kKeyLen>& key,
+    std::span<const std::uint8_t> blob,
+    std::span<const std::uint8_t> aad) {
+    if (blob.size() < kXNonce + kXTag) return std::nullopt;
+    const std::uint8_t* nonce = blob.data();
+    const std::uint8_t* ct    = nonce + kXNonce;
+    const std::size_t   ct_len = blob.size() - kXNonce;
+    std::vector<std::uint8_t> out(ct_len - kXTag);
+    unsigned long long pt_len = 0;
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+            out.data(), &pt_len, nullptr, ct, ct_len,
+            aad.data(), aad.size(), nonce, key.data()) != 0) {
+        return std::nullopt;
+    }
+    out.resize(pt_len);
+    return out;
+}
+
 }  // namespace
 
 struct SqliteStore::Impl {
     sqlite3* db = nullptr;
+
+    // At-rest encryption state. encrypt_at_rest is true exactly when
+    // open() received a non-empty master_key. inbox_key / outbox_key
+    // are derived once at open via HKDF; nullptr keys when disabled.
+    bool encrypt_at_rest = false;
+    std::array<std::uint8_t, kKeyLen> inbox_key{};
+    std::array<std::uint8_t, kKeyLen> outbox_key{};
+    std::array<std::uint8_t, kKeyLen> sessions_key{};
+    std::array<std::uint8_t, kKeyLen> chan_state_key{};
+    std::array<std::uint8_t, kKeyLen> chan_peers_key{};
+    std::array<std::uint8_t, kKeyLen> chan_inbox_key{};
+    std::array<std::uint8_t, kKeyLen> peer_name_key{};
+
     ~Impl() {
+        // Best-effort: zero the table keys before the process exits so
+        // a core-dump after Close-without-Quit doesn't carry them.
+        sodium_memzero(inbox_key.data(),       inbox_key.size());
+        sodium_memzero(outbox_key.data(),      outbox_key.size());
+        sodium_memzero(sessions_key.data(),    sessions_key.size());
+        sodium_memzero(chan_state_key.data(),  chan_state_key.size());
+        sodium_memzero(chan_peers_key.data(),  chan_peers_key.size());
+        sodium_memzero(chan_inbox_key.data(),  chan_inbox_key.size());
+        sodium_memzero(peer_name_key.data(),   peer_name_key.size());
         if (db) sqlite3_close(db);
     }
 
@@ -124,22 +214,202 @@ struct SqliteStore::Impl {
 SqliteStore::SqliteStore() : impl_(std::make_unique<Impl>()) {}
 SqliteStore::~SqliteStore() = default;
 
-std::unique_ptr<SqliteStore> SqliteStore::open(const std::string& path,
-                                               std::string_view passphrase) {
+namespace {
+// v0 = legacy plaintext schema (no migration). v2 = inbox + outbox
+// encrypted (interim release). v3 = also sessions, channel state,
+// channel peers, channel inbox, peer-name cache. New encrypted DBs
+// are created at v3 directly.
+constexpr int kSchemaVersionEncrypted = 3;
+
+int read_user_version(sqlite3* db) {
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &stmt, nullptr) != SQLITE_OK) {
+        return 0;
+    }
+    int v = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        v = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return v;
+}
+}  // namespace
+
+std::unique_ptr<SqliteStore> SqliteStore::open(
+    const std::string& path,
+    std::span<const std::uint8_t> master_key) {
     auto s = std::unique_ptr<SqliteStore>(new SqliteStore());
     if (sqlite3_open(path.c_str(), &s->impl_->db) != SQLITE_OK) {
         throw_sqlite("open", s->impl_->db);
     }
-    if (!passphrase.empty()) {
-        // TODO(sqlcipher): when SQLCipher is the underlying lib, run:
-        //   sqlite3_key(impl_->db, passphrase.data(), passphrase.size());
-        // Plain SQLite has no such symbol; passphrase is silently ignored for
-        // Phase 0.
-        (void)passphrase;
-    }
     s->impl_->exec(kSchema);
     s->impl_->exec("PRAGMA journal_mode = WAL;");
     s->impl_->exec("PRAGMA synchronous = NORMAL;");
+
+    const int version = read_user_version(s->impl_->db);
+    const bool have_key = !master_key.empty();
+    if (have_key && master_key.size() != kKeyLen) {
+        throw std::runtime_error(
+            "SqliteStore::open: master_key must be exactly 32 bytes");
+    }
+
+    if (version == kSchemaVersionEncrypted && !have_key) {
+        throw std::runtime_error(
+            "SqliteStore::open: database is encrypted at rest "
+            "(user_version=2) but no master_key was provided");
+    }
+    if (have_key) {
+        s->impl_->encrypt_at_rest = true;
+        s->impl_->inbox_key       = derive_table_key(master_key, "FinBit-DB-Inbox-v1");
+        s->impl_->outbox_key      = derive_table_key(master_key, "FinBit-DB-Outbox-v1");
+        s->impl_->sessions_key    = derive_table_key(master_key, "FinBit-DB-Sessions-v1");
+        s->impl_->chan_state_key  = derive_table_key(master_key, "FinBit-DB-ChanState-v1");
+        s->impl_->chan_peers_key  = derive_table_key(master_key, "FinBit-DB-ChanPeers-v1");
+        s->impl_->chan_inbox_key  = derive_table_key(master_key, "FinBit-DB-ChanInbox-v1");
+        s->impl_->peer_name_key   = derive_table_key(master_key, "FinBit-DB-PeerName-v1");
+    }
+    if (have_key && version < kSchemaVersionEncrypted) {
+        // Migration from legacy plaintext (v0) or partially-encrypted
+        // (v2 — inbox+outbox only). Single transaction across every
+        // table so a crash mid-migration leaves the DB readable either
+        // fully wrapped or fully plaintext, never partial.
+        s->impl_->exec("BEGIN IMMEDIATE;");
+        try {
+            // Common inner step: read every (aad, plaintext) row from a
+            // table, wrap each plaintext under `key` with the row's aad,
+            // and UPDATE the column. select_sql / update_sql arrays are
+            // SQLite text; aad_cols + plaintext_col are 0-based column
+            // indices on the SELECT result.
+            auto wrap_table = [&](const auto& key,
+                                  const char* select_sql,
+                                  const char* update_sql,
+                                  std::initializer_list<int> aad_cols,
+                                  int plaintext_col) {
+                struct Row {
+                    std::vector<std::uint8_t> aad;
+                    std::vector<std::uint8_t> pt;
+                    std::vector<std::vector<std::uint8_t>> where_keys;
+                };
+                std::vector<Row> rows;
+                sqlite3_stmt* sel = s->impl_->prep(select_sql);
+                while (sqlite3_step(sel) == SQLITE_ROW) {
+                    Row r;
+                    for (int col : aad_cols) {
+                        const auto* p = static_cast<const std::uint8_t*>(
+                            sqlite3_column_blob(sel, col));
+                        const int n = sqlite3_column_bytes(sel, col);
+                        r.where_keys.emplace_back(p, p + n);
+                        r.aad.insert(r.aad.end(), p, p + n);
+                    }
+                    const auto* p = static_cast<const std::uint8_t*>(
+                        sqlite3_column_blob(sel, plaintext_col));
+                    const int n = sqlite3_column_bytes(sel, plaintext_col);
+                    r.pt.assign(p, p + n);
+                    rows.push_back(std::move(r));
+                }
+                sqlite3_finalize(sel);
+                sqlite3_stmt* upd = s->impl_->prep(update_sql);
+                for (const auto& r : rows) {
+                    auto wrapped = aead_wrap(key,
+                        std::span<const std::uint8_t>(r.pt.data(), r.pt.size()),
+                        std::span<const std::uint8_t>(r.aad.data(), r.aad.size()));
+                    int idx = 1;
+                    sqlite3_bind_blob(upd, idx++, wrapped.data(),
+                                      static_cast<int>(wrapped.size()),
+                                      SQLITE_TRANSIENT);
+                    for (const auto& k : r.where_keys) {
+                        sqlite3_bind_blob(upd, idx++, k.data(),
+                                          static_cast<int>(k.size()),
+                                          SQLITE_TRANSIENT);
+                    }
+                    if (sqlite3_step(upd) != SQLITE_DONE) {
+                        sqlite3_finalize(upd);
+                        throw std::runtime_error("migration UPDATE failed");
+                    }
+                    sqlite3_reset(upd);
+                }
+                sqlite3_finalize(upd);
+            };
+
+            if (version < 2) {
+                wrap_table(s->impl_->inbox_key,
+                    "SELECT envelope_id, plaintext FROM inbox;",
+                    "UPDATE inbox SET plaintext = ? WHERE envelope_id = ?;",
+                    {0}, 1);
+                wrap_table(s->impl_->outbox_key,
+                    "SELECT envelope_id, ciphertext FROM outbox;",
+                    "UPDATE outbox SET ciphertext = ? WHERE envelope_id = ?;",
+                    {0}, 1);
+            }
+            // v2 → v3: wrap the remaining sensitive tables.
+            wrap_table(s->impl_->sessions_key,
+                "SELECT peer_pub, blob FROM sessions;",
+                "UPDATE sessions SET blob = ? WHERE peer_pub = ?;",
+                {0}, 1);
+            wrap_table(s->impl_->chan_state_key,
+                "SELECT name, own_dist FROM chan_state WHERE own_dist IS NOT NULL;",
+                "UPDATE chan_state SET own_dist = ? WHERE name = ?;",
+                {0}, 1);
+            wrap_table(s->impl_->chan_peers_key,
+                "SELECT channel_id, peer_pub, peer_dist FROM chan_peers;",
+                "UPDATE chan_peers SET peer_dist = ? "
+                    "WHERE channel_id = ? AND peer_pub = ?;",
+                {0, 1}, 2);
+            // chan_inbox is a special case: PK is autoinc `id`, but we
+            // want to bind AAD = channel_id (so a row can't be moved to
+            // a different channel). The wrap_table helper requires
+            // AAD-cols == WHERE-cols, so we inline this one.
+            {
+                struct Row { std::int64_t id;
+                             std::vector<std::uint8_t> chan_id;
+                             std::vector<std::uint8_t> pt; };
+                std::vector<Row> rows;
+                sqlite3_stmt* sel = s->impl_->prep(
+                    "SELECT id, channel_id, plaintext FROM chan_inbox;");
+                while (sqlite3_step(sel) == SQLITE_ROW) {
+                    Row r;
+                    r.id = sqlite3_column_int64(sel, 0);
+                    const auto* cp = static_cast<const std::uint8_t*>(
+                        sqlite3_column_blob(sel, 1));
+                    r.chan_id.assign(cp, cp + sqlite3_column_bytes(sel, 1));
+                    const auto* pp = static_cast<const std::uint8_t*>(
+                        sqlite3_column_blob(sel, 2));
+                    r.pt.assign(pp, pp + sqlite3_column_bytes(sel, 2));
+                    rows.push_back(std::move(r));
+                }
+                sqlite3_finalize(sel);
+                sqlite3_stmt* upd = s->impl_->prep(
+                    "UPDATE chan_inbox SET plaintext = ? WHERE id = ?;");
+                for (const auto& r : rows) {
+                    auto wrapped = aead_wrap(s->impl_->chan_inbox_key,
+                        std::span<const std::uint8_t>(r.pt.data(), r.pt.size()),
+                        std::span<const std::uint8_t>(r.chan_id.data(),
+                                                       r.chan_id.size()));
+                    sqlite3_bind_blob(upd, 1, wrapped.data(),
+                                      static_cast<int>(wrapped.size()),
+                                      SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(upd, 2, r.id);
+                    if (sqlite3_step(upd) != SQLITE_DONE) {
+                        sqlite3_finalize(upd);
+                        throw std::runtime_error(
+                            "migration: chan_inbox UPDATE failed");
+                    }
+                    sqlite3_reset(upd);
+                }
+                sqlite3_finalize(upd);
+            }
+            wrap_table(s->impl_->peer_name_key,
+                "SELECT peer_pub, username FROM peer_name_cache;",
+                "UPDATE peer_name_cache SET username = ? WHERE peer_pub = ?;",
+                {0}, 1);
+
+            s->impl_->exec("PRAGMA user_version = 3;");
+            s->impl_->exec("COMMIT;");
+        } catch (...) {
+            s->impl_->exec("ROLLBACK;");
+            throw;
+        }
+    }
     return s;
 }
 
@@ -213,11 +483,17 @@ std::optional<std::vector<std::uint8_t>> SqliteStore::lookup_peer(
 
 void SqliteStore::save_session(std::span<const std::uint8_t> peer_pub,
                                std::span<const std::uint8_t> blob) {
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = blob;
+    if (impl_->encrypt_at_rest) {
+        wrapped = aead_wrap(impl_->sessions_key, blob, peer_pub);
+        stored  = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
     auto* stmt = impl_->prep(
         "INSERT OR REPLACE INTO sessions(peer_pub, blob, updated_ms) VALUES(?, ?, "
         "(strftime('%s','now') * 1000));");
     bind_blob(stmt, 1, peer_pub);
-    bind_blob(stmt, 2, blob);
+    bind_blob(stmt, 2, stored);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         sqlite3_finalize(stmt);
         throw_sqlite("save_session", impl_->db);
@@ -230,7 +506,17 @@ std::optional<std::vector<std::uint8_t>> SqliteStore::load_session(
     auto* stmt = impl_->prep("SELECT blob FROM sessions WHERE peer_pub = ?;");
     bind_blob(stmt, 1, peer_pub);
     std::optional<std::vector<std::uint8_t>> out;
-    if (sqlite3_step(stmt) == SQLITE_ROW) out = column_blob(stmt, 0);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        auto stored = column_blob(stmt, 0);
+        if (impl_->encrypt_at_rest) {
+            auto pt = aead_unwrap(impl_->sessions_key,
+                std::span<const std::uint8_t>(stored.data(), stored.size()),
+                peer_pub);
+            if (pt) out = std::move(*pt);
+        } else {
+            out = std::move(stored);
+        }
+    }
     sqlite3_finalize(stmt);
     return out;
 }
@@ -239,12 +525,20 @@ void SqliteStore::append_inbox(std::span<const std::uint8_t> envelope_id,
                                std::span<const std::uint8_t> peer_pub,
                                std::span<const std::uint8_t> plaintext,
                                std::uint64_t timestamp_ms) {
+    // When at-rest encryption is on, wrap the plaintext column with the
+    // inbox sub-key and bind envelope_id as AAD so a row can't be moved.
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = plaintext;
+    if (impl_->encrypt_at_rest) {
+        wrapped = aead_wrap(impl_->inbox_key, plaintext, envelope_id);
+        stored  = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
     auto* stmt = impl_->prep(
         "INSERT OR IGNORE INTO inbox(envelope_id, peer_pub, plaintext, ts_ms) VALUES(?, ?, ?, "
         "?);");
     bind_blob(stmt, 1, envelope_id);
     bind_blob(stmt, 2, peer_pub);
-    bind_blob(stmt, 3, plaintext);
+    bind_blob(stmt, 3, stored);
     sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(timestamp_ms));
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -254,12 +548,22 @@ void SqliteStore::append_outbox(std::span<const std::uint8_t> envelope_id,
                                 std::span<const std::uint8_t> peer_pub,
                                 std::span<const std::uint8_t> ciphertext,
                                 std::uint64_t timestamp_ms) {
+    // The column is named `ciphertext` but historically held plaintext
+    // bytes (see chat_client.cpp comment). With at-rest encryption on,
+    // it now stores genuine ciphertext: nonce || aead(plaintext, AAD =
+    // envelope_id), wrapped under the outbox sub-key.
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = ciphertext;
+    if (impl_->encrypt_at_rest) {
+        wrapped = aead_wrap(impl_->outbox_key, ciphertext, envelope_id);
+        stored  = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
     auto* stmt = impl_->prep(
         "INSERT OR IGNORE INTO outbox(envelope_id, peer_pub, ciphertext, ts_ms) VALUES(?, ?, ?, "
         "?);");
     bind_blob(stmt, 1, envelope_id);
     bind_blob(stmt, 2, peer_pub);
-    bind_blob(stmt, 3, ciphertext);
+    bind_blob(stmt, 3, stored);
     sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(timestamp_ms));
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -275,7 +579,23 @@ std::vector<SqliteStore::InboxRow> SqliteStore::recent_inbox(std::size_t limit) 
         InboxRow r;
         r.envelope_id = column_blob(stmt, 0);
         r.peer_pub = column_blob(stmt, 1);
-        r.plaintext = column_blob(stmt, 2);
+        auto stored = column_blob(stmt, 2);
+        if (impl_->encrypt_at_rest) {
+            auto pt = aead_unwrap(impl_->inbox_key,
+                std::span<const std::uint8_t>(stored.data(), stored.size()),
+                std::span<const std::uint8_t>(r.envelope_id.data(),
+                                               r.envelope_id.size()));
+            if (!pt) {
+                // Skip corrupted / wrong-key rows rather than abort —
+                // surfaces as a missing entry in history rather than a
+                // crash. The user notices and we log nothing here
+                // (would dilute the canary-grep blindness check).
+                continue;
+            }
+            r.plaintext = std::move(*pt);
+        } else {
+            r.plaintext = std::move(stored);
+        }
         r.timestamp_ms = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
         rows.push_back(std::move(r));
     }
@@ -284,8 +604,6 @@ std::vector<SqliteStore::InboxRow> SqliteStore::recent_inbox(std::size_t limit) 
 }
 
 std::vector<SqliteStore::OutboxRow> SqliteStore::recent_outbox(std::size_t limit) const {
-    // Note: column is named `ciphertext` but holds plaintext bytes — see
-    // the append_outbox call site comment in chat_client.cpp.
     auto* stmt =
         impl_->prep("SELECT envelope_id, peer_pub, ciphertext, ts_ms FROM outbox "
                     "ORDER BY ts_ms DESC LIMIT ?;");
@@ -295,7 +613,17 @@ std::vector<SqliteStore::OutboxRow> SqliteStore::recent_outbox(std::size_t limit
         OutboxRow r;
         r.envelope_id = column_blob(stmt, 0);
         r.peer_pub = column_blob(stmt, 1);
-        r.plaintext = column_blob(stmt, 2);
+        auto stored = column_blob(stmt, 2);
+        if (impl_->encrypt_at_rest) {
+            auto pt = aead_unwrap(impl_->outbox_key,
+                std::span<const std::uint8_t>(stored.data(), stored.size()),
+                std::span<const std::uint8_t>(r.envelope_id.data(),
+                                               r.envelope_id.size()));
+            if (!pt) continue;
+            r.plaintext = std::move(*pt);
+        } else {
+            r.plaintext = std::move(stored);
+        }
         r.timestamp_ms = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
         rows.push_back(std::move(r));
     }
@@ -397,13 +725,21 @@ std::optional<std::vector<std::uint8_t>> SqliteStore::srv_get_prekey_bundle(
 
 void SqliteStore::chan_save(const std::string& name, std::span<const std::uint8_t> channel_id,
                              std::span<const std::uint8_t> own_dist) {
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = own_dist;
+    if (impl_->encrypt_at_rest && !own_dist.empty()) {
+        const auto* nm = reinterpret_cast<const std::uint8_t*>(name.data());
+        wrapped = aead_wrap(impl_->chan_state_key, own_dist,
+            std::span<const std::uint8_t>(nm, name.size()));
+        stored = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
     auto* stmt = impl_->prep(
         "INSERT INTO chan_state(name, channel_id, own_dist) VALUES(?, ?, ?) "
         "ON CONFLICT(name) DO UPDATE SET channel_id = excluded.channel_id, "
         "own_dist = excluded.own_dist;");
     sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_TRANSIENT);
     bind_blob(stmt, 2, channel_id);
-    bind_blob(stmt, 3, own_dist);
+    bind_blob(stmt, 3, stored);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }
@@ -416,7 +752,18 @@ std::vector<SqliteStore::ChannelRow> SqliteStore::chan_list() const {
         const auto* nm = sqlite3_column_text(stmt, 0);
         if (nm) r.name = reinterpret_cast<const char*>(nm);
         r.channel_id = column_blob(stmt, 1);
-        r.own_dist = column_blob(stmt, 2);
+        auto stored = column_blob(stmt, 2);
+        if (impl_->encrypt_at_rest && !stored.empty()) {
+            const auto* nb = reinterpret_cast<const std::uint8_t*>(r.name.data());
+            auto pt = aead_unwrap(impl_->chan_state_key,
+                std::span<const std::uint8_t>(stored.data(), stored.size()),
+                std::span<const std::uint8_t>(nb, r.name.size()));
+            if (pt) r.own_dist = std::move(*pt);
+            // else: drop silently — channel will be unrecoverable but
+            // we don't crash the entire chan_list scan.
+        } else {
+            r.own_dist = std::move(stored);
+        }
         out.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -426,12 +773,24 @@ std::vector<SqliteStore::ChannelRow> SqliteStore::chan_list() const {
 void SqliteStore::chan_save_peer(std::span<const std::uint8_t> channel_id,
                                   std::span<const std::uint8_t> peer_pub,
                                   std::span<const std::uint8_t> peer_dist) {
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = peer_dist;
+    if (impl_->encrypt_at_rest) {
+        // AAD = channel_id || peer_pub.
+        std::vector<std::uint8_t> aad;
+        aad.reserve(channel_id.size() + peer_pub.size());
+        aad.insert(aad.end(), channel_id.begin(), channel_id.end());
+        aad.insert(aad.end(), peer_pub.begin(), peer_pub.end());
+        wrapped = aead_wrap(impl_->chan_peers_key, peer_dist,
+            std::span<const std::uint8_t>(aad.data(), aad.size()));
+        stored = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
     auto* stmt = impl_->prep(
         "INSERT INTO chan_peers(channel_id, peer_pub, peer_dist) VALUES(?, ?, ?) "
         "ON CONFLICT(channel_id, peer_pub) DO UPDATE SET peer_dist = excluded.peer_dist;");
     bind_blob(stmt, 1, channel_id);
     bind_blob(stmt, 2, peer_pub);
-    bind_blob(stmt, 3, peer_dist);
+    bind_blob(stmt, 3, stored);
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }
@@ -445,7 +804,20 @@ std::vector<SqliteStore::ChannelPeerRow> SqliteStore::chan_peers(
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         ChannelPeerRow r;
         r.peer_pub = column_blob(stmt, 0);
-        r.peer_dist = column_blob(stmt, 1);
+        auto stored = column_blob(stmt, 1);
+        if (impl_->encrypt_at_rest) {
+            std::vector<std::uint8_t> aad;
+            aad.reserve(channel_id.size() + r.peer_pub.size());
+            aad.insert(aad.end(), channel_id.begin(), channel_id.end());
+            aad.insert(aad.end(), r.peer_pub.begin(), r.peer_pub.end());
+            auto pt = aead_unwrap(impl_->chan_peers_key,
+                std::span<const std::uint8_t>(stored.data(), stored.size()),
+                std::span<const std::uint8_t>(aad.data(), aad.size()));
+            if (!pt) continue;
+            r.peer_dist = std::move(*pt);
+        } else {
+            r.peer_dist = std::move(stored);
+        }
         out.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
@@ -456,12 +828,18 @@ void SqliteStore::chan_append_inbox(std::span<const std::uint8_t> channel_id,
                                      std::span<const std::uint8_t> sender_pub,
                                      std::span<const std::uint8_t> plaintext,
                                      std::uint64_t timestamp_ms) {
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = plaintext;
+    if (impl_->encrypt_at_rest) {
+        wrapped = aead_wrap(impl_->chan_inbox_key, plaintext, channel_id);
+        stored = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
     auto* stmt = impl_->prep(
         "INSERT INTO chan_inbox(channel_id, sender_pub, plaintext, ts_ms) "
         "VALUES(?, ?, ?, ?);");
     bind_blob(stmt, 1, channel_id);
     bind_blob(stmt, 2, sender_pub);
-    bind_blob(stmt, 3, plaintext);
+    bind_blob(stmt, 3, stored);
     sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(timestamp_ms));
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -506,7 +884,17 @@ std::vector<SqliteStore::ChannelInboxRow> SqliteStore::chan_recent_inbox(
         ChannelInboxRow r;
         r.channel_id = column_blob(stmt, 0);
         r.sender_pub = column_blob(stmt, 1);
-        r.plaintext = column_blob(stmt, 2);
+        auto stored = column_blob(stmt, 2);
+        if (impl_->encrypt_at_rest) {
+            auto pt = aead_unwrap(impl_->chan_inbox_key,
+                std::span<const std::uint8_t>(stored.data(), stored.size()),
+                std::span<const std::uint8_t>(r.channel_id.data(),
+                                               r.channel_id.size()));
+            if (!pt) continue;
+            r.plaintext = std::move(*pt);
+        } else {
+            r.plaintext = std::move(stored);
+        }
         r.timestamp_ms = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 3));
         out.push_back(std::move(r));
     }
@@ -522,7 +910,15 @@ void SqliteStore::cache_peer_name(std::span<const std::uint8_t> peer_pub,
         "ON CONFLICT(peer_pub) DO UPDATE SET username = excluded.username, "
         "learned_ms = excluded.learned_ms;");
     bind_blob(stmt, 1, peer_pub);
-    sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_TRANSIENT);
+    if (impl_->encrypt_at_rest) {
+        const auto* up = reinterpret_cast<const std::uint8_t*>(username.data());
+        auto wrapped = aead_wrap(impl_->peer_name_key,
+            std::span<const std::uint8_t>(up, username.size()), peer_pub);
+        sqlite3_bind_blob(stmt, 2, wrapped.data(),
+                          static_cast<int>(wrapped.size()), SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_TRANSIENT);
+    }
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }
@@ -532,8 +928,16 @@ std::optional<std::string> SqliteStore::peer_name(std::span<const std::uint8_t> 
     bind_blob(stmt, 1, peer_pub);
     std::optional<std::string> out;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const auto* s = sqlite3_column_text(stmt, 0);
-        if (s) out = reinterpret_cast<const char*>(s);
+        if (impl_->encrypt_at_rest) {
+            auto stored = column_blob(stmt, 0);
+            auto pt = aead_unwrap(impl_->peer_name_key,
+                std::span<const std::uint8_t>(stored.data(), stored.size()),
+                peer_pub);
+            if (pt) out = std::string(pt->begin(), pt->end());
+        } else {
+            const auto* s = sqlite3_column_text(stmt, 0);
+            if (s) out = reinterpret_cast<const char*>(s);
+        }
     }
     sqlite3_finalize(stmt);
     return out;
@@ -546,8 +950,18 @@ std::vector<SqliteStore::CachedPeer> SqliteStore::all_cached_peers() const {
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         CachedPeer p;
         p.peer_pub = column_blob(stmt, 0);
-        const auto* s = sqlite3_column_text(stmt, 1);
-        if (s) p.username = reinterpret_cast<const char*>(s);
+        if (impl_->encrypt_at_rest) {
+            auto stored = column_blob(stmt, 1);
+            auto pt = aead_unwrap(impl_->peer_name_key,
+                std::span<const std::uint8_t>(stored.data(), stored.size()),
+                std::span<const std::uint8_t>(p.peer_pub.data(),
+                                               p.peer_pub.size()));
+            if (!pt) continue;
+            p.username = std::string(pt->begin(), pt->end());
+        } else {
+            const auto* s = sqlite3_column_text(stmt, 1);
+            if (s) p.username = reinterpret_cast<const char*>(s);
+        }
         out.push_back(std::move(p));
     }
     sqlite3_finalize(stmt);
