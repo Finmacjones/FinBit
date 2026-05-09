@@ -312,11 +312,18 @@ struct ChannelState {
     fb::store::SqliteStore::ChannelCrypto crypto =
         fb::store::SqliteStore::ChannelCrypto::kSenderKeys;
     // MLS group state when crypto == kMls. In-memory only — mls::Session
-    // doesn't expose stable TLS-syntax marshalling on its public API,
-    // so MLS channels work within a session but the state vanishes on
-    // restart. Tracked as a follow-up; meanwhile the receive path
-    // gracefully falls back to SenderKeys decrypt when mls is null.
+    // is reconstructed at process start by replaying the saved
+    // operation log against the bootstrap seed (see
+    // mls_group_save / mls_group_op_append / mls_group_load on the
+    // store). The receive path also gracefully falls back to
+    // SenderKeys decrypt when mls is null (e.g. before restore
+    // completes).
     std::unique_ptr<fb::crypto::MlsGroup> mls;
+    // Next sequence number to use when appending an op for this MLS
+    // channel to mls_group_log. Starts at 0 for newly-created groups,
+    // bumped after every state-mutating call and after every replayed
+    // op on restore.
+    std::int64_t mls_next_seq = 0;
     // Joiner-side state when WE are mid-join on this channel (we've
     // received an InviteRequest, replied with our KP, and are waiting
     // for a Welcome). Single-use; complete()d on receipt of the
@@ -600,6 +607,42 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                     std::span<const std::uint8_t>(cs.id.data(), cs.id.size()),
                     peer_pub, peer_dist);
             };
+            // MLS persistence: write the bootstrap seed for a kMls
+            // channel. Idempotent on the store side (UPSERT). Called
+            // exactly once per channel — at create() for the inviter,
+            // at Welcome.complete() for the joiner.
+            auto persist_mls_seed = [this](ChannelState& cs) {
+                if (!impl_->store || !cs.mls) return;
+                auto seed_blob = cs.mls->serialize_seed();
+                impl_->store->mls_group_save(
+                    std::span<const std::uint8_t>(cs.id.data(), cs.id.size()),
+                    std::span<const std::uint8_t>(seed_blob.data(),
+                                                   seed_blob.size()));
+                cs.mls_next_seq = 0;
+            };
+            // MLS persistence: append the most recent op produced by
+            // the live MlsGroup to the on-disk log. Each MlsGroup
+            // mutator (add_member / propose_add_member / commit_pending
+            // / handle_proposal / apply_commit) appends exactly one
+            // entry to operation_log(); this helper serializes that
+            // entry under the next sequence number.
+            //
+            // Call EXACTLY once per mutator call. If the call throws
+            // before this helper runs, no on-disk op is persisted —
+            // mlspp's State remains unchanged in that case (mutators
+            // only commit changes when they return without throwing),
+            // so the log stays consistent with the live state.
+            auto persist_mls_last_op = [this](ChannelState& cs) {
+                if (!impl_->store || !cs.mls) return;
+                auto ops = cs.mls->operation_log();
+                if (ops.empty()) return;
+                const auto& last = ops.back();
+                impl_->store->mls_group_op_append(
+                    std::span<const std::uint8_t>(cs.id.data(), cs.id.size()),
+                    cs.mls_next_seq,
+                    std::span<const std::uint8_t>(last.data(), last.size()));
+                cs.mls_next_seq++;
+            };
 
             // Restore persisted channels from the local store: reload the
             // GroupSession state, install peer distributions, subscribe.
@@ -611,22 +654,69 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                 std::memcpy(cs.id.data(), row.channel_id.data(), 32);
                 cs.own_dist = row.own_dist;
                 cs.crypto = row.crypto;
-                // Honest about persistence: MLS state lives only in
-                // memory (mls::Session has no public marshalling);
-                // restoring a kMls channel from disk leaves cs.mls
-                // null. Surface a one-time error per channel so the
-                // user knows to re-invite. Channel envelopes still
-                // get subscribed to below; receive will fall through
-                // to SenderKeys decrypt (fails for MLS-encrypted
-                // messages but stays alive for any SenderKeys
-                // messages that arrive — a sane mixed-mode degrade).
+                // MLS restore via the operation-replay layer:
+                // load the bootstrap seed + every saved op for this
+                // channel, hand both to MlsGroup::from_seed_and_log,
+                // and the rebuilt State is byte-equivalent to the
+                // pre-shutdown one. cs.mls_next_seq is set to the
+                // next free sequence number so future appends don't
+                // collide.
+                //
+                // If the channel is kMls but the store has no row
+                // for it (legacy DB created before persistence
+                // shipped, or the seed save was lost mid-write),
+                // fall through with cs.mls null. The receive path
+                // tolerates this — SenderKeys decrypt returns
+                // nullopt for MLS ciphertexts so the channel stays
+                // alive but messages from that epoch can't be read
+                // until a re-invite re-establishes the group.
                 if (cs.crypto ==
                     fb::store::SqliteStore::ChannelCrypto::kMls) {
-                    emit log(QString("MLS channel #%1 restored without "
-                                      "in-memory state — re-invite "
-                                      "members to re-establish "
-                                      "(see docs/security-audit.md §10)")
-                                 .arg(QString::fromStdString(row.name)));
+                    auto snap = impl_->store->mls_group_load(
+                        std::span<const std::uint8_t>(
+                            row.channel_id.data(), row.channel_id.size()));
+                    if (snap) {
+                        try {
+                            cs.mls = fb::crypto::MlsGroup::from_seed_and_log(
+                                std::span<const std::uint8_t>(
+                                    snap->seed.data(), snap->seed.size()),
+                                snap->ops);
+                            cs.mls_next_seq = snap->next_seq;
+                            // Membership cache: prime so the first
+                            // post-restart add fans out to existing
+                            // members instead of treating them as
+                            // new strangers.
+                            const auto& my_pub =
+                                impl_->identity->public_key();
+                            for (const auto& id :
+                                 cs.mls->member_identities()) {
+                                if (id.size() != 32) continue;
+                                if (std::equal(my_pub.begin(),
+                                                my_pub.end(),
+                                                id.begin())) continue;
+                                cs.mls_member_pubs.insert(
+                                    std::string(id.begin(), id.end()));
+                            }
+                            emit log(QString("MLS channel #%1 restored "
+                                              "(member_count=%2, "
+                                              "ops_replayed=%3)")
+                                         .arg(QString::fromStdString(row.name))
+                                         .arg(cs.mls->member_count())
+                                         .arg(static_cast<qulonglong>(snap->ops.size())));
+                        } catch (const std::exception& e) {
+                            emit errorOccurred(QString(
+                                "MLS restore for #%1 failed: %2 — "
+                                "re-invite members to re-establish")
+                                .arg(QString::fromStdString(row.name))
+                                .arg(e.what()));
+                        }
+                    } else {
+                        emit log(QString("MLS channel #%1 has no on-disk "
+                                          "seed (legacy or partial save) "
+                                          "— re-invite members to "
+                                          "re-establish")
+                                     .arg(QString::fromStdString(row.name)));
+                    }
                 }
 
                 // Try the full-state blob first; if absent, fall back to a
@@ -748,6 +838,12 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                             impl_->identity->public_key().data(), 32),
                                         std::span<const std::uint8_t, 32>(
                                             cs.id.data(), 32));
+                                    // Persist the seed BEFORE returning
+                                    // success — if the process dies
+                                    // between create and the first
+                                    // commit, the empty group is still
+                                    // restorable.
+                                    persist_mls_seed(cs);
                                 } catch (const std::exception& e) {
                                     emit errorOccurred(QString(
                                         "MLS create failed: %1 — falling back to "
@@ -1963,6 +2059,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                         m.key_package().size());
                                     auto proposal_bytes =
                                         cs.mls->propose_add_member(kp_span);
+                                    persist_mls_last_op(cs);
                                     // Snapshot existing members BEFORE
                                     // commit_pending advances the
                                     // roster — these are the peers we
@@ -2032,6 +2129,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                     }
                                     // Now commit and broadcast results.
                                     auto add = cs.mls->commit_pending();
+                                    persist_mls_last_op(cs);
                                     auto welcome_payload = pack_mls_welcome_payload(
                                         std::span<const std::uint8_t>(
                                             reinterpret_cast<const std::uint8_t*>(
@@ -2123,6 +2221,14 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                     cs.pending_join.reset();
                                     cs.crypto =
                                         fb::store::SqliteStore::ChannelCrypto::kMls;
+                                    // Persist the JOINER seed: the
+                                    // bootstrap that includes
+                                    // sig_priv + leaf_priv + init_priv
+                                    // + KeyPackage + Welcome bytes.
+                                    // No ops to log yet — the joiner
+                                    // starts at the post-Welcome
+                                    // state.
+                                    persist_mls_seed(cs);
                                     // Subscribe to the channel envelope
                                     // fan-out so future application
                                     // messages reach us.
@@ -2191,6 +2297,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                             reinterpret_cast<const std::uint8_t*>(
                                                 m.commit().data()),
                                             m.commit().size()));
+                                    persist_mls_last_op(cs);
                                     // Refresh membership cache after the
                                     // commit advances the roster.
                                     cs.mls_member_pubs.clear();
@@ -2234,6 +2341,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                             reinterpret_cast<const std::uint8_t*>(
                                                 m.proposal().data()),
                                             m.proposal().size()));
+                                    persist_mls_last_op(cs);
                                 } catch (const std::exception& e) {
                                     emit log(QString("MLS handle_proposal "
                                                       "failed: %1").arg(e.what()));

@@ -50,6 +50,20 @@ echo "== cloning mlspp (pin=${pin}) into ${TARGET}"
 mkdir -p "$(dirname "${TARGET}")"
 git clone --depth 1 --branch "${pin}" "${REPO_URL}" "${TARGET}"
 
+PATCH_DIR="${SCRIPT_DIR}/mlspp-patches"
+if [ -d "${PATCH_DIR}" ]; then
+    # Apply FinBit's patches (currently: empty-group State ctor variant
+    # exposing the init_secret, needed by the operation-replay
+    # persistence layer above mls::State). Patches are applied BEFORE
+    # we strip mlspp's .git so we get clear error messages on conflict.
+    shopt -s nullglob
+    for p in "${PATCH_DIR}"/*.patch; do
+        echo "== applying $(basename "${p}")"
+        ( cd "${TARGET}" && git apply --whitespace=nowarn "${p}" )
+    done
+    shopt -u nullglob
+fi
+
 echo "== removing mlspp's .git so the vendored tree doesn't appear as a submodule"
 rm -rf "${TARGET}/.git"
 

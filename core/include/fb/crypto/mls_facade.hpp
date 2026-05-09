@@ -106,8 +106,59 @@ public:
     // Apply an inbound Commit (e.g. someone else added/removed a member).
     virtual void apply_commit(std::span<const std::uint8_t> commit) = 0;
 
-    // Serialize the current group state for at-rest storage.
+    // ---- Persistence (operation-log replay model) --------------------
+    //
+    // mlspp does not expose mls::State (de)serialization on its public
+    // API, and `state.handle(my_own_commit)` refuses to apply commits
+    // we authored ourselves (it requires a cached_state, which is
+    // exactly what we're trying to reconstruct). Wire-commit replay
+    // is therefore not viable.
+    //
+    // Instead the facade saves the seed plus an OPERATION LOG: an
+    // ordered list of effects we applied (proposals staged, commits
+    // produced or applied), each capturing the inputs we used —
+    // including any random leaf_secret consumed inside state.commit.
+    // On restore the seed rebuilds the empty State, then each op is
+    // RE-EXECUTED in order. Re-execution produces an identical State
+    // because every input is preserved; the resulting State at the
+    // end of the log is byte-equivalent to the live one.
+    //
+    // Two storage primitives:
+    //
+    //   serialize_seed() — small, written ONCE at group creation /
+    //     join completion. Holds the cipher suite, group id, our
+    //     credential identity, the private keys we generated
+    //     (sig_priv, leaf_priv, plus init_priv + KeyPackage +
+    //     Welcome for joiners), the random init_secret used at
+    //     epoch 0 (creator only), and a marshaled LeafNode (creator
+    //     only). 500–1500 bytes typical. Treat as secret — callers
+    //     MUST AEAD-wrap before writing to disk.
+    //
+    //   operation_log() — every effect we applied since seeding, in
+    //     apply order. Each entry is an opaque blob the caller stores
+    //     in an append-only table; on restore, hand the full ordered
+    //     vector to from_seed_and_log. Most entries are 100–500 bytes;
+    //     larger ones (Welcomes, KeyPackages) up to a few KB. The
+    //     transcript stays bounded in normal use (one entry per
+    //     proposal/commit/apply event).
+    //
+    // serialize() bundles seed + log into a single blob (useful for
+    // backup/export/test). For the hot path prefer the split form
+    // so individual ops can be appended incrementally instead of
+    // re-serialising the entire log.
+    [[nodiscard]] virtual std::vector<std::uint8_t> serialize_seed() const = 0;
+    [[nodiscard]] virtual std::vector<std::vector<std::uint8_t>>
+        operation_log() const = 0;
     [[nodiscard]] virtual std::vector<std::uint8_t> serialize() const = 0;
+
+    // Restore from the split form. seed must be exactly the bytes
+    // returned by serialize_seed(); ops must be the full ordered
+    // list returned by operation_log() at the corresponding moment.
+    // Throws on malformed seed, key-parse failure, or any op that
+    // fails to re-execute against the rebuilt state.
+    [[nodiscard]] static std::unique_ptr<MlsGroup> from_seed_and_log(
+        std::span<const std::uint8_t> seed,
+        const std::vector<std::vector<std::uint8_t>>& ops);
 
     // Number of members currently in the group.
     [[nodiscard]] virtual std::size_t member_count() const = 0;

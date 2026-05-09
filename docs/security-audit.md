@@ -351,58 +351,101 @@ In rough priority order:
    passes it to encrypt; receiver cross-checks vs reconstruction
    and uses it as outer_aad on decrypt; tampering detected; old
    senders with empty aad still work).
-4. **Partial:** MLS (RFC 9420) for channels — opt-in pipeline shipped
+4. **Done:** MLS (RFC 9420) for channels — opt-in pipeline shipped
    (vendored mlspp, full A→D handshake, channel envelopes routed
-   through `mls::Session::protect/unprotect` when crypto=kMls).
-   See §10 for the persistence gap that's still open.
+   through `mls::State::protect/unprotect` when crypto=kMls). The
+   former persistence gap (§10) is closed via the operation-replay
+   layer above `mls::State` plus a small mlspp patch that exposes
+   an empty-group constructor taking a caller-supplied init_secret.
+   `MlsGroup` saves a bootstrap seed + ordered op log; on restart
+   `MlsGroup::from_seed_and_log` rebuilds a byte-equivalent State.
+   Tests: `MlsFacade.{Creator,Joiner,MultiCommit,SplitSeed}*` and
+   `MlsPersistTmpDb.MlsPersistence_TwoMemberRoundTripAcrossRestart`
+   exercise the full DB round trip.
 5. Document explicitly to users: the centralized server learns
    metadata (who-talks-to-whom, who's-in-which-room-when), even
    though it never sees content. The roadmap's P2P phase is what
    addresses this.
 
-## 10. MLS persistence gap (open)
+## 10. MLS persistence (closed)
 
-mlspp does NOT expose state persistence on its public API:
-- `mls::Session` keeps its history behind a PIMPL.
-- `mls::State` has no public `tls::marshal` (only inner types like
-  `Tombstone` carry `TLS_SERIALIZABLE`).
+The former gap was: mlspp doesn't expose `tls::marshal(State)` or a
+restore constructor on its public API, so `mls::State` couldn't be
+snapshotted directly. We close the gap with two pieces:
 
-Both are upstream design choices, not bugs. The two viable paths to
-add persistence on top of FinBit's facade are:
+A. **Operation-replay layer above `mls::State`** in
+   `core/src/crypto/mls_facade.cpp`. Two complementary observations
+   make this work without snapshotting State:
+   - State is FULLY DETERMINED by its construction inputs plus the
+     ordered sequence of mutations applied to it (proposals,
+     commits, applies). If we save those inputs we can re-derive
+     the State byte-equivalently.
+   - The randomness mlspp injects per-mutation (the `leaf_secret`
+     argument to `state.commit`) is OURS to choose — we generate
+     it in user space via `random_bytes(suite.secret_size())` and
+     stash it in the op log, so replay produces an identical
+     commit body and an identical post-commit state.
 
-1. **Patch mlspp** to expose `tls::marshal(State)` + a matching
-   restore constructor. State has many internal invariants (chain
-   keys, leaf indices, tree hashes, transcript) so the patch needs
-   careful review and probably upstream contribution before it's
-   wise to ship.
-2. **Transcript replay above MlsGroup**:
-   - At `start_join`, save `(sig_priv.data, init_priv.data,
-     leaf_priv.data, key_package_bytes)` into the local store.
-     `HPKEPrivateKey::parse(suite, data)` and
-     `SignaturePrivateKey::parse(suite, data)` round-trip via
-     the public `data` field.
-   - At `complete(welcome)`, save the Welcome bytes that hydrated
-     us alongside the keys above.
-   - At every `apply_commit(c)`, append the commit bytes to a
-     per-channel transcript log.
-   - On restart: parse keys, reconstruct PendingJoin equivalent,
-     `complete(saved_welcome)` → State, replay every saved Commit
-     in order.
-   - Transcript stays bounded as long as the channel isn't
-     pathologically high-churn.
+   The wrapper saves two things per channel:
+   - **seed**: `(group_id, identity, sig_priv, leaf_priv, [creator]
+     init_secret + LeafNode bytes | [joiner] init_priv +
+     KeyPackage + Welcome)`. Written ONCE at `MlsGroup::create` or
+     `PendingMlsJoin::complete`.
+   - **op log**: an append-only list of opaque op records. Each
+     mutator (`add_member`, `remove_member`, `propose_add_member`,
+     `handle_proposal`, `commit_pending`, `apply_commit`) appends
+     exactly one record carrying the inputs needed to re-execute
+     it (KeyPackage bytes for adds, leaf_secret for commits, wire
+     bytes for handles/applies).
 
-Until either lands, MLS channels survive within a session but lose
-their group state on restart. Behaviour today:
-- `chan_state.crypto` persists (the channel REMEMBERS it's an MLS
-  channel after restart).
-- `cs.mls` is null on restore. ChatClient logs a clear "MLS channel
-  #X restored without in-memory state — re-invite members" message.
-- Channel envelope subscription continues. Inbound MLS messages
-  fail decrypt (best-effort fallthrough to SenderKeys decrypt
-  produces the same nullopt result; no crash, no spurious accept).
-- The user re-invites the channel members; the auto-orchestration
-  in step D's handlers re-establishes a fresh group.
+   `MlsGroup::from_seed_and_log(seed, ops)` rebuilds the empty
+   State from the seed, then re-executes each op in order via
+   `replay_op` (which routes back through the same `do_***`
+   methods the live mutators use). Result: a State at the same
+   epoch with the same membership_key, encryption_keys, and
+   confirmation_tag as the live one. Application traffic encrypted
+   under the live state decrypts under the restored state.
 
-This is the one acknowledged "use it within a session" limitation
-of the v0 MLS opt-in. Documented in `core/src/crypto/mls_facade.cpp`
-serialize() and at the chan_list restore site.
+B. **Minimal mlspp patch** in
+   `third_party/mlspp/{include,src}/mls/state.{h,cpp}`. The
+   default empty-group ctor calls `random_bytes` internally to
+   generate the epoch-0 init_secret and never exposes it. We add
+   one new ctor variant that takes `const bytes& init_secret_override`
+   and uses it instead. Patch is ~25 lines, additive (no behaviour
+   change to existing callers). Documented inline as "FinBit
+   persistence patch".
+
+Storage at-rest: two new SQLite tables (`mls_group_state`,
+`mls_group_log`) with separate per-table HKDF subkeys. AAD =
+`channel_id` for the seed, `channel_id || be64(seq)` for log
+rows so an attacker who can swap encrypted blobs can't reorder
+ops within a channel. The seed contains long-term key material —
+treat as you'd treat the identity vault.
+
+ChatClient wires this in at:
+- `kCreateLocal` (use_mls=true): `persist_mls_seed(cs)` after
+  `MlsGroup::create`.
+- `mlsWelcomeReceived`: `persist_mls_seed(cs)` after `complete()`.
+- After every `add_member` / `propose_add_member` / `commit_pending`
+  / `handle_proposal` / `apply_commit`: `persist_mls_last_op(cs)`.
+- `chan_list` restore for `kMls` channels: `mls_group_load` →
+  `MlsGroup::from_seed_and_log` → `cs.mls` live + `cs.mls_next_seq`
+  primed for future appends.
+
+If the on-disk seed is missing for a kMls channel (legacy DB,
+truncated save), restore falls through with `cs.mls` null and the
+user is told to re-invite — same graceful degrade as the original
+"persistence gap" path.
+
+Tests:
+- `MlsFacade.{CreatorSeedIsIdempotent, CreatorPersistenceRoundTripNoCommits,
+  JoinerPersistenceRoundTripAcrossWelcome,
+  MultiCommitTranscriptReplayThreeMembers, SplitSeedAndLogRoundTrip}` —
+  in-memory unit coverage of the wrapper.
+- `TmpDb.{MlsGroupPersistenceRoundTripEncrypted, MlsGroupSaveReplacesSeed,
+  MlsGroupLoadMissingReturnsNullopt, ChanDeleteAlsoDropsMlsTables}` —
+  store-table coverage.
+- `MlsPersistTmpDb.{MlsPersistence_CreatorRoundTrip,
+  MlsPersistence_TwoMemberRoundTripAcrossRestart}` —
+  end-to-end MlsGroup ↔ SqliteStore through a simulated
+  process-restart cycle.

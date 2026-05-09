@@ -185,12 +185,42 @@ public:
     [[nodiscard]] std::vector<ChannelInboxRow> chan_recent_inbox(
         std::span<const std::uint8_t> channel_id, std::size_t limit) const;
 
-    // Forget a channel entirely: chan_state row, chan_peers, chan_inbox.
-    // Caller is responsible for any associated session-blob row in `sessions`
-    // (chan_state stores name, but the GroupSession blob lives under
+    // Forget a channel entirely: chan_state row, chan_peers, chan_inbox,
+    // mls_group_state + mls_group_log if any. Caller is responsible
+    // for any associated session-blob row in `sessions` (chan_state
+    // stores name, but the GroupSession blob lives under
     // sessions/__chanstate__:<name>).
     void chan_delete(const std::string& name,
                      std::span<const std::uint8_t> channel_id);
+
+    // ---- MLS persistence (operation-replay model) --------------------
+    //
+    // Two paired tables. mls_group_save writes (or replaces) the
+    // bootstrap seed for a kMls channel — call this exactly once at
+    // group creation or Welcome-completion. Then for every state-
+    // mutating effect MlsGroup applied (proposals, commits, applies),
+    // call mls_group_op_append with the next sequence number; the
+    // store enforces uniqueness so duplicate appends on retry won't
+    // corrupt the log. mls_group_load returns the seed + the full
+    // ordered op list, suitable for handing to
+    // MlsGroup::from_seed_and_log.
+    //
+    // Both tables AEAD-wrap the secret material at rest (per-table
+    // HKDF subkey, AAD = channel_id for state, channel_id||be64(seq)
+    // for log entries).
+    void mls_group_save(std::span<const std::uint8_t> channel_id,
+                        std::span<const std::uint8_t> seed_blob);
+    void mls_group_op_append(std::span<const std::uint8_t> channel_id,
+                             std::int64_t seq,
+                             std::span<const std::uint8_t> op_blob);
+    struct MlsGroupSnapshot {
+        std::vector<std::uint8_t>              seed;
+        std::vector<std::vector<std::uint8_t>> ops;
+        std::int64_t                           next_seq = 0;
+    };
+    [[nodiscard]] std::optional<MlsGroupSnapshot> mls_group_load(
+        std::span<const std::uint8_t> channel_id) const;
+    void mls_group_delete(std::span<const std::uint8_t> channel_id);
 
     // peer_cache: username <-> pubkey we've learned (e.g. as DM peers).
     void cache_peer_name(std::span<const std::uint8_t> peer_pub, const std::string& username);

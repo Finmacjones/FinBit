@@ -11,6 +11,7 @@ add_executable(fb_core_tests
     net/frame_codec_test.cpp
     net/websocket_test.cpp
     store/sqlite_store_test.cpp
+    integration/mls_persistence_integration_test.cpp
     ratelimit/token_bucket_test.cpp
     media/sframe_test.cpp
     mesh/compression_test.cpp

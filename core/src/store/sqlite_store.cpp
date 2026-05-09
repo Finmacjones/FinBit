@@ -7,6 +7,7 @@
 #include <array>
 #include <cstring>
 #include <stdexcept>
+#include <chrono>
 #include <string>
 #include <utility>
 
@@ -99,6 +100,32 @@ CREATE TABLE IF NOT EXISTS peer_name_cache (
     username  TEXT NOT NULL,
     learned_ms INTEGER NOT NULL DEFAULT 0
 );
+-- MLS persistence (operation-replay model). One row per kMls channel
+-- in mls_group_state holding the bootstrap seed (creator: identity +
+-- sig_priv + leaf_priv + epoch-0 init_secret + LeafNode bytes;
+-- joiner: identity + sig_priv + init_priv + leaf_priv + KeyPackage +
+-- Welcome). Append-only mls_group_log captures each state-mutating
+-- effect (proposals staged, commits produced/applied) — on restart
+-- we hand seed + ordered ops to MlsGroup::from_seed_and_log to
+-- rebuild State.
+--
+-- Both tables are AEAD-wrapped at-rest with separate per-table HKDF
+-- subkeys. AAD = channel_id (state) or channel_id||be64(seq) (log)
+-- so a row can't be silently moved or reordered.
+CREATE TABLE IF NOT EXISTS mls_group_state (
+    channel_id    BLOB PRIMARY KEY,
+    seed_blob     BLOB NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mls_group_log (
+    channel_id    BLOB NOT NULL,
+    seq           INTEGER NOT NULL,
+    op_blob       BLOB NOT NULL,
+    applied_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_mls_group_log_chan
+    ON mls_group_log(channel_id, seq);
 )sql";
 
 void throw_sqlite(const std::string& ctx, sqlite3* db) {
@@ -185,6 +212,8 @@ struct SqliteStore::Impl {
     std::array<std::uint8_t, kKeyLen> chan_peers_key{};
     std::array<std::uint8_t, kKeyLen> chan_inbox_key{};
     std::array<std::uint8_t, kKeyLen> peer_name_key{};
+    std::array<std::uint8_t, kKeyLen> mls_state_key{};
+    std::array<std::uint8_t, kKeyLen> mls_log_key{};
 
     ~Impl() {
         // Best-effort: zero the table keys before the process exits so
@@ -196,6 +225,8 @@ struct SqliteStore::Impl {
         sodium_memzero(chan_peers_key.data(),  chan_peers_key.size());
         sodium_memzero(chan_inbox_key.data(),  chan_inbox_key.size());
         sodium_memzero(peer_name_key.data(),   peer_name_key.size());
+        sodium_memzero(mls_state_key.data(),   mls_state_key.size());
+        sodium_memzero(mls_log_key.data(),     mls_log_key.size());
         if (db) sqlite3_close(db);
     }
 
@@ -285,6 +316,8 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
         s->impl_->chan_peers_key  = derive_table_key(master_key, "FinBit-DB-ChanPeers-v1");
         s->impl_->chan_inbox_key  = derive_table_key(master_key, "FinBit-DB-ChanInbox-v1");
         s->impl_->peer_name_key   = derive_table_key(master_key, "FinBit-DB-PeerName-v1");
+        s->impl_->mls_state_key   = derive_table_key(master_key, "FinBit-DB-MlsState-v1");
+        s->impl_->mls_log_key     = derive_table_key(master_key, "FinBit-DB-MlsLog-v1");
     }
     if (have_key && version < kSchemaVersionEncrypted) {
         // Migration from legacy plaintext (v0) or partially-encrypted
@@ -886,6 +919,10 @@ void SqliteStore::chan_delete(const std::string& name,
              [&](sqlite3_stmt* s) { bind_blob(s, 1, channel_id); });
     exec_one("DELETE FROM chan_inbox WHERE channel_id = ?;",
              [&](sqlite3_stmt* s) { bind_blob(s, 1, channel_id); });
+    exec_one("DELETE FROM mls_group_state WHERE channel_id = ?;",
+             [&](sqlite3_stmt* s) { bind_blob(s, 1, channel_id); });
+    exec_one("DELETE FROM mls_group_log WHERE channel_id = ?;",
+             [&](sqlite3_stmt* s) { bind_blob(s, 1, channel_id); });
     // Drop the GroupSession blob too (stored under sessions/__chanstate__:<name>).
     const std::string state_key = "__chanstate__:" + name;
     exec_one("DELETE FROM sessions WHERE peer_pub = ?;",
@@ -1017,6 +1054,164 @@ std::vector<std::vector<std::uint8_t>> SqliteStore::srv_offline_drain(
     sqlite3_finalize(del);
     impl_->exec("COMMIT");
     return out;
+}
+
+// =============================================================================
+// MLS persistence (operation-replay model). Two paired tables wrapped at
+// rest with separate per-table HKDF subkeys; AAD binds rows to their
+// channel + sequence so a row can't be silently moved or reordered.
+// =============================================================================
+
+namespace {
+// AAD for log rows = channel_id || seq encoded as 8 bytes big-endian.
+// Binding the seq prevents an attacker who can swap encrypted blobs
+// from reordering ops within the same channel; binding the channel
+// prevents cross-channel substitution.
+std::vector<std::uint8_t> mls_log_aad(std::span<const std::uint8_t> channel_id,
+                                       std::int64_t seq) {
+    std::vector<std::uint8_t> out;
+    out.reserve(channel_id.size() + 8);
+    out.insert(out.end(), channel_id.begin(), channel_id.end());
+    auto u = static_cast<std::uint64_t>(seq);
+    for (int i = 7; i >= 0; --i) {
+        out.push_back(static_cast<std::uint8_t>((u >> (8 * i)) & 0xff));
+    }
+    return out;
+}
+}  // namespace
+
+void SqliteStore::mls_group_save(std::span<const std::uint8_t> channel_id,
+                                  std::span<const std::uint8_t> seed_blob) {
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = seed_blob;
+    if (impl_->encrypt_at_rest) {
+        wrapped = aead_wrap(impl_->mls_state_key, seed_blob, channel_id);
+        stored = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
+    auto* stmt = impl_->prep(
+        "INSERT INTO mls_group_state (channel_id, seed_blob, created_at_ms) "
+        "VALUES (?, ?, ?) "
+        "ON CONFLICT(channel_id) DO UPDATE SET "
+        "  seed_blob = excluded.seed_blob, "
+        "  created_at_ms = excluded.created_at_ms;");
+    bind_blob(stmt, 1, channel_id);
+    bind_blob(stmt, 2, stored);
+    sqlite3_bind_int64(stmt, 3,
+        static_cast<sqlite3_int64>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()));
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+void SqliteStore::mls_group_op_append(std::span<const std::uint8_t> channel_id,
+                                        std::int64_t seq,
+                                        std::span<const std::uint8_t> op_blob) {
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = op_blob;
+    auto aad_vec = mls_log_aad(channel_id, seq);
+    if (impl_->encrypt_at_rest) {
+        wrapped = aead_wrap(impl_->mls_log_key, op_blob,
+                            std::span<const std::uint8_t>(
+                                aad_vec.data(), aad_vec.size()));
+        stored = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
+    // INSERT-only — duplicate (channel_id, seq) is an error caller should
+    // see (means we double-appended for the same op, indicates a bug
+    // upstream rather than a benign retry).
+    auto* stmt = impl_->prep(
+        "INSERT INTO mls_group_log (channel_id, seq, op_blob, applied_at_ms) "
+        "VALUES (?, ?, ?, ?);");
+    bind_blob(stmt, 1, channel_id);
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(seq));
+    bind_blob(stmt, 3, stored);
+    sqlite3_bind_int64(stmt, 4,
+        static_cast<sqlite3_int64>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()));
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        const std::string err = sqlite3_errmsg(impl_->db);
+        sqlite3_finalize(stmt);
+        throw std::runtime_error("mls_group_op_append: " + err);
+    }
+    sqlite3_finalize(stmt);
+}
+
+std::optional<SqliteStore::MlsGroupSnapshot> SqliteStore::mls_group_load(
+    std::span<const std::uint8_t> channel_id) const {
+    MlsGroupSnapshot snap;
+
+    // 1. Seed.
+    {
+        auto* stmt = impl_->prep(
+            "SELECT seed_blob FROM mls_group_state WHERE channel_id = ?;");
+        bind_blob(stmt, 1, channel_id);
+        if (sqlite3_step(stmt) != SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            return std::nullopt;
+        }
+        auto stored = column_blob(stmt, 0);
+        sqlite3_finalize(stmt);
+        if (impl_->encrypt_at_rest) {
+            auto pt = aead_unwrap(impl_->mls_state_key,
+                std::span<const std::uint8_t>(stored.data(), stored.size()),
+                channel_id);
+            if (!pt) {
+                throw std::runtime_error(
+                    "mls_group_load: seed AEAD verify failed (corruption "
+                    "or wrong master_key)");
+            }
+            snap.seed = std::move(*pt);
+        } else {
+            snap.seed = std::move(stored);
+        }
+    }
+
+    // 2. Ops in seq order.
+    {
+        auto* stmt = impl_->prep(
+            "SELECT seq, op_blob FROM mls_group_log "
+            "WHERE channel_id = ? ORDER BY seq ASC;");
+        bind_blob(stmt, 1, channel_id);
+        std::int64_t max_seq = -1;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            std::int64_t seq = sqlite3_column_int64(stmt, 0);
+            auto stored = column_blob(stmt, 1);
+            if (impl_->encrypt_at_rest) {
+                auto aad_vec = mls_log_aad(channel_id, seq);
+                auto pt = aead_unwrap(impl_->mls_log_key,
+                    std::span<const std::uint8_t>(stored.data(), stored.size()),
+                    std::span<const std::uint8_t>(aad_vec.data(),
+                                                   aad_vec.size()));
+                if (!pt) {
+                    sqlite3_finalize(stmt);
+                    throw std::runtime_error(
+                        "mls_group_load: log row AEAD verify failed at seq " +
+                        std::to_string(seq));
+                }
+                snap.ops.push_back(std::move(*pt));
+            } else {
+                snap.ops.push_back(std::move(stored));
+            }
+            if (seq > max_seq) max_seq = seq;
+        }
+        sqlite3_finalize(stmt);
+        snap.next_seq = max_seq + 1;
+    }
+    return snap;
+}
+
+void SqliteStore::mls_group_delete(std::span<const std::uint8_t> channel_id) {
+    auto exec_one = [&](const char* sql) {
+        auto* stmt = impl_->prep(sql);
+        bind_blob(stmt, 1, channel_id);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    };
+    impl_->exec("BEGIN");
+    exec_one("DELETE FROM mls_group_state WHERE channel_id = ?;");
+    exec_one("DELETE FROM mls_group_log WHERE channel_id = ?;");
+    impl_->exec("COMMIT");
 }
 
 }  // namespace fb::store

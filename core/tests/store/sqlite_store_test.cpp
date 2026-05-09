@@ -329,6 +329,81 @@ TEST_F(TmpDb, AtRestEncryptionCoversAllSensitiveTables) {
     }
 }
 
+// MLS group save / append / load round trip on an encrypted DB:
+// stores a seed + 3 op blobs under one channel_id, closes & reopens
+// the DB with the same key, and verifies the plaintext seed and ops
+// (in seq order) come back intact via mls_group_load. Also confirms
+// that next_seq advances past the highest stored seq (so the caller
+// can keep appending).
+TEST_F(TmpDb, MlsGroupPersistenceRoundTripEncrypted) {
+    std::array<std::uint8_t, 32> master_key{};
+    for (std::size_t i = 0; i < master_key.size(); ++i) master_key[i] = 0x42;
+    std::vector<std::uint8_t> channel_id(32, 0x77);
+    auto seed = bytes({0x01, 0x02, 0x03, 0x04, 0x05});
+    auto op0  = bytes({0xaa});
+    auto op1  = bytes({0xbb, 0xbb});
+    auto op2  = bytes({0xcc, 0xcc, 0xcc});
+
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        s->mls_group_save(span_of(channel_id), span_of(seed));
+        s->mls_group_op_append(span_of(channel_id), 0, span_of(op0));
+        s->mls_group_op_append(span_of(channel_id), 1, span_of(op1));
+        s->mls_group_op_append(span_of(channel_id), 2, span_of(op2));
+    }
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        auto snap = s->mls_group_load(span_of(channel_id));
+        ASSERT_TRUE(snap.has_value());
+        EXPECT_EQ(snap->seed, seed);
+        ASSERT_EQ(snap->ops.size(), 3u);
+        EXPECT_EQ(snap->ops[0], op0);
+        EXPECT_EQ(snap->ops[1], op1);
+        EXPECT_EQ(snap->ops[2], op2);
+        EXPECT_EQ(snap->next_seq, 3);
+    }
+}
+
+// mls_group_save is upsert: a second save for the same channel_id
+// replaces the seed. Used at re-creation or re-join time.
+TEST_F(TmpDb, MlsGroupSaveReplacesSeed) {
+    auto s = fb::store::SqliteStore::open(path);
+    std::vector<std::uint8_t> channel_id(32, 0x33);
+    auto seed_a = bytes({0x01, 0x01});
+    auto seed_b = bytes({0x02, 0x02, 0x02});
+    s->mls_group_save(span_of(channel_id), span_of(seed_a));
+    s->mls_group_save(span_of(channel_id), span_of(seed_b));
+    auto snap = s->mls_group_load(span_of(channel_id));
+    ASSERT_TRUE(snap.has_value());
+    EXPECT_EQ(snap->seed, seed_b);
+    EXPECT_TRUE(snap->ops.empty());
+}
+
+// Loading a non-existent channel returns nullopt — important
+// because chat_client uses presence-vs-absence to distinguish
+// "MLS channel that needs restore" from "MLS channel never seen".
+TEST_F(TmpDb, MlsGroupLoadMissingReturnsNullopt) {
+    auto s = fb::store::SqliteStore::open(path);
+    std::vector<std::uint8_t> channel_id(32, 0x22);
+    EXPECT_FALSE(s->mls_group_load(span_of(channel_id)).has_value());
+}
+
+// chan_delete cleans up mls_group_state + mls_group_log too.
+TEST_F(TmpDb, ChanDeleteAlsoDropsMlsTables) {
+    auto s = fb::store::SqliteStore::open(path);
+    std::vector<std::uint8_t> channel_id(32, 0x55);
+    s->chan_save("hangout", span_of(channel_id), {},
+                 fb::store::SqliteStore::ChannelCrypto::kMls);
+    s->mls_group_save(span_of(channel_id), bytes({0xaa, 0xbb}));
+    s->mls_group_op_append(span_of(channel_id), 0, bytes({0xcc}));
+    EXPECT_TRUE(s->mls_group_load(span_of(channel_id)).has_value());
+
+    s->chan_delete("hangout", span_of(channel_id));
+    EXPECT_FALSE(s->mls_group_load(span_of(channel_id)).has_value());
+}
+
 // Reopening an encrypted DB with NO key throws — protects against
 // silently treating the wrapped blobs as plaintext.
 TEST_F(TmpDb, AtRestRefusesUnkeyedReopen) {
