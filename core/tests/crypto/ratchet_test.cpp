@@ -171,3 +171,30 @@ TEST(Ratchet, AlternatingDirectionsAreFineAfterMultipleDhRatchets) {
         EXPECT_EQ(*db, b);
     }
 }
+
+// Envelope-level AAD binding: a relay rewriting a single byte of the
+// outer AAD (e.g. flipping a timestamp or envelope_id bit) must
+// invalidate the inner AEAD tag. This is the property the new
+// chat_client.cpp envelope_aad_bytes binding leans on; without it
+// the proto's "aad is bound by the AEAD" promise was empty.
+//
+// Each decrypt attempt consumes a chain step in the Double Ratchet,
+// so we use one pair for the failure case and a fresh pair for the
+// success case to keep the chain states independent.
+TEST(Ratchet, FlippedOuterAadFailsDecrypt) {
+    auto aad_good = bytes("envelope_id=0123456789abcdef|ts=1714867200000");
+    auto aad_bad  = aad_good;
+    aad_bad[3] ^= 0x01;
+    {
+        auto p = make_pair();
+        auto ct = p.alice.encrypt(bytes("payload"), span_of(aad_good));
+        EXPECT_FALSE(p.bob.decrypt(span_of(ct), span_of(aad_bad)).has_value());
+    }
+    {
+        auto p = make_pair();
+        auto ct = p.alice.encrypt(bytes("payload"), span_of(aad_good));
+        auto pt = p.bob.decrypt(span_of(ct), span_of(aad_good));
+        ASSERT_TRUE(pt.has_value());
+        EXPECT_EQ(*pt, bytes("payload"));
+    }
+}

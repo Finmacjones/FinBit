@@ -64,6 +64,24 @@ namespace {
 
 constexpr std::string_view kX3dhInfo = "FinBit-X3DH-v0";
 
+// Envelope-level AAD bound by the inner ratchet/SenderKeys AEAD tag —
+// `envelope_id (16) || timestamp_ms (8 BE)`. Sender computes once
+// per envelope, passes as outer_aad to encrypt AND populates
+// Envelope.aad with the same bytes; receivers cross-check the field
+// against the reconstruction, then use it as outer_aad on decrypt.
+// Keeping this in lockstep with chat_client.cpp's helper of the
+// same name is mandatory for cross-binary interop.
+std::vector<std::uint8_t> envelope_aad_bytes(
+    std::span<const std::uint8_t> envelope_id, std::uint64_t timestamp_ms) {
+    std::vector<std::uint8_t> aad;
+    aad.reserve(envelope_id.size() + 8);
+    aad.insert(aad.end(), envelope_id.begin(), envelope_id.end());
+    for (int sh = 56; sh >= 0; sh -= 8) {
+        aad.push_back(static_cast<std::uint8_t>((timestamp_ms >> sh) & 0xff));
+    }
+    return aad;
+}
+
 std::atomic_bool g_run{true};
 void on_signal(int) { g_run = false; }
 
@@ -585,18 +603,25 @@ int main(int argc, char** argv) {
             std::span<const std::uint8_t>(chan_id.data(), chan_id.size()),
             args.channel_name,
             std::span<const std::uint8_t>(own_dist.data(), own_dist.size()));
-        auto invite_inner = rat.encrypt(
-            std::span<const std::uint8_t>(invite_payload.data(), invite_payload.size()), {});
         {
-            fb::proto::Frame envf;
-            auto* env = envf.mutable_envelope();
             std::vector<std::uint8_t> envid(16);
             randombytes_buf(envid.data(), envid.size());
-            env->set_envelope_id(std::string(envid.begin(), envid.end()));
-            env->set_timestamp_ms(static_cast<std::uint64_t>(
+            const auto now_ms = static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::system_clock::now().time_since_epoch())
-                    .count()));
+                    .count());
+            const auto env_aad = envelope_aad_bytes(
+                std::span<const std::uint8_t>(envid.data(), envid.size()),
+                now_ms);
+            auto invite_inner = rat.encrypt(
+                std::span<const std::uint8_t>(invite_payload.data(),
+                                                invite_payload.size()),
+                std::span<const std::uint8_t>(env_aad.data(), env_aad.size()));
+            fb::proto::Frame envf;
+            auto* env = envf.mutable_envelope();
+            env->set_envelope_id(std::string(envid.begin(), envid.end()));
+            env->set_timestamp_ms(now_ms);
+            env->set_aad(std::string(env_aad.begin(), env_aad.end()));
             env->set_user_pubkey(peer_b.identity_pubkey());
             env->set_sender_pubkey(std::string(
                 reinterpret_cast<const char*>(identity.public_key().data()),
@@ -614,17 +639,23 @@ int main(int argc, char** argv) {
 
         // 5. Publish the channel message.
         std::vector<std::uint8_t> pt(args.text.begin(), args.text.end());
-        auto chan_inner = session.encrypt(
-            std::span<const std::uint8_t>(pt.data(), pt.size()), {});
-        fb::proto::Frame envf;
-        auto* env = envf.mutable_envelope();
         std::vector<std::uint8_t> envid(16);
         randombytes_buf(envid.data(), envid.size());
-        env->set_envelope_id(std::string(envid.begin(), envid.end()));
-        env->set_timestamp_ms(static_cast<std::uint64_t>(
+        const auto now_ms = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch())
-                .count()));
+                .count());
+        const auto env_aad = envelope_aad_bytes(
+            std::span<const std::uint8_t>(envid.data(), envid.size()),
+            now_ms);
+        auto chan_inner = session.encrypt(
+            std::span<const std::uint8_t>(pt.data(), pt.size()),
+            std::span<const std::uint8_t>(env_aad.data(), env_aad.size()));
+        fb::proto::Frame envf;
+        auto* env = envf.mutable_envelope();
+        env->set_envelope_id(std::string(envid.begin(), envid.end()));
+        env->set_timestamp_ms(now_ms);
+        env->set_aad(std::string(env_aad.begin(), env_aad.end()));
         env->set_channel_group_id(std::string(reinterpret_cast<const char*>(chan_id.data()),
                                                chan_id.size()));
         env->set_sender_pubkey(std::string(
@@ -662,17 +693,24 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(args.linger_ms));
 
             std::vector<std::uint8_t> pt(args.text.begin(), args.text.end());
-            auto msg = session.encrypt(std::span<const std::uint8_t>(pt.data(), pt.size()), {});
+            std::vector<std::uint8_t> envid(16);
+            randombytes_buf(envid.data(), envid.size());
+            const auto now_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count());
+            const auto env_aad = envelope_aad_bytes(
+                std::span<const std::uint8_t>(envid.data(), envid.size()),
+                now_ms);
+            auto msg = session.encrypt(
+                std::span<const std::uint8_t>(pt.data(), pt.size()),
+                std::span<const std::uint8_t>(env_aad.data(), env_aad.size()));
 
             fb::proto::Frame f2;
             auto* env = f2.mutable_envelope();
-            std::vector<std::uint8_t> envid(16);
-            randombytes_buf(envid.data(), envid.size());
             env->set_envelope_id(std::string(envid.begin(), envid.end()));
-            env->set_timestamp_ms(static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count()));
+            env->set_timestamp_ms(now_ms);
+            env->set_aad(std::string(env_aad.begin(), env_aad.end()));
             env->set_channel_group_id(
                 std::string(reinterpret_cast<const char*>(chan_id.data()), chan_id.size()));
             env->set_sender_pubkey(std::string(
@@ -736,12 +774,25 @@ int main(int argc, char** argv) {
                     std::span<const std::uint8_t>(dist.data(), dist.size()));
                 installed = true;
             }
+            // Honour Envelope.aad (empty for pre-binding senders).
+            std::vector<std::uint8_t> outer_aad(env.aad().begin(), env.aad().end());
+            if (!outer_aad.empty()) {
+                auto expected = envelope_aad_bytes(
+                    std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(env.envelope_id().data()),
+                        env.envelope_id().size()),
+                    env.timestamp_ms());
+                if (outer_aad != expected) {
+                    std::cerr << "[fb-cli] envelope aad inconsistent — dropping\n";
+                    continue;
+                }
+            }
             auto pt = session.decrypt(
                 std::span<const std::uint8_t>(sender_pub.data(), sender_pub.size()),
                 std::span<const std::uint8_t>(
                     reinterpret_cast<const std::uint8_t*>(env.ciphertext().data()),
                     env.ciphertext().size()),
-                {});
+                std::span<const std::uint8_t>(outer_aad.data(), outer_aad.size()));
             if (!pt) {
                 std::cerr << "[fb-cli] channel decrypt failed\n";
                 continue;
@@ -778,7 +829,14 @@ int main(int argc, char** argv) {
         // Inner DM body is now a serialized DmPayload protobuf so receivers
         // can route between text and channel-key invites.
         const auto pt = pack_text_payload(args.text);
-        std::vector<std::uint8_t> outer_aad;
+        std::vector<std::uint8_t> envid(16);
+        randombytes_buf(envid.data(), envid.size());
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        const auto outer_aad = envelope_aad_bytes(
+            std::span<const std::uint8_t>(envid.data(), envid.size()), now_ms);
         auto inner = rat.encrypt(std::span<const std::uint8_t>(pt.data(), pt.size()),
                                  std::span<const std::uint8_t>(outer_aad.data(), outer_aad.size()));
 
@@ -787,13 +845,8 @@ int main(int argc, char** argv) {
         // envelope; the ratchet's AEAD already covers integrity.)
         fb::proto::Frame f2;
         auto* env = f2.mutable_envelope();
-        std::vector<std::uint8_t> envid(16);
-        randombytes_buf(envid.data(), envid.size());
         env->set_envelope_id(std::string(envid.begin(), envid.end()));
-        const auto now_ms = static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count());
+        env->set_aad(std::string(outer_aad.begin(), outer_aad.end()));
         env->set_timestamp_ms(now_ms);
         env->set_user_pubkey(peer_b.identity_pubkey());
         env->set_sender_pubkey(std::string(
@@ -847,6 +900,15 @@ int main(int argc, char** argv) {
             auto nit = known_channels.find(ch_id);
             const std::string name = (nit != known_channels.end()) ? nit->second
                                                                     : std::string{"<unknown>"};
+            std::vector<std::uint8_t> outer_aad(env.aad().begin(), env.aad().end());
+            if (!outer_aad.empty()) {
+                auto expected = envelope_aad_bytes(
+                    std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(env.envelope_id().data()),
+                        env.envelope_id().size()),
+                    env.timestamp_ms());
+                if (outer_aad != expected) continue;
+            }
             auto pt = group_session.decrypt(
                 std::span<const std::uint8_t>(
                     reinterpret_cast<const std::uint8_t*>(sender_pub_bytes.data()),
@@ -854,7 +916,7 @@ int main(int argc, char** argv) {
                 std::span<const std::uint8_t>(
                     reinterpret_cast<const std::uint8_t*>(env.ciphertext().data()),
                     env.ciphertext().size()),
-                {});
+                std::span<const std::uint8_t>(outer_aad.data(), outer_aad.size()));
             if (!pt) continue;  // sender we haven't been invited from
             std::cout << "CHAN-MSG: " << std::string(pt->begin(), pt->end()) << std::endl;
             (void)name;  // (could prefix the line with #name)
@@ -876,11 +938,23 @@ int main(int argc, char** argv) {
                 std::span<const std::uint8_t, 32>(x25519.priv.data(), 32),
                 std::span<const std::uint8_t, 32>(x25519.pub.data(), 32)));
         }
+        std::vector<std::uint8_t> outer_aad(env.aad().begin(), env.aad().end());
+        if (!outer_aad.empty()) {
+            auto expected = envelope_aad_bytes(
+                std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(env.envelope_id().data()),
+                    env.envelope_id().size()),
+                env.timestamp_ms());
+            if (outer_aad != expected) {
+                std::cerr << "[fb-cli] envelope aad inconsistent — dropping\n";
+                continue;
+            }
+        }
         auto pt = rat->decrypt(
             std::span<const std::uint8_t>(
                 reinterpret_cast<const std::uint8_t*>(env.ciphertext().data()),
                 env.ciphertext().size()),
-            {});
+            std::span<const std::uint8_t>(outer_aad.data(), outer_aad.size()));
         if (!pt) {
             std::cerr << "[fb-cli] dm decrypt failed\n";
             continue;

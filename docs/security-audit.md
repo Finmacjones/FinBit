@@ -137,24 +137,32 @@ What the server **cannot** see:
   recipient's pubkey — the sender's username is leaked separately
   through `username_lookup` queries when the recipient asks).
 
-### ⚠️ `Envelope.aad` discrepancy
+### ✅ `Envelope.aad` is now bound by the inner AEAD tag
 
-The proto comment says envelope-level AAD is "bound by the AEAD tag —
-a relay cannot rewrite the envelope id or shift its timestamp without
-invalidating it". Implementation passes empty `outer_aad` to every
-inner encrypt call. Severity: low; the inner ratchet/SenderKeys layer
-still authenticates content + sequence + DH state. To close the gap
-either:
+The original proto promise that envelope-level AAD is bound by the
+inner tag is now actually true. Implementation:
 
-1. Pass `aad = envelope_id || u64_be(timestamp_ms)` into the inner
-   `encrypt()` AAD slot, AND populate `Envelope.aad` so the recipient
-   can reconstruct the same buffer for `decrypt()`. Wire-compatible;
-   one-line change at each of the four envelope-build sites + each
-   decrypt site.
-2. Or remove the proto comment promise and document envelope fields
-   as relay-modifiable display metadata.
+- Both senders (`chat_client.cpp` and `tools/fb-cli/main.cpp`)
+  compute `env_aad = envelope_id (16) || timestamp_ms (8 BE)`,
+  pass it as `outer_aad` to the inner ratchet/SenderKeys
+  `encrypt()`, AND populate `Envelope.aad` with the same bytes.
+- Receivers cross-check `Envelope.aad` against the reconstruction
+  from `envelope_id` and `timestamp_ms`. Mismatch ⇒ drop.
+- `Envelope.aad` is then used as `outer_aad` for `decrypt()`. A
+  relay rewriting envelope_id or timestamp without also rewriting
+  the aad bytes consistently breaks the AEAD tag; rewriting the
+  aad bytes consistently breaks the receiver's mismatch check.
+  Both attacks are detected.
+- Backwards-compat: a pre-binding sender leaves `Envelope.aad`
+  empty, and the receiver honours that (uses empty outer_aad on
+  decrypt) — old senders to new receivers still work.
 
-Recommend option 1.
+Verified by:
+- `Ratchet.FlippedOuterAadFailsDecrypt` (gtest) — flipping a single
+  AAD byte makes the decrypt return nullopt.
+- `tools/e2e/{dm,channel_inband,offline_persist,server_persist_full,
+  username_resolve}.sh` — all five round-trips use the new binding
+  end-to-end.
 
 ### Authentication
 
@@ -318,9 +326,11 @@ In rough priority order:
 1. ~~Encrypt local message store at rest~~ — **done in §7.**
 2. ~~Drop the unused `identities.sec` column~~ — **stopped writing
    to it; column kept for backwards-read of legacy DBs.**
-3. Either populate `Envelope.aad` and bind it via inner-encrypt
-   `outer_aad`, or update the proto comment to drop the promise.
-   (Currently the comment is updated; the binding is still TODO.)
+3. ~~Bind `Envelope.aad` via the inner-encrypt `outer_aad`~~ —
+   **done in §3** (sender computes envelope_id ‖ u64_be(ts) and
+   passes it to encrypt; receiver cross-checks vs reconstruction
+   and uses it as outer_aad on decrypt; tampering detected; old
+   senders with empty aad still work).
 4. Plan migration to MLS (RFC 9420) for channels — gets membership-
    removal rekey + forward secrecy that SenderKeys can't.
 5. Document explicitly to users: the centralized server learns

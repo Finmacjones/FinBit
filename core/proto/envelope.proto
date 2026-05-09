@@ -16,14 +16,18 @@ option optimize_for = LITE_RUNTIME;
 // rate limits keyed off `sender_pubkey` (when present). Everything else is
 // opaque.
 //
-// `aad` (additional authenticated data) was originally specified as
-// `envelope_id || timestamp_ms` to be bound by the AEAD tag. The current
-// implementation does NOT bind it (the inner ratchet/SenderKeys encrypt
-// is called with empty outer_aad). The inner protocols still authenticate
-// content + sequence + DH state, so injection / reorder / replay are
-// detected; what's NOT bound is the relay-side metadata (envelope_id and
-// timestamp_ms can be rewritten without invalidating the inner tag).
-// Tracked in docs/security-audit.md §3 as a low-severity gap to close.
+// `aad` (additional authenticated data) is the concatenation
+// `envelope_id || timestamp_ms (8 BE)` and is bound by the inner
+// ratchet / SenderKeys AEAD tag — a relay cannot rewrite envelope_id
+// or timestamp without invalidating the tag, AND receivers cross-
+// check that `aad` matches the reconstruction from envelope_id and
+// timestamp_ms (so a relay also can't bypass the binding by
+// substituting all three consistently — the receiver enforces
+// equality).
+//
+// Older clients (pre-binding) leave this empty and used empty
+// outer_aad in their inner encrypt; new receivers honour that for
+// backwards compat. New senders ALWAYS populate this field.
 //
 // `aead_alg` selects the AEAD algorithm. `1 = AES-256-GCM` is the only value
 // shipped in the initial release; the field exists so we can negotiate other
