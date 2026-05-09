@@ -20,6 +20,7 @@
 // =============================================================================
 
 #include "fb/p2p/peer_net.hpp"
+#include "fb/crypto/identity_cert.hpp"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -254,6 +255,129 @@ TEST(PeerNet, BurstSendsArriveInOrderOnSingleConnection) {
     }
     // A reused one outbound connection for all 8 sends.
     EXPECT_EQ(a.outbound_count(), 1u);
+    rmrf(tmpdir);
+}
+
+// Mutual-TLS: A and B both use IDENTITY-derived self-signed certs.
+// Each side extracts the peer's pubkey from their cert and exposes
+// it via on_message's PeerInfo.pubkey. A's send to B with an
+// expected_peer_pubkey of B's identity succeeds; A's send to B
+// with the WRONG expected_peer_pubkey fails (the dial throws
+// "identity-pin failure" inside PeerNet's worker, so the bytes
+// never reach B's on_message).
+TEST(PeerNet, MutualTlsIdentityPinningSucceedsAndRejects) {
+    auto tmpdir = make_tmpdir();
+    if (tmpdir.empty()) GTEST_SKIP() << "could not create tmpdir";
+
+    // Generate identity certs for A and B from distinct Ed25519 seeds.
+    std::array<std::uint8_t, 32> seedA{}; seedA[0] = 0xa1;
+    std::array<std::uint8_t, 32> seedB{}; seedB[0] = 0xb2;
+    auto certA = fb::crypto::generate_identity_cert(
+        std::span<const std::uint8_t, 32>(seedA));
+    auto certB = fb::crypto::generate_identity_cert(
+        std::span<const std::uint8_t, 32>(seedB));
+
+    auto write = [&](const std::string& name, const std::string& contents) {
+        const std::string path = tmpdir + "/" + name;
+        std::ofstream o(path);
+        o << contents;
+        return path;
+    };
+    const auto a_cert_path = write("a_cert.pem", certA.cert_pem);
+    const auto a_key_path  = write("a_key.pem",  certA.key_pem);
+    const auto b_cert_path = write("b_cert.pem", certB.cert_pem);
+    const auto b_key_path  = write("b_key.pem",  certB.key_pem);
+
+    // Recover B's actual pubkey to use as the expected pin (and as
+    // the wrong pin for the failure case, we'll use a random one).
+    auto bpub = fb::crypto::extract_pubkey_from_cert_pem(certB.cert_pem);
+    ASSERT_TRUE(bpub.has_value());
+
+    fb::p2p::PeerNet a, b;
+
+    std::mutex b_mu;
+    std::vector<std::vector<std::uint8_t>> b_inbox;
+    std::vector<std::vector<std::uint8_t>> b_inbox_pubs;
+    b.set_on_message([&](const fb::p2p::PeerInfo& from,
+                          std::span<const std::uint8_t> bytes) {
+        std::lock_guard lk(b_mu);
+        b_inbox.emplace_back(bytes.begin(), bytes.end());
+        b_inbox_pubs.emplace_back(from.pubkey);
+    });
+
+    fb::p2p::PeerListenerOptions b_lo;
+    b_lo.bind_host          = "127.0.0.1";
+    b_lo.tls_cert_pem       = b_cert_path;
+    b_lo.tls_key_pem        = b_key_path;
+    b_lo.require_client_cert = true;   // mutual auth required
+    b.start_listener(b_lo);
+
+    fb::p2p::PeerListenerOptions a_lo;
+    a_lo.bind_host          = "127.0.0.1";
+    a_lo.tls_cert_pem       = a_cert_path;
+    a_lo.tls_key_pem        = a_key_path;
+    a_lo.require_client_cert = true;
+    a.start_listener(a_lo);
+
+    // Configure A's dialer with A's identity cert + key.
+    fb::p2p::PeerDialerOptions dopts;
+    dopts.client_cert_pem      = certA.cert_pem;
+    dopts.client_key_pem       = certA.key_pem;
+    dopts.insecure_skip_verify = true;
+    a.set_dialer(dopts);
+
+    // Happy path: A sends to B with B's CORRECT identity pubkey.
+    fb::p2p::PeerInfo b_target{};
+    b_target.addr = "wss://127.0.0.1:" + std::to_string(b.listener_port());
+    b_target.pubkey.assign(bpub->begin(), bpub->end());
+    const std::vector<std::uint8_t> hello{'h','i','!'};
+    EXPECT_TRUE(a.send(b_target,
+        std::span<const std::uint8_t>(hello.data(), hello.size())));
+
+    EXPECT_TRUE(wait_until(5000, [&]() {
+        std::lock_guard lk(b_mu);
+        return !b_inbox.empty();
+    }));
+
+    // B saw A's IDENTITY pubkey on the connection (extracted from
+    // A's mutual-TLS cert) — not a self-stamped sender_pubkey field.
+    auto apub = fb::crypto::extract_pubkey_from_cert_pem(certA.cert_pem);
+    ASSERT_TRUE(apub.has_value());
+    {
+        std::lock_guard lk(b_mu);
+        ASSERT_FALSE(b_inbox_pubs.empty());
+        EXPECT_EQ(b_inbox_pubs.front().size(), 32u);
+        EXPECT_TRUE(std::equal(b_inbox_pubs.front().begin(),
+                                b_inbox_pubs.front().end(),
+                                apub->begin()));
+    }
+
+    // Mismatch path: A sends to B's address but expects a DIFFERENT
+    // pubkey. The dial should throw "identity-pin failure" inside
+    // PeerNet's worker, so B's on_message MUST NOT see the bytes.
+    fb::p2p::PeerNet a2;
+    a2.set_dialer(dopts);
+    fb::p2p::PeerInfo bad_target{};
+    bad_target.addr = "wss://127.0.0.1:" + std::to_string(b.listener_port());
+    std::array<std::uint8_t, 32> wrong_pub{};
+    for (auto& b8 : wrong_pub) b8 = 0xee;
+    bad_target.pubkey.assign(wrong_pub.begin(), wrong_pub.end());
+
+    const std::size_t before = ([&]() {
+        std::lock_guard lk(b_mu);
+        return b_inbox.size();
+    })();
+    const std::vector<std::uint8_t> nope{'n','o'};
+    a2.send(bad_target,
+        std::span<const std::uint8_t>(nope.data(), nope.size()));
+    // Give the dial+handshake plenty of time to complete (or fail).
+    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    {
+        std::lock_guard lk(b_mu);
+        EXPECT_EQ(b_inbox.size(), before)
+            << "B received bytes from a peer with mismatched pinned pubkey";
+    }
+
     rmrf(tmpdir);
 }
 

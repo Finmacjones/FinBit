@@ -40,7 +40,7 @@
 #include <span>
 #include <vector>
 
-namespace fb::proto { class ProviderRecord; class DhtMessage; }
+namespace fb::proto { class ProviderRecord; class PrekeyRecord; class DhtMessage; }
 
 namespace fb::p2p {
 
@@ -63,6 +63,9 @@ using DhtSendCallback =
 // publisher_pubkey || nonce).
 using DhtLookupCallback =
     std::function<void(const std::vector<fb::proto::ProviderRecord>&)>;
+
+using DhtPrekeyLookupCallback =
+    std::function<void(const std::vector<fb::proto::PrekeyRecord>&)>;
 
 class DhtNode {
 public:
@@ -114,10 +117,25 @@ public:
     // the response slot is reclaimed.
     void abort_lookup(std::span<const std::uint8_t> request_id);
 
+    // ---- Prekey bundle publish + lookup (X3DH without a server) ----
+
+    // Self-publish a prekey bundle. Stored locally and broadcast to
+    // the K closest peers so DM-initiators can find us via DHT.
+    std::size_t publish_prekey(const fb::proto::PrekeyRecord& record);
+
+    // Issue a prekey lookup. Local hits fire first; remote responses
+    // fire as they arrive (cumulative dedup, same shape as lookup()).
+    std::size_t lookup_prekey(std::span<const std::uint8_t> target_pubkey,
+                                DhtPrekeyLookupCallback on_results);
+
+    void abort_prekey_lookup(std::span<const std::uint8_t> request_id);
+
     // Diagnostics / test plumbing.
-    [[nodiscard]] RoutingTable&  routing()        { return routing_; }
-    [[nodiscard]] ProviderStore& store()          { return store_; }
+    [[nodiscard]] RoutingTable&  routing()         { return routing_; }
+    [[nodiscard]] ProviderStore& store()           { return store_; }
+    [[nodiscard]] PrekeyStore&   prekeys()         { return prekeys_; }
     [[nodiscard]] std::size_t    pending_lookups() const;
+    [[nodiscard]] std::size_t    pending_prekey_lookups() const;
 
 private:
     struct Impl;
@@ -125,6 +143,7 @@ private:
     DhtSendCallback                 send_;
     RoutingTable                    routing_;
     ProviderStore                   store_;
+    PrekeyStore                     prekeys_;
     std::unique_ptr<Impl>           impl_;
 };
 

@@ -283,4 +283,257 @@ std::size_t ProviderStore::size() const {
     return n;
 }
 
+// =============================================================================
+// PrekeyStore — same building blocks as ProviderStore but with the
+// X3DH bundle fields. Layout of the canonical signing bytes:
+//
+//   "fb.p2p.PrekeyRecord:v1\n"
+//   uint8(pubkey_len = 32)              || pubkey
+//   uint8(spk_len = 32)                 || signed_prekey
+//   uint8(spk_sig_len = 64)             || signed_prekey_signature
+//   uint64_be(published_at_ms)
+//   uint64_be(ttl_ms)
+//   uint8(nonce_len = 16)               || nonce
+// =============================================================================
+
+namespace {
+
+constexpr const char* kPrekeyMagic = "fb.p2p.PrekeyRecord:v1\n";
+
+}  // namespace
+
+std::vector<std::uint8_t> prekey_canonical_signing_bytes(
+    std::span<const std::uint8_t> publisher_pubkey,
+    std::span<const std::uint8_t> signed_prekey,
+    std::span<const std::uint8_t> signed_prekey_signature,
+    std::uint64_t published_at_ms,
+    std::uint64_t ttl_ms,
+    std::span<const std::uint8_t> nonce) {
+    if (publisher_pubkey.size() != 32) {
+        throw std::invalid_argument("PrekeyRecord: pubkey must be 32B");
+    }
+    if (signed_prekey.size() != 32) {
+        throw std::invalid_argument(
+            "PrekeyRecord: signed_prekey must be 32B (X25519 pub)");
+    }
+    if (signed_prekey_signature.size() != crypto_sign_BYTES) {
+        throw std::invalid_argument(
+            "PrekeyRecord: signed_prekey_signature must be 64B");
+    }
+    if (nonce.size() != 16) {
+        throw std::invalid_argument("PrekeyRecord: nonce must be 16B");
+    }
+    std::vector<std::uint8_t> out;
+    const std::string magic = kPrekeyMagic;
+    out.insert(out.end(), magic.begin(), magic.end());
+    out.push_back(32);
+    out.insert(out.end(), publisher_pubkey.begin(), publisher_pubkey.end());
+    out.push_back(32);
+    out.insert(out.end(), signed_prekey.begin(), signed_prekey.end());
+    out.push_back(64);
+    out.insert(out.end(), signed_prekey_signature.begin(),
+                signed_prekey_signature.end());
+    auto append_be64 = [&](std::uint64_t v) {
+        for (int i = 7; i >= 0; --i) {
+            out.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xff));
+        }
+    };
+    append_be64(published_at_ms);
+    append_be64(ttl_ms);
+    out.push_back(16);
+    out.insert(out.end(), nonce.begin(), nonce.end());
+    return out;
+}
+
+fb::proto::PrekeyRecord build_prekey_record(
+    std::span<const std::uint8_t> sig_pub,
+    std::span<const std::uint8_t> sig_priv,
+    std::span<const std::uint8_t> signed_prekey,
+    std::span<const std::uint8_t> signed_prekey_signature,
+    std::uint64_t published_at_ms,
+    std::uint64_t ttl_ms) {
+    if (sig_pub.size() != crypto_sign_PUBLICKEYBYTES) {
+        throw std::invalid_argument("build_prekey_record: sig_pub must be 32B");
+    }
+    if (sig_priv.size() != crypto_sign_SECRETKEYBYTES) {
+        throw std::invalid_argument("build_prekey_record: sig_priv must be 64B");
+    }
+    fb::proto::PrekeyRecord out;
+    out.set_publisher_pubkey(std::string(sig_pub.begin(), sig_pub.end()));
+    out.set_signed_prekey(std::string(signed_prekey.begin(),
+                                       signed_prekey.end()));
+    out.set_signed_prekey_signature(std::string(
+        signed_prekey_signature.begin(), signed_prekey_signature.end()));
+    out.set_published_at_ms(published_at_ms);
+    out.set_ttl_ms(ttl_ms);
+
+    std::array<std::uint8_t, 16> nonce{};
+    randombytes_buf(nonce.data(), nonce.size());
+    out.set_nonce(std::string(nonce.begin(), nonce.end()));
+
+    auto signing_bytes = prekey_canonical_signing_bytes(
+        sig_pub, signed_prekey, signed_prekey_signature,
+        published_at_ms, ttl_ms,
+        std::span<const std::uint8_t>(nonce.data(), nonce.size()));
+    std::array<std::uint8_t, crypto_sign_BYTES> sig{};
+    unsigned long long sig_len = 0;
+    if (crypto_sign_detached(sig.data(), &sig_len,
+                              signing_bytes.data(), signing_bytes.size(),
+                              sig_priv.data()) != 0) {
+        throw std::runtime_error(
+            "build_prekey_record: crypto_sign_detached failed");
+    }
+    out.set_signature(std::string(sig.begin(), sig.begin() + sig_len));
+    return out;
+}
+
+namespace {
+
+bool verify_prekey_record_signature(const fb::proto::PrekeyRecord& r) {
+    if (r.publisher_pubkey().size() != crypto_sign_PUBLICKEYBYTES) return false;
+    if (r.signed_prekey().size() != 32) return false;
+    if (r.signed_prekey_signature().size() != crypto_sign_BYTES) return false;
+    if (r.signature().size() != crypto_sign_BYTES) return false;
+    if (r.nonce().size() != 16) return false;
+    auto pub = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(r.publisher_pubkey().data()),
+        r.publisher_pubkey().size());
+    auto spk = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(r.signed_prekey().data()),
+        r.signed_prekey().size());
+    auto spk_sig = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(r.signed_prekey_signature().data()),
+        r.signed_prekey_signature().size());
+    auto nonce = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(r.nonce().data()),
+        r.nonce().size());
+    auto signing_bytes = prekey_canonical_signing_bytes(
+        pub, spk, spk_sig, r.published_at_ms(), r.ttl_ms(), nonce);
+    if (0 != crypto_sign_verify_detached(
+            reinterpret_cast<const unsigned char*>(r.signature().data()),
+            signing_bytes.data(), signing_bytes.size(), pub.data())) {
+        return false;
+    }
+    // Independent SPK signature check — guards against a peer
+    // republishing the OUTER record with a different SPK they don't
+    // own. The SPK signature is over the SPK bytes alone, signed by
+    // the identity key.
+    if (0 != crypto_sign_verify_detached(
+            reinterpret_cast<const unsigned char*>(r.signed_prekey_signature().data()),
+            reinterpret_cast<const unsigned char*>(r.signed_prekey().data()),
+            r.signed_prekey().size(), pub.data())) {
+        return false;
+    }
+    return true;
+}
+
+bool prekey_expired(const fb::proto::PrekeyRecord& r, std::uint64_t now_ms) {
+    return r.published_at_ms() + r.ttl_ms() <= now_ms;
+}
+
+std::string prekey_record_key(const fb::proto::PrekeyRecord& r) {
+    std::string out;
+    out.reserve(r.publisher_pubkey().size() + r.nonce().size());
+    out.append(r.publisher_pubkey());
+    out.append(r.nonce());
+    return out;
+}
+
+}  // namespace
+
+struct PrekeyStore::Impl {
+    std::map<std::string,
+             std::map<std::string, fb::proto::PrekeyRecord>> by_publisher;
+};
+
+PrekeyStore::PrekeyStore()  : impl_(std::make_unique<Impl>()) {}
+PrekeyStore::~PrekeyStore() = default;
+
+PrekeyStore::PutResult PrekeyStore::put(
+    const fb::proto::PrekeyRecord& record, std::uint64_t now_ms) {
+    if (record.publisher_pubkey().size() != crypto_sign_PUBLICKEYBYTES)
+        return PutResult::kRejectedFormat;
+    if (record.signed_prekey().size() != 32)
+        return PutResult::kRejectedFormat;
+    if (record.signed_prekey_signature().size() != crypto_sign_BYTES)
+        return PutResult::kRejectedFormat;
+    if (record.signature().size() != crypto_sign_BYTES)
+        return PutResult::kRejectedFormat;
+    if (record.nonce().size() != 16)
+        return PutResult::kRejectedFormat;
+
+    const auto now = now_ms_or(now_ms);
+    if (record.published_at_ms() > now + kRecordClockSkewMs)
+        return PutResult::kRejectedClock;
+    if (prekey_expired(record, now))
+        return PutResult::kRejectedExpired;
+    if (!verify_prekey_record_signature(record))
+        return PutResult::kRejectedSig;
+
+    auto pkey = pubkey_key(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(record.publisher_pubkey().data()),
+        record.publisher_pubkey().size()));
+    auto rkey = prekey_record_key(record);
+    auto& bucket = impl_->by_publisher[pkey];
+    auto [it, inserted] = bucket.try_emplace(rkey, record);
+    return inserted ? PutResult::kAccepted : PutResult::kAlreadyKnown;
+}
+
+std::optional<fb::proto::PrekeyRecord> PrekeyStore::get_latest(
+    std::span<const std::uint8_t> publisher_pubkey,
+    std::uint64_t now_ms) const {
+    const auto now = now_ms_or(now_ms);
+    auto pkey = pubkey_key(publisher_pubkey);
+    auto it = impl_->by_publisher.find(pkey);
+    if (it == impl_->by_publisher.end()) return std::nullopt;
+    std::optional<fb::proto::PrekeyRecord> best;
+    for (const auto& [_rk, rec] : it->second) {
+        if (prekey_expired(rec, now)) continue;
+        if (!best || rec.published_at_ms() > best->published_at_ms()) {
+            best = rec;
+        }
+    }
+    return best;
+}
+
+std::vector<fb::proto::PrekeyRecord> PrekeyStore::get_all(
+    std::span<const std::uint8_t> publisher_pubkey,
+    std::uint64_t now_ms) const {
+    const auto now = now_ms_or(now_ms);
+    std::vector<fb::proto::PrekeyRecord> out;
+    auto pkey = pubkey_key(publisher_pubkey);
+    auto it = impl_->by_publisher.find(pkey);
+    if (it == impl_->by_publisher.end()) return out;
+    for (const auto& [_rk, rec] : it->second) {
+        if (!prekey_expired(rec, now)) out.push_back(rec);
+    }
+    return out;
+}
+
+std::size_t PrekeyStore::prune_expired(std::uint64_t now_ms) {
+    const auto now = now_ms_or(now_ms);
+    std::size_t pruned = 0;
+    for (auto pit = impl_->by_publisher.begin();
+         pit != impl_->by_publisher.end();) {
+        auto& bucket = pit->second;
+        for (auto rit = bucket.begin(); rit != bucket.end();) {
+            if (prekey_expired(rit->second, now)) {
+                rit = bucket.erase(rit);
+                ++pruned;
+            } else {
+                ++rit;
+            }
+        }
+        if (bucket.empty()) pit = impl_->by_publisher.erase(pit);
+        else ++pit;
+    }
+    return pruned;
+}
+
+std::size_t PrekeyStore::size() const {
+    std::size_t n = 0;
+    for (const auto& [_pk, bucket] : impl_->by_publisher) n += bucket.size();
+    return n;
+}
+
 }  // namespace fb::p2p

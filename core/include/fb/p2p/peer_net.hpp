@@ -53,6 +53,18 @@ struct PeerListenerOptions {
     // PEM file paths for the listener's TLS identity.
     std::string tls_cert_pem;
     std::string tls_key_pem;
+    // Mutual auth: when true, connecting peers MUST present a client
+    // cert during the TLS handshake. Recommended for the serverless
+    // P2P path (PeerNet's main use case) — the listener extracts the
+    // client's Ed25519 pubkey from the cert and exposes it on
+    // PeerInfo.pubkey, giving downstream code (DhtNode etc.)
+    // TLS-attested peer identity instead of a self-stamped sender
+    // pubkey field.
+    //
+    // Default false for backwards compatibility with anonymous-dial
+    // callers; the cert pubkey is still extracted whenever a peer
+    // happens to present one.
+    bool require_client_cert = false;
 };
 
 struct PeerDialerOptions {
@@ -61,6 +73,12 @@ struct PeerDialerOptions {
     std::string ca_file;
     // Skip cert validation entirely. Dev / self-signed only.
     bool insecure_skip_verify = false;
+    // ---- Mutual auth (FinBit serverless P2P) ----
+    // PEM-encoded identity cert + key to present during outbound
+    // handshakes. Use fb::crypto::generate_identity_cert() to derive
+    // them from an Ed25519 seed.
+    std::string client_cert_pem;
+    std::string client_key_pem;
 };
 
 class PeerNet {

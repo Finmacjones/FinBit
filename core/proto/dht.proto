@@ -57,6 +57,55 @@ message ProviderRecord {
     bytes  signature = 6;
 }
 
+// Prekey bundle published into the DHT so peers can start a Double
+// Ratchet (X3DH) without ever talking to a central server. Same shape
+// as ProviderRecord — signed at the application layer, TTL-bounded,
+// keyed by publisher_pubkey. Each peer publishes their own bundle and
+// re-publishes before TTL expiry; a peer wanting to DM looks up the
+// publisher's pubkey in the DHT and runs X3DH against the returned
+// signed_prekey.
+//
+// Wire-form privacy: same as ProviderRecord — these records are
+// PUBLIC by design (anyone can look up alice's bundle and start a
+// conversation; the security boundary is the X3DH + Double Ratchet on
+// top, not the bundle's confidentiality).
+message PrekeyRecord {
+    bytes  publisher_pubkey       = 1;   // 32B Ed25519 identity
+    bytes  signed_prekey          = 2;   // 32B X25519 (signed prekey pub)
+    bytes  signed_prekey_signature = 3;  // 64B Ed25519 over signed_prekey,
+                                          // signed by the identity key.
+                                          // Independent of the outer record
+                                          // signature — it survives TTL
+                                          // refresh and lets peers verify
+                                          // the SPK binding to the identity
+                                          // even if they only see the SPK
+                                          // bytes out of band.
+    uint64 published_at_ms        = 4;
+    uint64 ttl_ms                 = 5;
+    bytes  nonce                  = 6;   // 16B
+    bytes  signature              = 7;   // 64B Ed25519 over canonical
+                                          // signing bytes (analogous to
+                                          // ProviderRecord.signature).
+}
+
+// "I serve prekey for pubkey X — store this record." Sent to the K
+// peers closest to SHA-256(record.publisher_pubkey)[0..20].
+message DhtPrekeyPublish {
+    PrekeyRecord record = 1;
+}
+
+// "Fetch prekey for pubkey X." Sent to the K closest peers to
+// SHA-256(target_pubkey)[0..20]. Receiver replies with PrekeyResponse.
+message DhtPrekeyLookup {
+    bytes target_pubkey = 1;
+    bytes request_id    = 2;
+}
+
+message DhtPrekeyResponse {
+    repeated PrekeyRecord records    = 1;
+    bytes                 request_id = 2;
+}
+
 // Wire envelope for DHT lookup responses: a peer asked "who provides for
 // pubkey X?" and the responder returns every fresh record they have for X.
 message ProviderLookupResponse {
@@ -88,8 +137,11 @@ message DhtLookup {
 // bytes; this oneof is what the receiving DhtNode dispatches on.
 message DhtMessage {
     oneof body {
-        DhtPublish              publish  = 1;
-        DhtLookup               lookup   = 2;
-        ProviderLookupResponse  response = 3;
+        DhtPublish              publish          = 1;
+        DhtLookup               lookup           = 2;
+        ProviderLookupResponse  response         = 3;
+        DhtPrekeyPublish        prekey_publish   = 4;
+        DhtPrekeyLookup         prekey_lookup    = 5;
+        DhtPrekeyResponse       prekey_response  = 6;
     }
 }

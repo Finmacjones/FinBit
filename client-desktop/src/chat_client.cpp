@@ -1165,6 +1165,22 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             if (impl_->username_gossip)
                                 impl_->username_gossip->on_message(from, payload);
                             break;
+                        case fb::proto::PeerEnvelope::DM:
+                            // Direct-P2P DM: inner payload is a
+                            // wire-form Envelope. Surface the
+                            // capability via the activity log; the
+                            // actual decrypt path goes through the
+                            // existing Frame.envelope handler in a
+                            // follow-up refactor that hoists DM
+                            // dispatch into a helper callable from
+                            // both sites.
+                            emit log(QString("inbound DM via direct P2P "
+                                              "from %1B sender, payload=%2B")
+                                         .arg(static_cast<qulonglong>(
+                                             from.pubkey.size()))
+                                         .arg(static_cast<qulonglong>(
+                                             payload.size())));
+                            break;
                         default: break;
                     }
                 }

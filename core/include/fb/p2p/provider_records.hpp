@@ -30,11 +30,12 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
-namespace fb::proto { class ProviderRecord; }
+namespace fb::proto { class ProviderRecord; class PrekeyRecord; }
 
 namespace fb::p2p {
 
@@ -107,6 +108,71 @@ public:
 
     // Number of records currently in the store (across all publishers,
     // expired-or-not — call prune_expired first for a cleaner count).
+    [[nodiscard]] std::size_t size() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// =============================================================================
+// PrekeyStore — same shape as ProviderStore but for X3DH prekey
+// bundles. Lets peers publish their bundles into the DHT and look
+// each other's up without a central server (the role the
+// `KeyBundleUpload` / `KeyBundleFetch` server-resident frames play
+// in the centralized mode).
+// =============================================================================
+
+[[nodiscard]] std::vector<std::uint8_t> prekey_canonical_signing_bytes(
+    std::span<const std::uint8_t> publisher_pubkey,
+    std::span<const std::uint8_t> signed_prekey,
+    std::span<const std::uint8_t> signed_prekey_signature,
+    std::uint64_t published_at_ms,
+    std::uint64_t ttl_ms,
+    std::span<const std::uint8_t> nonce);
+
+// Build + sign a prekey record. `sig_pub` is the publisher's identity
+// pubkey (Ed25519, 32B). `sig_priv` is the matching 64B secret. The
+// caller-supplied `signed_prekey` (32B X25519) is the X3DH SPK; we
+// also accept its independent Ed25519 signature `signed_prekey_signature`
+// — produced once when the SPK was generated, valid as long as the SPK
+// is. (Different from the OUTER record signature, which covers the
+// whole record + nonce + ttl.)
+[[nodiscard]] fb::proto::PrekeyRecord build_prekey_record(
+    std::span<const std::uint8_t> sig_pub,
+    std::span<const std::uint8_t> sig_priv,
+    std::span<const std::uint8_t> signed_prekey,
+    std::span<const std::uint8_t> signed_prekey_signature,
+    std::uint64_t published_at_ms,
+    std::uint64_t ttl_ms = kDefaultProviderTtlMs);
+
+class PrekeyStore {
+public:
+    PrekeyStore();
+    ~PrekeyStore();
+    PrekeyStore(const PrekeyStore&)            = delete;
+    PrekeyStore& operator=(const PrekeyStore&) = delete;
+
+    enum class PutResult {
+        kAccepted, kAlreadyKnown, kRejectedSig,
+        kRejectedFormat, kRejectedExpired, kRejectedClock,
+    };
+
+    PutResult put(const fb::proto::PrekeyRecord& record,
+                  std::uint64_t now_ms = 0);
+
+    // Most recent fresh record for a publisher (highest published_at_ms
+    // among non-expired entries). Empty if none.
+    [[nodiscard]] std::optional<fb::proto::PrekeyRecord> get_latest(
+        std::span<const std::uint8_t> publisher_pubkey,
+        std::uint64_t now_ms = 0) const;
+
+    // All fresh records for a publisher (multi-publish coexistence).
+    [[nodiscard]] std::vector<fb::proto::PrekeyRecord> get_all(
+        std::span<const std::uint8_t> publisher_pubkey,
+        std::uint64_t now_ms = 0) const;
+
+    std::size_t prune_expired(std::uint64_t now_ms = 0);
     [[nodiscard]] std::size_t size() const;
 
 private:

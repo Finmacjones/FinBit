@@ -24,6 +24,13 @@ std::string record_key(const fb::proto::ProviderRecord& r) {
     out.append(r.nonce());
     return out;
 }
+std::string prekey_record_key(const fb::proto::PrekeyRecord& r) {
+    std::string out;
+    out.reserve(r.publisher_pubkey().size() + r.nonce().size());
+    out.append(r.publisher_pubkey());
+    out.append(r.nonce());
+    return out;
+}
 
 std::vector<std::uint8_t> serialize_msg(const fb::proto::DhtMessage& m) {
     std::vector<std::uint8_t> out(m.ByteSizeLong());
@@ -50,17 +57,25 @@ std::vector<PeerInfo> closest_capped(const RoutingTable& rt,
 }  // namespace
 
 struct DhtNode::Impl {
-    // Active lookups, keyed by 16-byte request_id (raw bytes as
-    // std::string for map-keying). Values: pending peer count + dedup
-    // set + caller's callback.
+    // Active provider-record lookups.
     struct PendingLookup {
         std::vector<std::uint8_t>             target_pubkey;
         DhtLookupCallback                     callback;
         std::size_t                           awaiting_replies = 0;
         std::map<std::string,
-                 fb::proto::ProviderRecord>   seen;   // dedup
+                 fb::proto::ProviderRecord>   seen;
     };
     std::map<std::string, PendingLookup> pending;
+
+    // Active prekey-bundle lookups.
+    struct PendingPrekey {
+        std::vector<std::uint8_t>             target_pubkey;
+        DhtPrekeyLookupCallback               callback;
+        std::size_t                           awaiting_replies = 0;
+        std::map<std::string,
+                 fb::proto::PrekeyRecord>     seen;
+    };
+    std::map<std::string, PendingPrekey> pending_prekey;
 };
 
 DhtNode::DhtNode(NodeId self, DhtSendCallback send)
@@ -208,43 +223,71 @@ void DhtNode::on_message(const PeerInfo& from_peer,
             const auto& resp = msg.response();
             const std::string rid(resp.request_id());
             auto it = impl_->pending.find(rid);
-            if (it == impl_->pending.end()) {
-                // Late / unsolicited response — drop. Could be a
-                // late reply after we abort_lookup'd.
-                return;
-            }
+            if (it == impl_->pending.end()) return;
             auto& pl = it->second;
-            // Merge new records into the dedup set.
             for (const auto& r : resp.records()) {
-                // Cheap sanity: don't store records that don't match
-                // the pubkey we asked about (peer could lie or be
-                // confused).
                 if (r.publisher_pubkey() !=
                     std::string(pl.target_pubkey.begin(),
                                  pl.target_pubkey.end())) {
                     continue;
                 }
                 pl.seen[record_key(r)] = r;
-                // Opportunistically also store locally so future
-                // lookups for the same pubkey don't need a network
-                // round trip.
                 (void)store_.put(r);
             }
-            // Fire the callback with the cumulative deduped batch.
             std::vector<fb::proto::ProviderRecord> snapshot;
             snapshot.reserve(pl.seen.size());
             for (const auto& [_k, v] : pl.seen) snapshot.push_back(v);
             pl.callback(snapshot);
-
             if (pl.awaiting_replies > 0) --pl.awaiting_replies;
-            if (pl.awaiting_replies == 0) {
-                impl_->pending.erase(it);
+            if (pl.awaiting_replies == 0) impl_->pending.erase(it);
+            break;
+        }
+        case fb::proto::DhtMessage::kPrekeyPublish: {
+            const auto& rec = msg.prekey_publish().record();
+            (void)prekeys_.put(rec);
+            break;
+        }
+        case fb::proto::DhtMessage::kPrekeyLookup: {
+            const auto& q = msg.prekey_lookup();
+            if (q.target_pubkey().size() != 32) return;
+            auto pub = std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(
+                    q.target_pubkey().data()),
+                q.target_pubkey().size());
+            auto records = prekeys_.get_all(pub);
+            fb::proto::DhtMessage reply;
+            auto* resp = reply.mutable_prekey_response();
+            resp->set_request_id(q.request_id());
+            for (const auto& r : records) *resp->add_records() = r;
+            auto wire = serialize_msg(reply);
+            send_(from_peer, std::span<const std::uint8_t>(
+                wire.data(), wire.size()));
+            break;
+        }
+        case fb::proto::DhtMessage::kPrekeyResponse: {
+            const auto& resp = msg.prekey_response();
+            const std::string rid(resp.request_id());
+            auto it = impl_->pending_prekey.find(rid);
+            if (it == impl_->pending_prekey.end()) return;
+            auto& pp = it->second;
+            for (const auto& r : resp.records()) {
+                if (r.publisher_pubkey() !=
+                    std::string(pp.target_pubkey.begin(),
+                                 pp.target_pubkey.end())) {
+                    continue;
+                }
+                pp.seen[prekey_record_key(r)] = r;
+                (void)prekeys_.put(r);
             }
+            std::vector<fb::proto::PrekeyRecord> snapshot;
+            snapshot.reserve(pp.seen.size());
+            for (const auto& [_k, v] : pp.seen) snapshot.push_back(v);
+            pp.callback(snapshot);
+            if (pp.awaiting_replies > 0) --pp.awaiting_replies;
+            if (pp.awaiting_replies == 0) impl_->pending_prekey.erase(it);
             break;
         }
         default:
-            // Unknown body — could be a future-protocol message we
-            // don't understand. Drop silently.
             break;
     }
 }
@@ -257,6 +300,93 @@ void DhtNode::abort_lookup(std::span<const std::uint8_t> request_id) {
 
 std::size_t DhtNode::pending_lookups() const {
     return impl_->pending.size();
+}
+
+// =============================================================================
+// Prekey publish / lookup. Same shape as the provider-record path
+// above — different store, different message variants.
+// =============================================================================
+
+std::size_t DhtNode::publish_prekey(const fb::proto::PrekeyRecord& record) {
+    const auto local = prekeys_.put(record);
+    if (local != PrekeyStore::PutResult::kAccepted &&
+        local != PrekeyStore::PutResult::kAlreadyKnown) {
+        return 0;
+    }
+    if (record.publisher_pubkey().size() != 32) return 0;
+    auto target = node_id_from_pubkey(std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(
+            record.publisher_pubkey().data()),
+        record.publisher_pubkey().size()));
+    auto peers = closest_capped(routing_, target, kReplicationFactor);
+    if (peers.empty()) return 0;
+
+    fb::proto::DhtMessage msg;
+    *msg.mutable_prekey_publish()->mutable_record() = record;
+    auto wire = serialize_msg(msg);
+
+    std::size_t sent = 0;
+    for (const auto& p : peers) {
+        if (p.id == self_) continue;
+        send_(p, std::span<const std::uint8_t>(wire.data(), wire.size()));
+        ++sent;
+    }
+    return sent;
+}
+
+std::size_t DhtNode::lookup_prekey(std::span<const std::uint8_t> target_pubkey,
+                                     DhtPrekeyLookupCallback on_results) {
+    if (target_pubkey.size() != 32) return 0;
+    auto target_node = node_id_from_pubkey(target_pubkey);
+    auto peers = closest_capped(routing_, target_node, kReplicationFactor);
+
+    auto local_hits = prekeys_.get_all(target_pubkey);
+    if (peers.empty()) {
+        on_results(local_hits);
+        return 0;
+    }
+
+    auto rid_arr = fresh_request_id();
+    std::string rid(rid_arr.begin(), rid_arr.end());
+    Impl::PendingPrekey pp;
+    pp.target_pubkey.assign(target_pubkey.begin(), target_pubkey.end());
+    pp.callback = std::move(on_results);
+    pp.awaiting_replies = peers.size();
+    for (const auto& r : local_hits) {
+        pp.seen[prekey_record_key(r)] = r;
+    }
+    {
+        std::vector<fb::proto::PrekeyRecord> snapshot;
+        snapshot.reserve(pp.seen.size());
+        for (const auto& [_k, v] : pp.seen) snapshot.push_back(v);
+        pp.callback(snapshot);
+    }
+    impl_->pending_prekey.emplace(rid, std::move(pp));
+
+    fb::proto::DhtMessage msg;
+    auto* lk = msg.mutable_prekey_lookup();
+    lk->set_target_pubkey(std::string(target_pubkey.begin(),
+                                       target_pubkey.end()));
+    lk->set_request_id(rid);
+    auto wire = serialize_msg(msg);
+
+    std::size_t sent = 0;
+    for (const auto& p : peers) {
+        if (p.id == self_) continue;
+        send_(p, std::span<const std::uint8_t>(wire.data(), wire.size()));
+        ++sent;
+    }
+    return sent;
+}
+
+void DhtNode::abort_prekey_lookup(std::span<const std::uint8_t> request_id) {
+    impl_->pending_prekey.erase(std::string(
+        reinterpret_cast<const char*>(request_id.data()),
+        request_id.size()));
+}
+
+std::size_t DhtNode::pending_prekey_lookups() const {
+    return impl_->pending_prekey.size();
 }
 
 }  // namespace fb::p2p

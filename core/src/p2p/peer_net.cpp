@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/p2p/peer_net.hpp"
 
+#include "fb/crypto/identity_cert.hpp"
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
 #include "fb/net/tls_client.hpp"
@@ -23,6 +24,7 @@
 #include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <signal.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -36,6 +38,10 @@ struct OpenSslInit {
     OpenSslInit() {
         OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS |
                          OPENSSL_INIT_LOAD_CRYPTO_STRINGS, nullptr);
+        // SIGPIPE → EPIPE on write() to a torn-down socket. Without
+        // this the entire process gets killed when a peer drops mid-
+        // send (common on TLS-handshake-failure paths).
+        ::signal(SIGPIPE, SIG_IGN);
     }
 };
 OpenSslInit& openssl_init() { static OpenSslInit i; return i; }
@@ -363,6 +369,21 @@ void PeerNet::start_listener(const PeerListenerOptions& opts) {
     impl_->server_ctx = SSL_CTX_new(TLS_server_method());
     if (!impl_->server_ctx) throw_openssl("SSL_CTX_new");
     SSL_CTX_set_min_proto_version(impl_->server_ctx, TLS1_2_VERSION);
+    // Mutual auth: when require_client_cert is true, we ask for a
+    // client cert AND fail the handshake if none is presented.
+    // Otherwise we still REQUEST one (so peers that have one will
+    // present it, letting us extract their pubkey) but don't reject
+    // anonymous dialers. The chain-check would always fail (peer
+    // certs are self-signed at the identity key, no useful CA
+    // exists) so the verify_callback always returns 1 — actual
+    // pubkey binding happens at the application layer after the
+    // handshake.
+    int verify_mode = SSL_VERIFY_PEER;
+    if (opts.require_client_cert) {
+        verify_mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+    }
+    SSL_CTX_set_verify(impl_->server_ctx, verify_mode,
+        [](int /*preverify_ok*/, X509_STORE_CTX*) -> int { return 1; });
     if (SSL_CTX_use_certificate_chain_file(
             impl_->server_ctx, opts.tls_cert_pem.c_str()) != 1) {
         throw_openssl("use_certificate_chain_file");
@@ -425,16 +446,33 @@ void PeerNet::start_listener(const PeerListenerOptions& opts) {
             if (!conn->handshake()) {
                 continue;   // bad client / cert / etc.
             }
+            // Mutual-TLS: extract the client's Ed25519 pubkey from
+            // their cert so on_message receives a PeerInfo with the
+            // identity TLS-attested. Without this the application
+            // layer would be back to trusting a self-stamped
+            // sender_pubkey field.
+            PeerInfo from{};
+            X509* peer_cert = SSL_get_peer_certificate(conn->ssl);
+            if (peer_cert) {
+                EVP_PKEY* pkey = X509_get_pubkey(peer_cert);
+                if (pkey && EVP_PKEY_id(pkey) == EVP_PKEY_ED25519) {
+                    std::array<std::uint8_t, 32> pub{};
+                    std::size_t len = pub.size();
+                    if (EVP_PKEY_get_raw_public_key(
+                            pkey, pub.data(), &len) == 1 && len == 32) {
+                        from.pubkey.assign(pub.begin(), pub.end());
+                        from.id = node_id_from_pubkey(
+                            std::span<const std::uint8_t>(
+                                pub.data(), pub.size()));
+                    }
+                }
+                if (pkey) EVP_PKEY_free(pkey);
+                X509_free(peer_cert);
+            }
             // Spawn a worker thread to drive the connection.
             auto w = std::make_shared<Impl::Worker>();
             // Move conn into the lambda capture.
             auto conn_ptr = std::shared_ptr<AcceptedConn>(conn.release());
-            // Build a PeerInfo label — for inbound we don't know the
-            // peer's pubkey yet (would need mutual-TLS or in-band
-            // identity announce). Leave id zero, addr empty; the
-            // higher layer (e.g. ChatClient) overlays sender pubkey
-            // from the inbound PeerEnvelope itself.
-            PeerInfo from{};
             w->thread = std::thread(
                 [this, w_weak = std::weak_ptr<Impl::Worker>(w),
                  conn_ptr, from]() mutable {
@@ -495,6 +533,13 @@ bool PeerNet::send(const PeerInfo& peer,
                     topts.ca_file              = dialer_opts.ca_file;
                     topts.insecure_skip_verify = dialer_opts.insecure_skip_verify;
                     topts.sni_hostname         = host;
+                    topts.client_cert_pem      = dialer_opts.client_cert_pem;
+                    topts.client_key_pem       = dialer_opts.client_key_pem;
+                    if (peer_copy.pubkey.size() == 32) {
+                        std::copy_n(peer_copy.pubkey.begin(), 32,
+                                     topts.expected_peer_pubkey.begin());
+                        topts.expected_peer_pubkey_set = true;
+                    }
                     try {
                         tls.connect(host, port, topts);
                     } catch (const std::exception&) {

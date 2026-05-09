@@ -26,6 +26,7 @@
 // concurrent read+write must serialize access externally.
 // =============================================================================
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -47,6 +48,25 @@ struct TlsClientOptions {
     // host. Override when the server's cert CN/SAN differs from the IP
     // you're dialing (common for CDN / cert-pinned setups).
     std::string sni_hostname;
+
+    // ---- Identity-pinned mutual auth (FinBit serverless P2P) ----
+    //
+    // When set, present this client cert + key during the TLS
+    // handshake. PeerNet uses this to attest to the dialing peer's
+    // Ed25519 identity at the TLS layer. PEM strings (NOT file
+    // paths) so callers can hold the material in memory without
+    // touching disk.
+    std::string client_cert_pem;
+    std::string client_key_pem;
+
+    // When set, after the handshake we extract the peer's Ed25519
+    // pubkey from their cert and verify it matches these 32 bytes.
+    // Mismatch → connect() throws. Used by direct-P2P dials where
+    // we expect a specific peer identity (e.g. from a DHT lookup).
+    // Empty = no pubkey check; the existing CA-based chain check
+    // still runs (or insecure_skip_verify bypasses it).
+    std::array<std::uint8_t, 32> expected_peer_pubkey{};
+    bool                          expected_peer_pubkey_set = false;
 };
 
 class TlsClient {

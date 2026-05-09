@@ -126,6 +126,9 @@ struct Args {
     // listens for inbound Frame.peer and prints a marker line.
     bool overlay_send  = false;
     bool overlay_recv  = false;
+    // PeerEnvelope::Kind value for --overlay-send. 1=DHT (default),
+    // 2=GOSSIP, 3=DM. Used by tests to exercise specific kinds.
+    int  overlay_kind  = 1;
 };
 
 void usage() {
@@ -210,6 +213,11 @@ bool parse(int argc, char** argv, Args& a) {
         else if (s == "--tls-sni") { if (!next(a.tls_sni)) return false; }
         else if (s == "--overlay-send") { a.overlay_send = true; }
         else if (s == "--overlay-recv") { a.overlay_recv = true; }
+        else if (s == "--overlay-kind") {
+            std::string v;
+            if (!next(v)) return false;
+            a.overlay_kind = std::atoi(v.c_str());
+        }
         else if (s == "--help" || s == "-h") { usage(); std::exit(0); }
         else { std::cerr << "unknown arg: " << s << "\n"; usage(); return false; }
     }
@@ -918,7 +926,8 @@ int main(int argc, char** argv) {
         // payload — server doesn't parse it, just forwards.
         fb::proto::Frame envf;
         auto* env = envf.mutable_peer();
-        env->set_kind(fb::proto::PeerEnvelope::DHT);
+        env->set_kind(static_cast<fb::proto::PeerEnvelope::Kind>(
+            args.overlay_kind));
         env->set_recipient_pubkey(peer_pub);
         env->set_payload(args.text);
         blocking_send(conn, serialize(envf));

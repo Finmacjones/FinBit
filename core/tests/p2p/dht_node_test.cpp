@@ -280,6 +280,77 @@ TEST(DhtNode, TamperedPublishIsDroppedByReceiver) {
     EXPECT_TRUE(b.store().get(as_span(a_kp.pub), kNow).empty());
 }
 
+// Prekey publish from A reaches B's PrekeyStore; B's lookup of A's
+// pubkey returns the published bundle (round trip via DHT).
+TEST(DhtNode, PrekeyPublishAndLookupRoundTrip) {
+    auto a_kp = gen_kp();
+    auto b_kp = gen_kp();
+    Bridge bridge;
+    bridge.a_peer.id = fb::p2p::node_id_from_pubkey(as_span(a_kp.pub));
+    bridge.b_peer.id = fb::p2p::node_id_from_pubkey(as_span(b_kp.pub));
+
+    fb::p2p::DhtNode a(bridge.a_peer.id, bridge.a_send());
+    fb::p2p::DhtNode b(bridge.b_peer.id, bridge.b_send());
+    bridge.a = &a; bridge.b = &b;
+    a.observe(bridge.b_peer);
+    b.observe(bridge.a_peer);
+
+    // Build a prekey bundle for A: SPK = a fresh X25519 pub (random
+    // bytes are fine for this round-trip test; we're not running
+    // X3DH against it). Sign the SPK independently with A's
+    // identity key, then build the outer record.
+    std::array<std::uint8_t, 32> spk{};
+    randombytes_buf(spk.data(), spk.size());
+    std::array<std::uint8_t, crypto_sign_BYTES> spk_sig{};
+    unsigned long long sig_len = 0;
+    ASSERT_EQ(crypto_sign_detached(
+        spk_sig.data(), &sig_len, spk.data(), spk.size(), a_kp.sec.data()), 0);
+
+    auto rec = fb::p2p::build_prekey_record(
+        as_span(a_kp.pub), as_span(a_kp.sec),
+        std::span<const std::uint8_t>(spk.data(), spk.size()),
+        std::span<const std::uint8_t>(spk_sig.data(), spk_sig.size()),
+        kT0, kTtl);
+    EXPECT_EQ(a.publish_prekey(rec), 1u);   // → B
+
+    // Local-side store updated immediately; remote (B) gets it via the
+    // bridge synchronously since our SendCallback is direct.
+    auto b_local = b.prekeys().get_latest(as_span(a_kp.pub), kNow);
+    ASSERT_TRUE(b_local.has_value());
+    EXPECT_EQ(b_local->signed_prekey().size(), 32u);
+
+    // B does a lookup for A's prekey. Local store already has it →
+    // local-batch fires; the remote query also goes through and
+    // returns the same record.
+    std::vector<fb::proto::PrekeyRecord> last;
+    b.lookup_prekey(as_span(a_kp.pub),
+        [&](const std::vector<fb::proto::PrekeyRecord>& r) { last = r; });
+    ASSERT_EQ(last.size(), 1u);
+    EXPECT_EQ(last[0].publisher_pubkey(),
+              std::string(a_kp.pub.begin(), a_kp.pub.end()));
+    EXPECT_EQ(b.pending_prekey_lookups(), 0u);
+}
+
+// Empty routing table: lookup_prekey still fires its completion
+// callback (with whatever's in the local store, here empty).
+TEST(DhtNode, PrekeyLookupWithNoPeersFiresEmptyCallback) {
+    auto a_kp = gen_kp();
+    auto target_kp = gen_kp();
+    auto self_id = fb::p2p::node_id_from_pubkey(as_span(a_kp.pub));
+    fb::p2p::DhtNode a(self_id, [](const fb::p2p::PeerInfo&,
+                                     std::span<const std::uint8_t>) {});
+    bool fired = false;
+    std::size_t n = 999;
+    a.lookup_prekey(as_span(target_kp.pub),
+        [&](const std::vector<fb::proto::PrekeyRecord>& r) {
+            fired = true;
+            n = r.size();
+        });
+    EXPECT_TRUE(fired);
+    EXPECT_EQ(n, 0u);
+    EXPECT_EQ(a.pending_prekey_lookups(), 0u);
+}
+
 // abort_lookup frees the in-flight slot.
 TEST(DhtNode, AbortLookupReclaimsSlot) {
     auto a_kp = gen_kp();

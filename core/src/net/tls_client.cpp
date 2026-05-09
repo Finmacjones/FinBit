@@ -81,6 +81,12 @@ void TlsClient::connect(const std::string& host, std::uint16_t port,
 
     if (opts.insecure_skip_verify) {
         SSL_CTX_set_verify(impl_->ctx, SSL_VERIFY_NONE, nullptr);
+    } else if (opts.expected_peer_pubkey_set) {
+        // Pinned-pubkey mode: the chain check would fail (peer cert
+        // is self-signed at the identity key) so we skip it here and
+        // do the cryptographic verification at the application layer
+        // after the handshake completes.
+        SSL_CTX_set_verify(impl_->ctx, SSL_VERIFY_NONE, nullptr);
     } else {
         SSL_CTX_set_verify(impl_->ctx, SSL_VERIFY_PEER, nullptr);
         if (!opts.ca_file.empty()) {
@@ -95,6 +101,34 @@ void TlsClient::connect(const std::string& host, std::uint16_t port,
                 throw_openssl("set_default_verify_paths");
             }
         }
+    }
+
+    // Optional client cert (mutual-TLS for serverless P2P). Loaded
+    // from in-memory PEM strings — no temp-file dance.
+    if (!opts.client_cert_pem.empty() && !opts.client_key_pem.empty()) {
+        BIO* cbio = BIO_new_mem_buf(opts.client_cert_pem.data(),
+                                     static_cast<int>(opts.client_cert_pem.size()));
+        if (!cbio) throw_openssl("BIO_new_mem_buf(client_cert_pem)");
+        X509* ccert = PEM_read_bio_X509(cbio, nullptr, nullptr, nullptr);
+        BIO_free(cbio);
+        if (!ccert) throw_openssl("PEM_read_bio_X509(client_cert_pem)");
+        if (SSL_CTX_use_certificate(impl_->ctx, ccert) != 1) {
+            X509_free(ccert);
+            throw_openssl("SSL_CTX_use_certificate");
+        }
+        X509_free(ccert);
+
+        BIO* kbio = BIO_new_mem_buf(opts.client_key_pem.data(),
+                                     static_cast<int>(opts.client_key_pem.size()));
+        if (!kbio) throw_openssl("BIO_new_mem_buf(client_key_pem)");
+        EVP_PKEY* ckey = PEM_read_bio_PrivateKey(kbio, nullptr, nullptr, nullptr);
+        BIO_free(kbio);
+        if (!ckey) throw_openssl("PEM_read_bio_PrivateKey(client_key_pem)");
+        if (SSL_CTX_use_PrivateKey(impl_->ctx, ckey) != 1) {
+            EVP_PKEY_free(ckey);
+            throw_openssl("SSL_CTX_use_PrivateKey");
+        }
+        EVP_PKEY_free(ckey);
     }
 
     // 2. TCP connect.
@@ -173,6 +207,37 @@ void TlsClient::connect(const std::string& host, std::uint16_t port,
     }
 
     impl_->connected = true;
+
+    // Optional pinned-pubkey check: extract the peer's Ed25519 key
+    // from the cert they presented and require it equals the bytes
+    // the caller specified. Used for direct-P2P dials where we know
+    // exactly which peer we're trying to reach (from a DHT lookup).
+    if (opts.expected_peer_pubkey_set) {
+        X509* peer_cert = SSL_get_peer_certificate(impl_->ssl);
+        if (!peer_cert) {
+            throw std::runtime_error(
+                "TlsClient: expected_peer_pubkey set but peer "
+                "presented no cert");
+        }
+        EVP_PKEY* pkey = X509_get_pubkey(peer_cert);
+        bool ok = false;
+        if (pkey && EVP_PKEY_id(pkey) == EVP_PKEY_ED25519) {
+            std::array<std::uint8_t, 32> got{};
+            std::size_t len = got.size();
+            if (EVP_PKEY_get_raw_public_key(pkey, got.data(), &len) == 1 &&
+                len == 32) {
+                ok = std::equal(got.begin(), got.end(),
+                                opts.expected_peer_pubkey.begin());
+            }
+        }
+        if (pkey) EVP_PKEY_free(pkey);
+        X509_free(peer_cert);
+        if (!ok) {
+            throw std::runtime_error(
+                "TlsClient: peer cert pubkey did not match "
+                "expected_peer_pubkey (identity-pin failure)");
+        }
+    }
 }
 
 void TlsClient::blocking_send_all(std::span<const std::uint8_t> data) {

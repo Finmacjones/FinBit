@@ -4,6 +4,7 @@ include(GoogleTest)
 add_executable(fb_core_tests
     crypto/kat_aead_test.cpp
     crypto/identity_test.cpp
+    crypto/identity_cert_test.cpp
     crypto/hkdf_test.cpp
     crypto/ratchet_test.cpp
     crypto/sender_keys_test.cpp
@@ -25,6 +26,8 @@ add_executable(fb_core_tests
     p2p/dht_node_test.cpp
     p2p/bootstrap_test.cpp
     p2p/peer_net_test.cpp
+    p2p/offline_relay_test.cpp
+    p2p/channel_gossip_test.cpp
 )
 
 target_link_libraries(fb_core_tests

@@ -71,6 +71,7 @@ endforeach()
 add_library(fb_core STATIC
     ${FB_PROTO_SRCS}
     src/crypto/identity.cpp
+    src/crypto/identity_cert.cpp
     src/crypto/aead.cpp
     src/crypto/hkdf.cpp
     src/crypto/ratchet.cpp
@@ -94,6 +95,8 @@ add_library(fb_core STATIC
     src/p2p/dht_node.cpp
     src/p2p/bootstrap.cpp
     src/p2p/peer_net.cpp
+    src/p2p/offline_relay.cpp
+    src/p2p/channel_gossip.cpp
     src/identity/username_log.cpp
     src/identity/username_gossip.cpp
     src/net/tls_client.cpp

@@ -255,6 +255,20 @@ message PeerEnvelope {
         UNKNOWN = 0;
         DHT     = 1;   // payload = serialized fb.proto.DhtMessage
         GOSSIP  = 2;   // payload = serialized fb.proto.IdentityGossipMessage
+        DM      = 3;   // payload = serialized fb.proto.Envelope
+                       // (Double-Ratchet DM, server-blind end-to-end —
+                       //  the SAME wire shape used on the central
+                       //  server's relay path, just delivered direct).
+        OFFLINE_DEPOSIT  = 4;  // alice → bob's-relay: "hold this for bob".
+                                // payload = serialized fb.proto.Envelope
+                                // (encrypted to bob — relay can't read).
+                                // recipient_pubkey = BOB's pubkey (the
+                                // ultimate addressee, NOT the relay).
+        OFFLINE_FETCH    = 5;  // bob → his-relay: "give me everything
+                                // queued for me". payload empty.
+        OFFLINE_DELIVERY = 6;  // bob's-relay → bob: one queued item.
+                                // payload = the originally-deposited
+                                // Envelope bytes verbatim.
     }
     Kind   kind             = 1;
     bytes  recipient_pubkey = 2;
