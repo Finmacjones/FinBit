@@ -71,7 +71,7 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 
 | Subsystem | Blocker |
 |---|---|
-| MLS group crypto (replaces SenderKeys at scale) | mlspp not yet vendored |
+| MLS group crypto (replaces SenderKeys at scale) | foundation is in: vendored mlspp via `scripts/fetch-mlspp.sh`, opt-in build via `cmake -DFB_FEATURE_MLS=ON`, single-member round-trip works. Multi-member welcome/commit, DmPayload MLS variants, and the SenderKeys → MLS migration are the remaining steps. |
 | SFU mode for >6-participant calls | mediasoup or Janus integration; full-mesh works for small rooms today |
 | Android client | NDK not installed in this dev env (Kotlin/Compose scaffold ready) |
 | iOS client | not started |

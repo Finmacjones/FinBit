@@ -53,12 +53,13 @@ identity.bin
 .env.*
 !.env.example
 
-# Vendored external sources — built via scripts/build-paho.sh and
-# scripts/build-libsodium-wasm.sh, not committed.
+# Vendored external sources — built via scripts/build-paho.sh,
+# scripts/build-libsodium-wasm.sh, scripts/fetch-mlspp.sh, not committed.
 third_party/paho.mqtt.c/
 third_party/paho.mqtt.cpp/
 third_party/libsodium/
 third_party/install/
+third_party/mlspp/
 
 # WASM build outputs.
 client-web/build/

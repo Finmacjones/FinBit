@@ -7,6 +7,7 @@ add_executable(fb_core_tests
     crypto/hkdf_test.cpp
     crypto/ratchet_test.cpp
     crypto/sender_keys_test.cpp
+    crypto/mls_facade_test.cpp
     net/frame_codec_test.cpp
     net/websocket_test.cpp
     store/sqlite_store_test.cpp

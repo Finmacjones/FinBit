@@ -214,9 +214,29 @@ never travels in cleartext.
 ⚠️ **Compromise model**: a compromised channel member can leak the
 chain seed and let an attacker decrypt every past and future message
 on that chain. There is no per-message forward-secrecy step or
-membership-removal rekey in v0. The plan calls for replacing this
-with MLS (RFC 9420) via `mlspp`; until then, a compromised member is
-a full channel-key compromise. State explicitly to users.
+membership-removal rekey in the SenderKeys path. The plan calls for
+replacing this with MLS (RFC 9420) via `mlspp`; until then, a
+compromised member is a full channel-key compromise. State
+explicitly to users.
+
+**Foundation for the MLS migration is now in place.** mlspp is
+vendored under `third_party/mlspp/` (fetched via
+`scripts/fetch-mlspp.sh`) and gated behind `cmake
+-DFB_FEATURE_MLS=ON`. `core/src/crypto/mls_facade.cpp` wraps
+`mls::Session` behind a PIMPL — single-member round-trip works end-
+to-end (`MlsFacade.SingleMemberRoundTrip` gtest passes). What's NOT
+yet wired:
+- Multi-member welcome/commit on the join side
+  (`MlsGroup::join_from_welcome` doesn't exist yet)
+- `MlsGroup::serialize` / `from_blob` (mls::Session's TLS-syntax
+  marshalling not exposed on its public API)
+- DmPayload variants (MlsWelcome / MlsCommit / MlsApplication)
+- Channel envelope path opting into MLS over SenderKeys
+- Migration of existing SenderKeys channels
+
+These are the next iterations. Default builds stay on SenderKeys —
+the FB_FEATURE_MLS gate and FB_HAVE_MLS define keep mlspp out of the
+build entirely until opt-in.
 
 ## 6. Voice / video (`client-desktop/src/media_call.cpp`)
 

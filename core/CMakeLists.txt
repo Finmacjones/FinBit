@@ -141,6 +141,22 @@ else()
     message(STATUS "Paho MQTT C++ not found — mesh::make_mqtt_bridge will throw")
 endif()
 
+# --- MLS (RFC 9420) via vendored mlspp -------------------------------------
+# Gated on FB_FEATURE_MLS at the top-level CMakeLists. mls_facade.cpp
+# checks FB_HAVE_MLS at compile time — without it the stub Throws-Not-
+# Implemented body is used and SenderKeys remains the only channel cipher.
+if(FB_FEATURE_MLS AND TARGET mlspp)
+    # mlspp link is PRIVATE (mlspp types are hidden behind the
+    # mls_facade.cpp PIMPL), but the FB_HAVE_MLS define is PUBLIC so
+    # the test target — and any future consumer that wants to know
+    # whether MLS is on — can branch on it.
+    target_link_libraries(fb_core PRIVATE mlspp)
+    target_compile_definitions(fb_core PUBLIC FB_HAVE_MLS=1)
+    message(STATUS "fb_core: MLS (mlspp) ENABLED")
+else()
+    target_compile_definitions(fb_core PUBLIC FB_HAVE_MLS=0)
+endif()
+
 target_compile_features(fb_core PUBLIC cxx_std_20)
 
 add_library(fb::core ALIAS fb_core)
