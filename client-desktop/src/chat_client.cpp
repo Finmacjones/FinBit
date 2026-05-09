@@ -44,7 +44,10 @@
 #include "fb/identity/username_log.hpp"
 #include "fb/p2p/bootstrap.hpp"
 #include "fb/p2p/dht_node.hpp"
+#include "fb/p2p/peer_net.hpp"
 #include "fb/p2p/provider_records.hpp"
+#include "dht.pb.h"
+#include "identity_log.pb.h"
 #include "fb/store/sqlite_store.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
@@ -431,6 +434,30 @@ struct ChatClient::Impl {
     std::unique_ptr<fb::identity::UsernameLog>    username_log;
     std::unique_ptr<fb::identity::UsernameGossip> username_gossip;
     std::unique_ptr<fb::p2p::DhtNode>             dht;
+    // Optional direct-P2P transport. Started when the user opts in
+    // via env (FB_PEER_LISTEN_PORT + FB_PEER_LISTEN_CERT +
+    // FB_PEER_LISTEN_KEY). When configured, wrap_peer_send prefers
+    // PeerNet for peers whose addr is dialable (wss://...). Without
+    // it, all overlay traffic falls back to the central server's
+    // Frame.peer relay path.
+    std::unique_ptr<fb::p2p::PeerNet>             peer_net;
+    std::string                                    own_p2p_addr; // for self-publish
+
+    // Periodic overlay maintenance state.
+    std::uint64_t                                  last_self_publish_ms = 0;
+    std::uint64_t                                  last_gossip_pull_ms  = 0;
+    std::map<std::string, std::uint64_t>           gossip_watermark;  // peer_pub → last sync_with timestamp_ms
+
+    // Inbound queue for messages PeerNet's worker threads push in;
+    // drained by the chat_client worker thread so DhtNode /
+    // UsernameGossip see all callbacks on the same thread (matches
+    // the server-relayed path's threading model).
+    std::mutex                                    overlay_inbox_mu;
+    struct OverlayInboundMsg {
+        std::vector<std::uint8_t> sender_pubkey;   // empty if unknown
+        std::vector<std::uint8_t> bytes;            // serialized Frame.peer
+    };
+    std::deque<OverlayInboundMsg>                 overlay_inbox;
     // peer-username -> (peer pubkey + ratchet state)
     struct Session {
         std::array<std::uint8_t, 32> peer_pub{};
@@ -594,17 +621,41 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     fb::proto::Frame f;
                     auto* env = f.mutable_peer();
                     env->set_kind(kind);
+                    // Stamp our own sender_pubkey on direct-P2P
+                    // sends — the central server stamps it on
+                    // server-relayed sends, but a direct peer has
+                    // no such authority and the receiver needs it
+                    // for routing.
+                    env->set_sender_pubkey(std::string(
+                        reinterpret_cast<const char*>(
+                            impl_->identity->public_key().data()),
+                        impl_->identity->public_key().size()));
                     if (peer.pubkey.size() == 32) {
                         env->set_recipient_pubkey(std::string(
                             peer.pubkey.begin(), peer.pubkey.end()));
                     }
                     env->set_payload(std::string(payload.begin(),
                                                   payload.end()));
-                    try {
-                        blocking_send(impl_->conn, serialize(f));
-                    } catch (const std::exception& e) {
-                        emit log(QString("overlay send failed: %1")
-                                     .arg(e.what()));
+                    auto wire = serialize(f);
+                    // Prefer PeerNet for peers with a dialable
+                    // wss:// addr — that's the direct path. Falls
+                    // back to the central-server relay when the
+                    // peer is unreachable directly OR when no
+                    // PeerNet is configured.
+                    bool sent_direct = false;
+                    if (impl_->peer_net &&
+                        peer.addr.rfind("wss://", 0) == 0) {
+                        sent_direct = impl_->peer_net->send(peer,
+                            std::span<const std::uint8_t>(
+                                wire.data(), wire.size()));
+                    }
+                    if (!sent_direct) {
+                        try {
+                            blocking_send(impl_->conn, wire);
+                        } catch (const std::exception& e) {
+                            emit log(QString("overlay send failed: %1")
+                                         .arg(e.what()));
+                        }
                     }
                 };
             impl_->username_gossip =
@@ -627,6 +678,84 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     wrap_peer_send(fb::proto::PeerEnvelope::DHT,
                                     peer, wire);
                 });
+            // ---- PeerNet (direct peer-to-peer) ----
+            // Optional. Configured via env vars so the desktop UI
+            // doesn't need an "expose my port" toggle yet:
+            //   FB_PEER_LISTEN_PORT   uint16, e.g. 4443
+            //   FB_PEER_LISTEN_CERT   PEM cert path
+            //   FB_PEER_LISTEN_KEY    PEM key  path
+            //   FB_PEER_LISTEN_HOST   bind host (default 0.0.0.0)
+            //   FB_PEER_DIALER_CA     PEM CA   path (empty = system)
+            //   FB_PEER_DIALER_INSECURE  any non-empty value = skip
+            //                            cert verification on dial
+            //   FB_PEER_PUBLIC_ADDR   public reachability for our
+            //                         self-published provider record
+            //                         (e.g. "wss://my.host:4443").
+            //                         If empty, no record is
+            //                         published — peer-discovery
+            //                         still works for OTHERS to
+            //                         find us if they get our addr
+            //                         out-of-band (bootstrap file).
+            auto env = [](const char* k) -> std::string {
+                const char* v = std::getenv(k);
+                return v ? v : std::string();
+            };
+            const std::string peer_port_str = env("FB_PEER_LISTEN_PORT");
+            const std::string peer_cert     = env("FB_PEER_LISTEN_CERT");
+            const std::string peer_key      = env("FB_PEER_LISTEN_KEY");
+            const std::string peer_host     = env("FB_PEER_LISTEN_HOST");
+            const std::string dialer_ca     = env("FB_PEER_DIALER_CA");
+            const bool dialer_insecure      = !env("FB_PEER_DIALER_INSECURE").empty();
+            impl_->own_p2p_addr             = env("FB_PEER_PUBLIC_ADDR");
+            const bool any_peer_env =
+                !peer_port_str.empty() || !peer_cert.empty() ||
+                !peer_key.empty() || !dialer_ca.empty() ||
+                dialer_insecure;
+            if (any_peer_env) {
+                impl_->peer_net = std::make_unique<fb::p2p::PeerNet>();
+                fb::p2p::PeerDialerOptions dopts;
+                dopts.ca_file              = dialer_ca;
+                dopts.insecure_skip_verify = dialer_insecure;
+                impl_->peer_net->set_dialer(dopts);
+                // Inbound: stash on the overlay queue so the worker
+                // thread (this same thread, in its main poll loop)
+                // drains and dispatches into DhtNode /
+                // UsernameGossip sequentially.
+                impl_->peer_net->set_on_message(
+                    [this](const fb::p2p::PeerInfo& from,
+                            std::span<const std::uint8_t> bytes) {
+                        Impl::OverlayInboundMsg m;
+                        m.sender_pubkey = from.pubkey;
+                        m.bytes.assign(bytes.begin(), bytes.end());
+                        std::lock_guard lk(impl_->overlay_inbox_mu);
+                        impl_->overlay_inbox.push_back(std::move(m));
+                    });
+                if (!peer_port_str.empty() && !peer_cert.empty() &&
+                    !peer_key.empty()) {
+                    fb::p2p::PeerListenerOptions lopts;
+                    lopts.bind_host =
+                        peer_host.empty() ? "0.0.0.0" : peer_host;
+                    lopts.bind_port = static_cast<std::uint16_t>(
+                        std::atoi(peer_port_str.c_str()));
+                    lopts.tls_cert_pem = peer_cert;
+                    lopts.tls_key_pem  = peer_key;
+                    try {
+                        impl_->peer_net->start_listener(lopts);
+                        emit log(QString("PeerNet listening on "
+                                          "%1:%2")
+                                     .arg(QString::fromStdString(
+                                         lopts.bind_host))
+                                     .arg(impl_->peer_net->listener_port()));
+                    } catch (const std::exception& e) {
+                        emit log(QString("PeerNet listener failed: %1")
+                                     .arg(e.what()));
+                    }
+                } else {
+                    emit log(QString("PeerNet enabled in dialer-only "
+                                      "mode (no listener)"));
+                }
+            }
+
             // Seed the DHT routing table from the bootstrap file
             // (FB_BOOTSTRAP_FILE / XDG_CONFIG / $HOME/.finbit).
             // Without this, the routing table starts empty and
@@ -932,9 +1061,129 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 emit log(QString("restored channel #%1").arg(QString::fromStdString(row.name)));
             }
 
+            // Periodic overlay maintenance helpers (P3).
+            //   * republish: rotate our own provider record before
+            //     its TTL expires. Default cadence = half the TTL.
+            //   * gossip pull: ask each known routing-table peer
+            //     for "every claim newer than our last sync with
+            //     them" so the username log converges across the
+            //     swarm.
+            constexpr std::uint64_t kRepublishIntervalMs =
+                30 * 60 * 1000;   // 30 min (TTL is 1h by default)
+            constexpr std::uint64_t kGossipPullIntervalMs =
+                5 * 60 * 1000;    // 5 min per peer
+            auto now_ms = []() {
+                return static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now()
+                            .time_since_epoch()).count());
+            };
+            auto republish_self = [&]() {
+                if (!impl_->dht || impl_->own_p2p_addr.empty()) return;
+                try {
+                    auto sig_pub = std::span<const std::uint8_t>(
+                        impl_->identity->public_key().data(),
+                        impl_->identity->public_key().size());
+                    auto sig_priv = std::span<const std::uint8_t>(
+                        impl_->identity->secret_key().data(),
+                        impl_->identity->secret_key().size());
+                    auto rec = fb::p2p::build_record(
+                        sig_pub, sig_priv,
+                        std::vector<std::string>{impl_->own_p2p_addr},
+                        now_ms(),
+                        fb::p2p::kDefaultProviderTtlMs);
+                    auto sent = impl_->dht->publish(rec);
+                    emit log(QString("DHT republish: addr=%1 sent_to=%2")
+                                 .arg(QString::fromStdString(
+                                     impl_->own_p2p_addr))
+                                 .arg(static_cast<qulonglong>(sent)));
+                } catch (const std::exception& e) {
+                    emit log(QString("DHT republish failed: %1")
+                                 .arg(e.what()));
+                }
+            };
+            auto gossip_pull_round = [&]() {
+                if (!impl_->username_gossip || !impl_->dht) return;
+                const auto peers = impl_->dht->routing().all();
+                std::size_t pulled = 0;
+                for (const auto& p : peers) {
+                    if (p.pubkey.size() != 32) continue;
+                    const std::string key(p.pubkey.begin(),
+                                            p.pubkey.end());
+                    auto it = impl_->gossip_watermark.find(key);
+                    const std::uint64_t since =
+                        (it != impl_->gossip_watermark.end()) ? it->second : 0;
+                    impl_->username_gossip->sync_with(p, since);
+                    impl_->gossip_watermark[key] = now_ms();
+                    ++pulled;
+                }
+                if (pulled > 0) {
+                    emit log(QString("gossip pull: %1 peer(s)")
+                                 .arg(static_cast<qulonglong>(pulled)));
+                }
+            };
+
             // Main I/O loop.
             std::vector<std::uint8_t> rxbuf(4096);
             while (impl_->running) {
+                // 0a. Drain inbound overlay messages from PeerNet
+                //     workers (direct-P2P traffic). Same dispatch
+                //     path as server-relayed Frame.peer below.
+                std::deque<Impl::OverlayInboundMsg> overlay_drain;
+                {
+                    std::lock_guard lk(impl_->overlay_inbox_mu);
+                    overlay_drain.swap(impl_->overlay_inbox);
+                }
+                for (auto& m : overlay_drain) {
+                    fb::proto::Frame f;
+                    if (!f.ParseFromArray(m.bytes.data(),
+                                           static_cast<int>(m.bytes.size()))) {
+                        continue;
+                    }
+                    if (f.body_case() != fb::proto::Frame::kPeer) continue;
+                    const auto& pe = f.peer();
+                    fb::p2p::PeerInfo from{};
+                    if (pe.sender_pubkey().size() == 32) {
+                        from.id = fb::p2p::node_id_from_pubkey(
+                            std::span<const std::uint8_t>(
+                                reinterpret_cast<const std::uint8_t*>(
+                                    pe.sender_pubkey().data()),
+                                32));
+                        from.pubkey.assign(pe.sender_pubkey().begin(),
+                                            pe.sender_pubkey().end());
+                        if (impl_->dht) impl_->dht->observe(from);
+                    }
+                    auto payload = std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(
+                            pe.payload().data()),
+                        pe.payload().size());
+                    switch (pe.kind()) {
+                        case fb::proto::PeerEnvelope::DHT:
+                            if (impl_->dht) impl_->dht->on_message(from, payload);
+                            break;
+                        case fb::proto::PeerEnvelope::GOSSIP:
+                            if (impl_->username_gossip)
+                                impl_->username_gossip->on_message(from, payload);
+                            break;
+                        default: break;
+                    }
+                }
+
+                // 0b. Periodic maintenance ticks.
+                {
+                    const auto t = now_ms();
+                    if (t - impl_->last_self_publish_ms
+                            >= kRepublishIntervalMs) {
+                        impl_->last_self_publish_ms = t;
+                        republish_self();
+                    }
+                    if (t - impl_->last_gossip_pull_ms
+                            >= kGossipPullIntervalMs) {
+                        impl_->last_gossip_pull_ms = t;
+                        gossip_pull_round();
+                    }
+                }
+
                 // 0. Drain pending channel ops.
                 std::deque<PendingChannelOp> chan_ops;
                 {

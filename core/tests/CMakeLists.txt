@@ -24,6 +24,7 @@ add_executable(fb_core_tests
     p2p/provider_records_test.cpp
     p2p/dht_node_test.cpp
     p2p/bootstrap_test.cpp
+    p2p/peer_net_test.cpp
 )
 
 target_link_libraries(fb_core_tests

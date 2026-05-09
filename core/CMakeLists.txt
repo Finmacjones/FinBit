@@ -93,6 +93,7 @@ add_library(fb_core STATIC
     src/p2p/provider_records.cpp
     src/p2p/dht_node.cpp
     src/p2p/bootstrap.cpp
+    src/p2p/peer_net.cpp
     src/identity/username_log.cpp
     src/identity/username_gossip.cpp
     src/net/tls_client.cpp
