@@ -239,6 +239,29 @@ message RoomRoster {
 
 // Top-level frame on the wire. Client <-> server TCP and peer<->peer
 // libp2p streams both carry these.
+// Opaque-payload wrapper for peer-to-peer overlay traffic that travels
+// through the central server's relay. The server routes by
+// recipient_pubkey but does NOT parse `payload` — it just forwards.
+// `kind` is a hint for the receiving client's dispatch (DHT vs
+// username-log gossip; future kinds added without breaking the wire).
+//
+// `sender_pubkey` is populated by the server on forward (it knows
+// from the authenticated connection); senders leave it empty.
+//
+// `recipient_pubkey` empty = "broadcast to all online subscribers"
+// (used by gossip flood); 32-byte = "deliver only to this peer".
+message PeerEnvelope {
+    enum Kind {
+        UNKNOWN = 0;
+        DHT     = 1;   // payload = serialized fb.proto.DhtMessage
+        GOSSIP  = 2;   // payload = serialized fb.proto.IdentityGossipMessage
+    }
+    Kind   kind             = 1;
+    bytes  recipient_pubkey = 2;
+    bytes  payload          = 3;
+    bytes  sender_pubkey    = 4;
+}
+
 message Frame {
     oneof body {
         Envelope                envelope        = 1;
@@ -262,5 +285,6 @@ message Frame {
         RoomAnswer              room_answer      = 19;
         RoomIce                 room_ice         = 20;
         RoomRoster              room_roster      = 21;
+        PeerEnvelope            peer             = 22;
     }
 }

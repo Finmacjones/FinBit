@@ -40,6 +40,11 @@
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
 #include "fb/net/tls_client.hpp"
+#include "fb/identity/username_gossip.hpp"
+#include "fb/identity/username_log.hpp"
+#include "fb/p2p/bootstrap.hpp"
+#include "fb/p2p/dht_node.hpp"
+#include "fb/p2p/provider_records.hpp"
 #include "fb/store/sqlite_store.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
@@ -417,6 +422,15 @@ struct ChatClient::Impl {
     bool        tls_insecure_skip_verify = false;
     std::string tls_sni;
     fb::net::FrameDecoder dec;
+    // Serverless overlay state. Each peer holds its own username log
+    // + DHT routing+provider store. Both layers' SendCallbacks wrap
+    // outbound messages in Frame.peer + ship via the central server's
+    // relay (which sees only opaque, signed payloads). When a true-P2P
+    // transport ships, the SendCallbacks get rewired to it without
+    // touching DhtNode / UsernameGossip themselves.
+    std::unique_ptr<fb::identity::UsernameLog>    username_log;
+    std::unique_ptr<fb::identity::UsernameGossip> username_gossip;
+    std::unique_ptr<fb::p2p::DhtNode>             dht;
     // peer-username -> (peer pubkey + ratchet state)
     struct Session {
         std::array<std::uint8_t, 32> peer_pub{};
@@ -560,6 +574,81 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             impl_->x25519 = derive_x25519(*impl_->identity);
 
             emit connected(QString::fromStdString(impl_->identity->fingerprint()));
+
+            // ---- Serverless overlay setup ----
+            // Lifetime: tied to the worker thread; both objects use
+            // the worker's Conn for outbound, and inbound dispatch
+            // happens in the EPOLLIN loop where Frame.peer arrives.
+            //
+            // SendCallbacks build a Frame.peer envelope and write it
+            // straight onto the connection. Recipient routing is by
+            // PeerInfo.pubkey — the central server forwards based on
+            // the recipient_pubkey field. Empty pubkey = broadcast,
+            // which gossip uses for flood pulls.
+            impl_->username_log =
+                std::make_unique<fb::identity::UsernameLog>(*impl_->store);
+            auto wrap_peer_send =
+                [this](fb::proto::PeerEnvelope::Kind kind,
+                        const fb::p2p::PeerInfo& peer,
+                        std::span<const std::uint8_t> payload) {
+                    fb::proto::Frame f;
+                    auto* env = f.mutable_peer();
+                    env->set_kind(kind);
+                    if (peer.pubkey.size() == 32) {
+                        env->set_recipient_pubkey(std::string(
+                            peer.pubkey.begin(), peer.pubkey.end()));
+                    }
+                    env->set_payload(std::string(payload.begin(),
+                                                  payload.end()));
+                    try {
+                        blocking_send(impl_->conn, serialize(f));
+                    } catch (const std::exception& e) {
+                        emit log(QString("overlay send failed: %1")
+                                     .arg(e.what()));
+                    }
+                };
+            impl_->username_gossip =
+                std::make_unique<fb::identity::UsernameGossip>(
+                    *impl_->username_log,
+                    [wrap_peer_send](const fb::p2p::PeerInfo& peer,
+                                      std::span<const std::uint8_t> wire) {
+                        wrap_peer_send(fb::proto::PeerEnvelope::GOSSIP,
+                                        peer, wire);
+                    });
+            // Self-NodeId for the DHT routing table.
+            auto self_nid = fb::p2p::node_id_from_pubkey(
+                std::span<const std::uint8_t>(
+                    impl_->identity->public_key().data(),
+                    impl_->identity->public_key().size()));
+            impl_->dht = std::make_unique<fb::p2p::DhtNode>(
+                self_nid,
+                [wrap_peer_send](const fb::p2p::PeerInfo& peer,
+                                  std::span<const std::uint8_t> wire) {
+                    wrap_peer_send(fb::proto::PeerEnvelope::DHT,
+                                    peer, wire);
+                });
+            // Seed the DHT routing table from the bootstrap file
+            // (FB_BOOTSTRAP_FILE / XDG_CONFIG / $HOME/.finbit).
+            // Without this, the routing table starts empty and
+            // publish() / lookup() can't reach anyone until the
+            // first inbound PeerEnvelope teaches us about a peer.
+            try {
+                auto bs = fb::p2p::load_default_bootstrap();
+                for (const auto& p : bs.peers) {
+                    impl_->dht->routing().observe(p);
+                }
+                if (!bs.peers.empty()) {
+                    emit log(QString("loaded %1 bootstrap peer(s) "
+                                      "(malformed lines: %2)")
+                                 .arg(static_cast<qulonglong>(bs.peers.size()))
+                                 .arg(static_cast<qulonglong>(
+                                     bs.malformed_lines)));
+                }
+            } catch (...) {
+                // load_default_bootstrap doesn't throw, but defend
+                // against a future change. Empty bootstrap is fine —
+                // peers still get learned from inbound traffic.
+            }
 
             // Transport selection. impl_->use_tls is set by
             // connect_tls; the legacy connect() forwards with
@@ -1410,6 +1499,48 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                             "and pick a different name (or restore the "
                                             "original identity from its recovery code)."));
                                 impl_->stop_requested = true;
+                            }
+                            continue;
+                        }
+                        if (f.body_case() == fb::proto::Frame::kPeer) {
+                            // Inbound overlay envelope from another
+                            // peer (server forwarded by recipient
+                            // pubkey). Dispatch by kind to the right
+                            // overlay object.
+                            const auto& pe = f.peer();
+                            fb::p2p::PeerInfo from{};
+                            if (pe.sender_pubkey().size() == 32) {
+                                from.id = fb::p2p::node_id_from_pubkey(
+                                    std::span<const std::uint8_t>(
+                                        reinterpret_cast<const std::uint8_t*>(
+                                            pe.sender_pubkey().data()),
+                                        32));
+                                from.pubkey.assign(
+                                    pe.sender_pubkey().begin(),
+                                    pe.sender_pubkey().end());
+                                // Touch the routing table — every
+                                // sender we hear from is a viable
+                                // peer for our DHT lookups.
+                                if (impl_->dht) impl_->dht->observe(from);
+                            }
+                            auto payload = std::span<const std::uint8_t>(
+                                reinterpret_cast<const std::uint8_t*>(
+                                    pe.payload().data()),
+                                pe.payload().size());
+                            switch (pe.kind()) {
+                                case fb::proto::PeerEnvelope::DHT:
+                                    if (impl_->dht) {
+                                        impl_->dht->on_message(from, payload);
+                                    }
+                                    break;
+                                case fb::proto::PeerEnvelope::GOSSIP:
+                                    if (impl_->username_gossip) {
+                                        impl_->username_gossip->on_message(
+                                            from, payload);
+                                    }
+                                    break;
+                                default:
+                                    break;
                             }
                             continue;
                         }

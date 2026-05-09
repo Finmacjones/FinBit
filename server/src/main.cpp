@@ -684,6 +684,46 @@ int main(int argc, char** argv) {
                 }
                 break;
             }
+            case fb::proto::Frame::kPeer: {
+                // Forward a PeerEnvelope (DHT or username-log gossip)
+                // to the recipient by pubkey. The server doesn't
+                // parse `payload` — that's opaque, signed at the
+                // application layer (DhtNode / UsernameGossip).
+                if (!c.authenticated) break;
+                auto pe = f.peer();
+                pe.set_sender_pubkey(std::string(
+                    reinterpret_cast<const char*>(c.bound_user_pub.data()),
+                    c.bound_user_pub.size()));
+                fb::proto::Frame out;
+                *out.mutable_peer() = pe;
+                auto wire = serialize(out);
+
+                if (pe.recipient_pubkey().empty()) {
+                    // Broadcast to every authenticated peer except
+                    // the sender. Used by gossip flood.
+                    for (auto& [other_fd, other_c] : conns) {
+                        if (other_fd == c.sock.fd()) continue;
+                        if (!other_c->authenticated) continue;
+                        enqueue_write(loop, *other_c, wire);
+                    }
+                } else if (pe.recipient_pubkey().size() == 32) {
+                    for (auto& [other_fd, other_c] : conns) {
+                        if (other_fd == c.sock.fd()) continue;
+                        if (!other_c->authenticated) continue;
+                        if (other_c->bound_user_pub.size() == 32 &&
+                            std::memcmp(other_c->bound_user_pub.data(),
+                                          pe.recipient_pubkey().data(),
+                                          32) == 0) {
+                            enqueue_write(loop, *other_c, wire);
+                            break;
+                        }
+                    }
+                    // Recipient offline → silently drop. Senders
+                    // re-publish on a periodic cadence (DHT TTL,
+                    // gossip anti-entropy) so this is recoverable.
+                }
+                break;
+            }
             case fb::proto::Frame::kUsernameLookup: {
                 const auto& q = f.username_lookup();
                 fb::proto::Frame resp;

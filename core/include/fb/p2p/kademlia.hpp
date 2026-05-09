@@ -31,7 +31,15 @@ using NodeId = std::array<std::uint8_t, kNodeIdBytes>;
 
 struct PeerInfo {
     NodeId      id{};
-    std::string addr;  // "ip:port"
+    std::string addr;            // "scheme://host:port"
+    // Full Ed25519 pubkey (32 bytes) for this peer when known.
+    // Used by overlay transports (DhtSendCallback / GossipSendCallback)
+    // to address PeerEnvelopes by recipient_pubkey when the underlying
+    // transport routes by pubkey rather than by NodeId. Empty when the
+    // pubkey isn't known (e.g. peer learned only via routing-table
+    // refresh from a third party). Not used by RoutingTable's bucket
+    // ordering — that's still NodeId-based.
+    std::vector<std::uint8_t> pubkey;
 };
 
 // SHA-256(identity_pubkey)[0..20].

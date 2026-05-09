@@ -102,6 +102,10 @@ private:
     // leave the insecure box unchecked.
     QCheckBox*   tls_check_           = nullptr;
     QCheckBox*   tls_insecure_check_  = nullptr;
+    QPushButton* tls_ca_btn_          = nullptr;
+    // Path of the user-picked CA file (PEM). Empty = system trust
+    // store. Set by clicking tls_ca_btn_ → QFileDialog.
+    QString      tls_ca_path_;
 
     // Server rail (Discord's left-most column).
     QListWidget* server_rail_   = nullptr;

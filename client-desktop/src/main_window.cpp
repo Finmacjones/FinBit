@@ -78,6 +78,33 @@ MainWindow::MainWindow(QWidget* parent)
         "Skip TLS certificate validation. Only safe for local "
         "dev against a self-signed server cert. Never enable\n"
         "against a real public server.");
+    tls_ca_btn_ = new QPushButton("CA…", login_box);
+    tls_ca_btn_->setObjectName("secondaryBtn");
+    tls_ca_btn_->setToolTip(
+        "Pin a custom Certificate Authority (PEM file) for the TLS\n"
+        "handshake. Used when the server's cert is signed by a CA\n"
+        "that's not in the system trust store. Click to pick a file;\n"
+        "click again to clear. Mutually exclusive with the\n"
+        "(insecure) checkbox.");
+    QObject::connect(tls_ca_btn_, &QPushButton::clicked, this, [this]() {
+        if (!tls_ca_path_.isEmpty()) {
+            // Second click — clear the pin.
+            tls_ca_path_.clear();
+            tls_ca_btn_->setText("CA…");
+            tls_ca_btn_->setToolTip(
+                "Pin a custom Certificate Authority (PEM file) for "
+                "the TLS handshake.");
+            return;
+        }
+        const QString chosen = QFileDialog::getOpenFileName(
+            this, "Pin a TLS Certificate Authority", QString(),
+            "PEM files (*.pem *.crt *.cer);;All files (*)");
+        if (chosen.isEmpty()) return;
+        tls_ca_path_ = chosen;
+        tls_ca_btn_->setText("CA✓");
+        tls_ca_btn_->setToolTip("Pinned CA: " + chosen +
+                                  "\nClick to clear.");
+    });
     connect_btn_ = new QPushButton("Connect", login_box);
     log_toggle_ = new QPushButton("Show log", login_box);
     log_toggle_->setObjectName("secondaryBtn");
@@ -93,6 +120,7 @@ MainWindow::MainWindow(QWidget* parent)
     login_l->addSpacing(8);
     login_l->addWidget(tls_check_);
     login_l->addWidget(tls_insecure_check_);
+    login_l->addWidget(tls_ca_btn_);
     login_l->addWidget(connect_btn_);
     login_l->addStretch(1);
     login_l->addWidget(status_label_);
@@ -425,15 +453,12 @@ void MainWindow::onConnectClicked() {
     const bool use_tls = tls_check_->isChecked();
     const bool insecure = tls_insecure_check_->isChecked();
     if (use_tls) {
-        // No CA-file picker yet — defer to system trust store. For
-        // self-signed dev servers users tick the "(insecure)" box;
-        // a follow-up will add a file picker.
         client_->connect_tls(
             host_edit_->text(),
             static_cast<std::uint16_t>(port_spin_->value()),
             my_username_, my_seed_,
             /*use_tls=*/true,
-            /*ca_file=*/QString(),
+            /*ca_file=*/tls_ca_path_,
             /*insecure_skip_verify=*/insecure,
             /*sni_hostname=*/host_edit_->text());
     } else {

@@ -117,6 +117,15 @@ struct Args {
     std::string tls_ca;             // CA file for cert verification
     bool tls_insecure_skip_verify = false;   // dev/CI escape hatch
     std::string tls_sni;            // override SNI hostname
+
+    // Overlay relay test (N1): exercises the server-relayed
+    // PeerEnvelope path without standing up the full DhtNode /
+    // UsernameGossip plumbing. --overlay-send sends a single
+    // Frame.peer carrying `--text` as the payload addressed to
+    // `--peer`'s pubkey (resolved via UsernameLookup); --overlay-recv
+    // listens for inbound Frame.peer and prints a marker line.
+    bool overlay_send  = false;
+    bool overlay_recv  = false;
 };
 
 void usage() {
@@ -199,6 +208,8 @@ bool parse(int argc, char** argv, Args& a) {
             a.tls_insecure_skip_verify = true;
         }
         else if (s == "--tls-sni") { if (!next(a.tls_sni)) return false; }
+        else if (s == "--overlay-send") { a.overlay_send = true; }
+        else if (s == "--overlay-recv") { a.overlay_recv = true; }
         else if (s == "--help" || s == "-h") { usage(); std::exit(0); }
         else { std::cerr << "unknown arg: " << s << "\n"; usage(); return false; }
     }
@@ -207,9 +218,11 @@ bool parse(int argc, char** argv, Args& a) {
                       (a.channel_create ? 1 : 0) + (a.channel_listen ? 1 : 0) +
                       (a.channel_invite ? 1 : 0) +
                       (a.p2p_create ? 1 : 0) + (a.p2p_listen ? 1 : 0) +
-                      (a.p2p_relay ? 1 : 0);
+                      (a.p2p_relay ? 1 : 0) +
+                      (a.overlay_send ? 1 : 0) + (a.overlay_recv ? 1 : 0);
     if (modes != 1) return false;
     if (a.send && (a.peer.empty() || a.text.empty())) return false;
+    if (a.overlay_send && (a.peer.empty() || a.text.empty())) return false;
     if (a.channel_create &&
         (a.channel_name.empty() || a.dist_file.empty() || a.text.empty())) return false;
     if (a.channel_listen &&
@@ -878,6 +891,66 @@ int main(int argc, char** argv) {
             std::cout << "CHAN-MSG: " << std::string(pt->begin(), pt->end()) << std::endl;
         }
         return 0;
+    }
+
+    if (args.overlay_send) {
+        // Resolve peer username → pubkey via the existing key
+        // bundle directory.
+        {
+            fb::proto::Frame f;
+            f.mutable_key_fetch()->set_username(args.peer);
+            blocking_send(conn, serialize(f));
+        }
+        auto resp = blocking_recv_frame(conn, dec, 2000);
+        if (!resp) { std::cerr << "no key bundle response\n"; return 5; }
+        fb::proto::Frame f;
+        if (!f.ParseFromArray(resp->data(),
+                               static_cast<int>(resp->size())) ||
+            f.body_case() != fb::proto::Frame::kKeyFetchResp ||
+            !f.key_fetch_resp().found()) {
+            std::cerr << "peer not registered yet\n"; return 6;
+        }
+        const auto& peer_pub = f.key_fetch_resp().bundle().identity_pubkey();
+        if (peer_pub.size() != 32) {
+            std::cerr << "malformed peer bundle\n"; return 7;
+        }
+        // Build + send the PeerEnvelope. The text is the opaque
+        // payload — server doesn't parse it, just forwards.
+        fb::proto::Frame envf;
+        auto* env = envf.mutable_peer();
+        env->set_kind(fb::proto::PeerEnvelope::DHT);
+        env->set_recipient_pubkey(peer_pub);
+        env->set_payload(args.text);
+        blocking_send(conn, serialize(envf));
+        std::cout << "OVERLAY-SENT to " << args.peer
+                  << " bytes=" << args.text.size() << std::endl;
+        return 0;
+    }
+
+    if (args.overlay_recv) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(args.wait_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto remaining = std::chrono::duration_cast<
+                std::chrono::milliseconds>(deadline -
+                    std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) break;
+            auto frame = blocking_recv_frame(conn, dec,
+                                              static_cast<int>(remaining));
+            if (!frame) continue;
+            fb::proto::Frame f;
+            if (!f.ParseFromArray(frame->data(),
+                                   static_cast<int>(frame->size()))) continue;
+            if (f.body_case() != fb::proto::Frame::kPeer) continue;
+            std::cout << "OVERLAY-RECV kind="
+                      << static_cast<int>(f.peer().kind())
+                      << " from_pub_len="
+                      << f.peer().sender_pubkey().size()
+                      << " payload=" << f.peer().payload() << std::endl;
+            return 0;
+        }
+        std::cerr << "no overlay envelope received within wait_ms\n";
+        return 8;
     }
 
     if (args.send) {
