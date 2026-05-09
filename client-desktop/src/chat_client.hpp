@@ -37,6 +37,22 @@ public:
     void connect(const QString& host, std::uint16_t port, const QString& user,
                  const std::array<std::uint8_t, 32>& seed);
 
+    // TLS-enabled connect. When `use_tls` is true, the worker wraps
+    // the outbound socket in fb::net::TlsClient — the same wire
+    // protocol travels over an encrypted channel, suitable for
+    // running on a likely-open port like 443. `ca_file` is a PEM CA
+    // bundle (empty = system trust store); `insecure_skip_verify`
+    // disables cert validation entirely (dev / self-signed only —
+    // never use against a real server). `sni_hostname` overrides
+    // the SNI sent during the TLS handshake; defaults to `host`.
+    void connect_tls(const QString& host, std::uint16_t port,
+                      const QString& user,
+                      const std::array<std::uint8_t, 32>& seed,
+                      bool use_tls,
+                      const QString& ca_file,
+                      bool insecure_skip_verify,
+                      const QString& sni_hostname);
+
     // Send a DM to `peer` (must be a registered username). Safe to call from
     // the UI thread; queues onto the worker.
     void send_to_peer(const QString& peer, const QString& text);

@@ -61,4 +61,19 @@ message ClaimsSinceResponse {
     repeated UserClaim claims      = 1;
     bool               truncated   = 2;   // more claims exist past the page
     uint64             max_seen_ms = 3;   // highest timestamp in this batch
+    bytes              request_id  = 4;   // 16 bytes, echoed from request
+}
+
+// Top-level envelope for inter-peer username log gossip. The owning
+// transport (raw TCP, TLS, libp2p stream, …) carries the serialized
+// IdentityGossipMessage bytes; UsernameGossip dispatches on the oneof.
+message IdentityGossipMessage {
+    oneof body {
+        ClaimsSinceRequest  request  = 1;
+        ClaimsSinceResponse response = 2;
+    }
+    // Echoed on responses (and present on requests) so callers can
+    // correlate replies to outstanding requests when multiple are
+    // in flight per peer.
+    bytes request_id = 3;
 }

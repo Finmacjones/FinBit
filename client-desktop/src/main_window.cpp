@@ -6,6 +6,7 @@
 #include <sodium.h>
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QClipboard>
 #include <QDateTime>
 #include <QFileDialog>
@@ -65,6 +66,18 @@ MainWindow::MainWindow(QWidget* parent)
     port_spin_->setMaximumWidth(80);
     user_edit_ = new QLineEdit("alice", login_box);
     user_edit_->setMaximumWidth(120);
+    tls_check_ = new QCheckBox("TLS", login_box);
+    tls_check_->setToolTip(
+        "Wrap the connection in TLS (server must be on a "
+        "--tls-raw-port). Recommended for any server reachable\n"
+        "outside localhost — without it, the wire bytes are "
+        "visible to any router on the path even though the\n"
+        "message contents stay end-to-end encrypted.");
+    tls_insecure_check_ = new QCheckBox("(insecure)", login_box);
+    tls_insecure_check_->setToolTip(
+        "Skip TLS certificate validation. Only safe for local "
+        "dev against a self-signed server cert. Never enable\n"
+        "against a real public server.");
     connect_btn_ = new QPushButton("Connect", login_box);
     log_toggle_ = new QPushButton("Show log", login_box);
     log_toggle_->setObjectName("secondaryBtn");
@@ -77,6 +90,9 @@ MainWindow::MainWindow(QWidget* parent)
     login_l->addSpacing(16);
     login_l->addWidget(new QLabel("User", login_box));
     login_l->addWidget(user_edit_);
+    login_l->addSpacing(8);
+    login_l->addWidget(tls_check_);
+    login_l->addWidget(tls_insecure_check_);
     login_l->addWidget(connect_btn_);
     login_l->addStretch(1);
     login_l->addWidget(status_label_);
@@ -406,8 +422,25 @@ void MainWindow::onConnectClicked() {
     status_label_->setStyleSheet("color: #faa61a;");
     user_name_lbl_->setText(my_username_);
     user_avatar_->setPixmap(make_avatar(my_username_, 32));
-    client_->connect(host_edit_->text(), static_cast<std::uint16_t>(port_spin_->value()),
-                     my_username_, my_seed_);
+    const bool use_tls = tls_check_->isChecked();
+    const bool insecure = tls_insecure_check_->isChecked();
+    if (use_tls) {
+        // No CA-file picker yet — defer to system trust store. For
+        // self-signed dev servers users tick the "(insecure)" box;
+        // a follow-up will add a file picker.
+        client_->connect_tls(
+            host_edit_->text(),
+            static_cast<std::uint16_t>(port_spin_->value()),
+            my_username_, my_seed_,
+            /*use_tls=*/true,
+            /*ca_file=*/QString(),
+            /*insecure_skip_verify=*/insecure,
+            /*sni_hostname=*/host_edit_->text());
+    } else {
+        client_->connect(host_edit_->text(),
+                          static_cast<std::uint16_t>(port_spin_->value()),
+                          my_username_, my_seed_);
+    }
 }
 
 void MainWindow::adopt_session(const QString& username,

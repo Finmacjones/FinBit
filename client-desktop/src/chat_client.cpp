@@ -39,6 +39,7 @@
 #include "media_call.hpp"
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
+#include "fb/net/tls_client.hpp"
 #include "fb/store/sqlite_store.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
@@ -91,28 +92,66 @@ std::vector<std::uint8_t> serialize(const google::protobuf::MessageLite& m) {
     return out;
 }
 
-void blocking_send(fb::net::Socket& s, const std::vector<std::uint8_t>& payload) {
+// Conn — transport-agnostic handle. Holds either a raw Socket OR a
+// TlsClient; the rest of chat_client speaks only to Conn so the
+// length-prefixed Frame protobufs flow over either transport without
+// every call site branching. Same shape as fb-cli's Conn.
+struct Conn {
+    fb::net::Socket*    sock = nullptr;
+    fb::net::TlsClient* tls  = nullptr;
+
+    [[nodiscard]] int fd() const {
+        return tls ? tls->fd() : sock->fd();
+    }
+
+    void send_all(std::span<const std::uint8_t> data) {
+        if (tls) {
+            tls->blocking_send_all(data);
+            return;
+        }
+        std::size_t off = 0;
+        while (off < data.size()) {
+            const auto n = ::send(sock->fd(), data.data() + off,
+                                   data.size() - off, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error(std::string("send: ") +
+                                          std::strerror(errno));
+            }
+            off += static_cast<std::size_t>(n);
+        }
+    }
+
+    // Returns 0 on EOF / clean shutdown / timeout. Mirrors the
+    // existing read_some convention used in chat_client.
+    std::size_t read_some(std::span<std::uint8_t> out, int timeout_ms) {
+        if (tls) return tls->blocking_read(out, timeout_ms);
+        timeval tv{};
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        fd_set rs;
+        FD_ZERO(&rs);
+        FD_SET(sock->fd(), &rs);
+        const int sel = ::select(sock->fd() + 1, &rs, nullptr, nullptr, &tv);
+        if (sel <= 0) return 0;
+        const auto n = sock->read_some(out);
+        if (n <= 0) return 0;
+        return static_cast<std::size_t>(n);
+    }
+};
+
+void blocking_send(Conn& c, const std::vector<std::uint8_t>& payload) {
     auto framed = fb::net::encode_frame(
         std::span<const std::uint8_t>(payload.data(), payload.size()));
-    std::size_t off = 0;
-    while (off < framed.size()) {
-        const auto n = ::send(s.fd(), framed.data() + off, framed.size() - off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(std::string("send: ") + std::strerror(errno));
-        }
-        off += static_cast<std::size_t>(n);
-    }
+    c.send_all(std::span<const std::uint8_t>(framed.data(), framed.size()));
 }
 
-bool wait_readable(int fd, int timeout_ms) {
-    timeval tv{};
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    fd_set rs;
-    FD_ZERO(&rs);
-    FD_SET(fd, &rs);
-    return ::select(fd + 1, &rs, nullptr, nullptr, &tv) > 0;
+// Compatibility helper: read up to `out.size()` bytes from `c`,
+// blocking up to `timeout_ms`. Returns 0 on EOF/timeout. Replaces
+// the old wait_readable + sock->read_some pair at every call site.
+std::size_t conn_read_with_timeout(Conn& c, std::span<std::uint8_t> out,
+                                     int timeout_ms) {
+    return c.read_some(out, timeout_ms);
 }
 
 // Compose the envelope-level AAD that's bound by the inner ratchet /
@@ -368,6 +407,15 @@ struct ChatClient::Impl {
     std::unique_ptr<fb::store::SqliteStore> store;
     std::string store_path;
     std::optional<fb::net::Socket> sock;
+    std::optional<fb::net::TlsClient> tls;
+    Conn conn;            // points at sock or tls; lifetime tied to whichever
+    // TLS configuration captured by connect_tls. Empty / false for the
+    // legacy connect() path so existing callers see no behaviour
+    // change.
+    bool        use_tls = false;
+    std::string tls_ca_file;
+    bool        tls_insecure_skip_verify = false;
+    std::string tls_sni;
     fb::net::FrameDecoder dec;
     // peer-username -> (peer pubkey + ratchet state)
     struct Session {
@@ -436,11 +484,27 @@ ChatClient::~ChatClient() { disconnect(); }
 
 void ChatClient::connect(const QString& host, std::uint16_t port, const QString& user,
                          const std::array<std::uint8_t, 32>& seed) {
+    connect_tls(host, port, user, seed,
+                /*use_tls=*/false, /*ca_file=*/QString(),
+                /*insecure_skip_verify=*/false, /*sni_hostname=*/QString());
+}
+
+void ChatClient::connect_tls(const QString& host, std::uint16_t port,
+                              const QString& user,
+                              const std::array<std::uint8_t, 32>& seed,
+                              bool use_tls,
+                              const QString& ca_file,
+                              bool insecure_skip_verify,
+                              const QString& sni_hostname) {
     if (impl_->running.exchange(true)) return;
     impl_->host = host;
     impl_->port = port;
     impl_->username = user;
     impl_->seed = seed;
+    impl_->use_tls = use_tls;
+    impl_->tls_ca_file = ca_file.toStdString();
+    impl_->tls_insecure_skip_verify = insecure_skip_verify;
+    impl_->tls_sni = sni_hostname.toStdString();
     impl_->worker = std::thread([this]() {
         try {
             if (sodium_init() < 0) {
@@ -497,8 +561,31 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
 
             emit connected(QString::fromStdString(impl_->identity->fingerprint()));
 
-            impl_->sock.emplace(
-                fb::net::tcp_connect(impl_->host.toStdString(), impl_->port));
+            // Transport selection. impl_->use_tls is set by
+            // connect_tls; the legacy connect() forwards with
+            // use_tls=false so existing call sites keep their plain
+            // TCP behaviour.
+            if (impl_->use_tls) {
+                impl_->tls.emplace();
+                fb::net::TlsClientOptions tlsopts;
+                tlsopts.ca_file              = impl_->tls_ca_file;
+                tlsopts.insecure_skip_verify = impl_->tls_insecure_skip_verify;
+                tlsopts.sni_hostname         = impl_->tls_sni;
+                if (impl_->tls_insecure_skip_verify) {
+                    emit log(QString(
+                        "WARNING: TLS cert validation disabled "
+                        "(--tls-insecure-skip-verify). Use only "
+                        "against a known self-signed dev server."));
+                }
+                impl_->tls->connect(impl_->host.toStdString(),
+                                     impl_->port, tlsopts);
+                impl_->conn.tls = &impl_->tls.value();
+            } else {
+                impl_->sock.emplace(
+                    fb::net::tcp_connect(impl_->host.toStdString(),
+                                          impl_->port));
+                impl_->conn.sock = &impl_->sock.value();
+            }
 
             // ClientHello
             {
@@ -509,7 +596,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                     impl_->identity->public_key().size()));
                 hello->set_username(impl_->username.toStdString());
                 hello->set_protocol_version(fb::config::kProtocolVersion);
-                blocking_send(*impl_->sock, serialize(f));
+                blocking_send(impl_->conn, serialize(f));
             }
 
             // Wait for ServerHello + sign the challenge it carries.
@@ -520,16 +607,12 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                 const auto hello_deadline =
                     std::chrono::steady_clock::now() + std::chrono::seconds(3);
                 while (std::chrono::steady_clock::now() < hello_deadline) {
-                    if (!wait_readable(impl_->sock->fd(), 100)) continue;
-                    auto n = impl_->sock->read_some(
-                        std::span<std::uint8_t>(hbuf.data(), hbuf.size()));
-                    if (n == fb::net::Socket::kReadRetry) continue;
-                    if (n <= 0) {
-                        emit errorOccurred("server closed before ServerHello");
-                        return;
-                    }
+                    auto n = conn_read_with_timeout(impl_->conn,
+                        std::span<std::uint8_t>(hbuf.data(), hbuf.size()),
+                        100);
+                    if (n == 0) continue;
                     impl_->dec.feed(std::span<const std::uint8_t>(
-                        hbuf.data(), static_cast<std::size_t>(n)));
+                        hbuf.data(), n));
                     if (impl_->dec.try_pop(hello_frame) ==
                         fb::net::FrameDecoder::Status::kFrameReady) {
                         break;
@@ -555,7 +638,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                 fb::proto::Frame ackf;
                 ackf.mutable_hello_ack()->set_signature(
                     std::string(reinterpret_cast<const char*>(sig.data()), sig.size()));
-                blocking_send(*impl_->sock, serialize(ackf));
+                blocking_send(impl_->conn, serialize(ackf));
             }
 
             // Upload prekey bundle
@@ -573,7 +656,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch())
                         .count()));
-                blocking_send(*impl_->sock, serialize(f));
+                blocking_send(impl_->conn, serialize(f));
             }
 
             emit log(QString("connected to %1:%2 as %3")
@@ -750,7 +833,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                 fb::proto::Frame subf;
                 subf.mutable_chan_subscribe()->set_channel_group_id(
                     std::string(row.channel_id.begin(), row.channel_id.end()));
-                blocking_send(*impl_->sock, serialize(subf));
+                blocking_send(impl_->conn, serialize(subf));
                 cs.subscribed = true;
 
                 impl_->chan_id_to_name[std::string(
@@ -783,7 +866,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                         f.mutable_chan_subscribe()->set_channel_group_id(
                             std::string(reinterpret_cast<const char*>(cs.id.data()),
                                         cs.id.size()));
-                        blocking_send(*impl_->sock, serialize(f));
+                        blocking_send(impl_->conn, serialize(f));
                         cs.subscribed = true;
                         emit channelJoined(QString::fromStdString(op.channel_name));
                         emit log(QString("subscribed to channel #%1")
@@ -944,7 +1027,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             env->set_ciphertext(std::string(inner.begin(), inner.end()));
                             env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                             env->set_protocol_version(fb::config::kProtocolVersion);
-                            blocking_send(*impl_->sock, serialize(f));
+                            blocking_send(impl_->conn, serialize(f));
                             // Persist channel state so the advanced send-chain
                             // survives a restart (own_next_index, own_chain_key).
                             persist_chan_session(op.channel_name, cs);
@@ -976,7 +1059,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             uf.mutable_chan_unsubscribe()->set_channel_group_id(
                                 std::string(reinterpret_cast<const char*>(cs.id.data()),
                                             cs.id.size()));
-                            blocking_send(*impl_->sock, serialize(uf));
+                            blocking_send(impl_->conn, serialize(uf));
                         }
                         if (impl_->store) {
                             impl_->store->chan_delete(
@@ -1004,7 +1087,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
                         rj->set_want_audio(true);
                         rj->set_want_video(op.want_video);
-                        blocking_send(*impl_->sock, serialize(jf));
+                        blocking_send(impl_->conn, serialize(jf));
                         emit log(QString("joined call on #%1 (video=%2)")
                                      .arg(QString::fromStdString(op.channel_name))
                                      .arg(op.want_video ? "yes" : "no"));
@@ -1015,7 +1098,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                         fb::proto::Frame lf;
                         lf.mutable_room_leave()->set_room_id(std::string(
                             reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
-                        blocking_send(*impl_->sock, serialize(lf));
+                        blocking_send(impl_->conn, serialize(lf));
                         emit log(QString("left call on #%1")
                                      .arg(QString::fromStdString(op.channel_name)));
                     } else if (op.kind == PendingChannelOp::Kind::kInvite) {
@@ -1081,7 +1164,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             // would; then re-queue the invite for retry.
                             fb::proto::Frame f;
                             f.mutable_key_fetch()->set_username(op.peer);
-                            blocking_send(*impl_->sock, serialize(f));
+                            blocking_send(impl_->conn, serialize(f));
                             emit log(QString("fetching prekey for %1 to deliver invite")
                                          .arg(QString::fromStdString(op.peer)));
                             std::lock_guard lk(impl_->mu);
@@ -1122,7 +1205,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                         env->set_ciphertext(std::string(inner.begin(), inner.end()));
                         env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                         env->set_protocol_version(fb::config::kProtocolVersion);
-                        blocking_send(*impl_->sock, serialize(f));
+                        blocking_send(impl_->conn, serialize(f));
                         // Persist channel meta (own_dist may be brand-new).
                         persist_chan_meta(op.channel_name, cs);
                         persist_chan_session(op.channel_name, cs);
@@ -1187,7 +1270,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                         env->set_ciphertext(std::string(inner.begin(), inner.end()));
                         env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                         env->set_protocol_version(fb::config::kProtocolVersion);
-                        blocking_send(*impl_->sock, serialize(f));
+                        blocking_send(impl_->conn, serialize(f));
                     }
                 }
 
@@ -1227,7 +1310,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                         // Need to fetch peer bundle first.
                         fb::proto::Frame f;
                         f.mutable_key_fetch()->set_username(s.peer);
-                        blocking_send(*impl_->sock, serialize(f));
+                        blocking_send(impl_->conn, serialize(f));
                         emit log(QString("fetching prekey for %1")
                                      .arg(QString::fromStdString(s.peer)));
                         // Re-enqueue; we'll handle the response in the read
@@ -1272,7 +1355,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                     env->set_ciphertext(std::string(inner.begin(), inner.end()));
                     env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                     env->set_protocol_version(fb::config::kProtocolVersion);
-                    blocking_send(*impl_->sock, serialize(f));
+                    blocking_send(impl_->conn, serialize(f));
                     if (impl_->store && !s.text.empty()) {
                         // Persist the original text bytes (not the wrapped
                         // DmPayload blob) so on-disk history is human-
@@ -1300,15 +1383,16 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                  .arg(s.text.empty() ? " (mls protocol msg)" : ""));
                 }
 
-                // 2. Read with short timeout.
-                if (wait_readable(impl_->sock->fd(), 100)) {
-                    auto n = impl_->sock->read_some(
-                        std::span<std::uint8_t>(rxbuf.data(), rxbuf.size()));
-                    if (n == fb::net::Socket::kReadRetry) continue;
-                    if (n < 0) { emit errorOccurred("read failed"); break; }
-                    if (n == 0) { emit log("server closed connection"); break; }
+                // 2. Read with short timeout. Conn::read_some
+                // unifies plain TCP and TLS — 0 means timeout or
+                // peer-closed; >0 means bytes available.
+                {
+                    auto n = conn_read_with_timeout(impl_->conn,
+                        std::span<std::uint8_t>(rxbuf.data(), rxbuf.size()),
+                        100);
+                if (n > 0) {
                     impl_->dec.feed(std::span<const std::uint8_t>(
-                        rxbuf.data(), static_cast<std::size_t>(n)));
+                        rxbuf.data(), n));
                     std::vector<std::uint8_t> frame;
                     while (impl_->dec.try_pop(frame) ==
                            fb::net::FrameDecoder::Status::kFrameReady) {
@@ -1441,7 +1525,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                     fb::proto::Frame qf;
                                     qf.mutable_username_lookup()->set_pubkey(
                                         std::string(peer_key.begin(), peer_key.end()));
-                                    blocking_send(*impl_->sock, serialize(qf));
+                                    blocking_send(impl_->conn, serialize(qf));
                                     emit log(QString("mesh-bootstrap: %1 has no "
                                                       "session yet, resolving "
                                                       "username for key fetch")
@@ -1497,7 +1581,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                 if (impl_->pending_mesh_dials.count(peer_pub_str)) {
                                     fb::proto::Frame kf;
                                     kf.mutable_key_fetch()->set_username(r.username());
-                                    blocking_send(*impl_->sock, serialize(kf));
+                                    blocking_send(impl_->conn, serialize(kf));
                                     impl_->pending_fetch_targets.push_back(r.username());
                                     impl_->mesh_bootstrap_pending[r.username()] =
                                         peer_pub_str;
@@ -1864,7 +1948,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                     qf.mutable_username_lookup()->set_pubkey(
                                         std::string(env.sender_pubkey().begin(),
                                                     env.sender_pubkey().end()));
-                                    blocking_send(*impl_->sock, serialize(qf));
+                                    blocking_send(impl_->conn, serialize(qf));
                                 }
                             }
                             if (payload.body_case() == fb::proto::DmPayload::kText) {
@@ -1923,7 +2007,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                     fb::proto::Frame subf;
                                     subf.mutable_chan_subscribe()->set_channel_group_id(
                                         ck.channel_id());
-                                    blocking_send(*impl_->sock, serialize(subf));
+                                    blocking_send(impl_->conn, serialize(subf));
                                     cs.subscribed = true;
                                 }
                                 // Persist the channel + its peer-dist + the
@@ -2236,7 +2320,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                         fb::proto::Frame subf;
                                         subf.mutable_chan_subscribe()->set_channel_group_id(
                                             m.channel_id());
-                                        blocking_send(*impl_->sock, serialize(subf));
+                                        blocking_send(impl_->conn, serialize(subf));
                                         cs.subscribed = true;
                                     }
                                     impl_->chan_id_to_name[std::string(
@@ -2529,6 +2613,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                     }
                 }
             }
+                }   // end of new outer block opened by W2 patch
         } catch (const std::exception& e) {
             emit errorOccurred(QString::fromStdString(e.what()));
         }

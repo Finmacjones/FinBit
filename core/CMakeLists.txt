@@ -91,7 +91,9 @@ add_library(fb_core STATIC
     src/p2p/kademlia.cpp
     src/p2p/gossip.cpp
     src/p2p/provider_records.cpp
+    src/p2p/dht_node.cpp
     src/identity/username_log.cpp
+    src/identity/username_gossip.cpp
     src/net/tls_client.cpp
 )
 

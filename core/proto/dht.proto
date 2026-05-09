@@ -61,4 +61,35 @@ message ProviderRecord {
 // pubkey X?" and the responder returns every fresh record they have for X.
 message ProviderLookupResponse {
     repeated ProviderRecord records = 1;
+
+    // 16-byte echo of the request_id from the matching DhtLookup, so
+    // lookup callers can correlate replies that may arrive out of
+    // order (multiple Kademlia probes in flight at once).
+    bytes  request_id = 2;
+}
+
+// "I serve pubkey X — store this record." Sent to the K peers closest
+// (in XOR distance over the SHA-256(pubkey)[0..20] keyspace) to the
+// publisher's NodeId.
+message DhtPublish {
+    ProviderRecord record = 1;
+}
+
+// "Who serves pubkey X?" Sent to the K peers closest to
+// SHA-256(target_pubkey)[0..20]. Each receiver replies with a
+// ProviderLookupResponse holding whatever records they hold for X.
+message DhtLookup {
+    bytes  target_pubkey = 1;   // 32-byte Ed25519 pubkey
+    bytes  request_id    = 2;   // 16 bytes, echoed in the response
+}
+
+// Top-level envelope for inter-node DHT traffic. The owning transport
+// (raw TCP, TLS, libp2p stream, …) carries the serialized DhtMessage
+// bytes; this oneof is what the receiving DhtNode dispatches on.
+message DhtMessage {
+    oneof body {
+        DhtPublish              publish  = 1;
+        DhtLookup               lookup   = 2;
+        ProviderLookupResponse  response = 3;
+    }
 }

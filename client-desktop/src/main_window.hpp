@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include <QCheckBox>
 #include <QListWidget>
 #include <QMainWindow>
 #include <QPlainTextEdit>
@@ -91,6 +92,16 @@ private:
     QPushButton* connect_btn_   = nullptr;
     QLabel*      status_label_  = nullptr;
     QPushButton* log_toggle_    = nullptr;
+    // Optional TLS toggle. When checked, the worker wraps the
+    // outbound socket via fb::net::TlsClient. Server must be
+    // running with --tls-raw-port + matching --tls-cert/--tls-key.
+    // The dev convenience: "TLS (insecure)" skips cert validation
+    // — the only sane way to talk to a self-signed localhost
+    // server without first installing the cert into the OS trust
+    // store. Production deployments use real CA-issued certs and
+    // leave the insecure box unchecked.
+    QCheckBox*   tls_check_           = nullptr;
+    QCheckBox*   tls_insecure_check_  = nullptr;
 
     // Server rail (Discord's left-most column).
     QListWidget* server_rail_   = nullptr;
