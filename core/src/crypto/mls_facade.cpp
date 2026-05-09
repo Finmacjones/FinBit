@@ -109,6 +109,42 @@ public:
         return from_mls_bytes(commit_b);
     }
 
+    std::vector<std::uint8_t> propose_add_member(
+        std::span<const std::uint8_t> key_package) override {
+        // Crucial subtlety: mls::Session::add ONLY returns wire-form
+        // proposal bytes — it does NOT stage the proposal in OUR
+        // local State. To stage we have to also handle() it
+        // ourselves, exactly like every other member will do via
+        // handle_proposal. Without this, commit_pending() commits
+        // an empty epoch advance and the Welcome doesn't actually
+        // include the new member — the joiner sees "Welcome not
+        // intended for key package" on complete().
+        auto proposal = session_.add(to_mls_bytes(key_package));
+        session_.handle(proposal);
+        return from_mls_bytes(proposal);
+    }
+
+    void handle_proposal(std::span<const std::uint8_t> proposal) override {
+        // Session::handle on a Proposal stages it as pending. Idempotent
+        // re-application is safe — mlspp dedups by proposal hash inside
+        // the State.
+        session_.handle(to_mls_bytes(proposal));
+    }
+
+    AddResult commit_pending() override {
+        // Plain commit() bundles every staged proposal we and other
+        // members have submitted into one Commit + Welcome. We
+        // self-handle the Commit so our own epoch advances; the
+        // returned bytes go to OTHER existing members (who handle()
+        // them in turn) and to the Welcome's recipients.
+        auto [welcome_b, commit_b] = session_.commit();
+        session_.handle(commit_b);
+        AddResult r;
+        r.welcome = from_mls_bytes(welcome_b);
+        r.commit  = from_mls_bytes(commit_b);
+        return r;
+    }
+
     std::vector<std::uint8_t> application_encrypt(
         std::span<const std::uint8_t> plaintext) override {
         return from_mls_bytes(session_.protect(to_mls_bytes(plaintext)));
@@ -131,19 +167,62 @@ public:
     }
 
     std::vector<std::uint8_t> serialize() const override {
-        // mls::Session doesn't expose a stable serialize/deserialize on
-        // its public API surface; persistence requires dropping down to
-        // mls::State and using its TLS-syntax tls::marshal. Deferred —
-        // tracked in security-audit.md follow-up.
+        // Honest scope note: mlspp does not expose state persistence on
+        // its public API. mls::Session keeps its history behind a PIMPL
+        // and mls::State has no public tls::marshal — both decisions
+        // are upstream design choices.
+        //
+        // The two viable paths to add persistence are:
+        //   1. Patch mlspp to expose State (de)serialization. State has
+        //      many internal invariants (chain keys, leaf indices, tree
+        //      hashes) so the patch needs careful review.
+        //   2. Build a transcript-replay layer here: save (sig_priv,
+        //      init_priv, leaf_priv) at start_join, save the Welcome
+        //      that hydrated us, and append every Commit we apply.
+        //      On restore, reconstruct keys from saved bytes via
+        //      HPKEPrivateKey::parse / SignaturePrivateKey::parse,
+        //      build State via the join-from-Welcome constructor, then
+        //      replay each Commit. Transcript stays bounded as long
+        //      as members rotate periodically (each Commit produces a
+        //      new epoch and old commits become reference material
+        //      only).
+        //
+        // Neither fits in the v0 ship. ChatClient's restart path
+        // recognises this — kMls channels whose cs.mls is null on
+        // reload surface a "needs re-invite" signal rather than
+        // crashing or pretending to be SenderKeys.
         throw std::runtime_error(
-            "MlsGroup::serialize: at-rest persistence not yet wired "
-            "(needs mls::State TLS-syntax marshalling — next iteration)");
+            "MlsGroup::serialize: persistence requires either patching "
+            "mlspp to expose State (de)serialization or a transcript-"
+            "replay layer above MlsGroup. Neither is wired in v0; "
+            "channel survives within a session and needs re-invite "
+            "after restart. See security-audit.md §10.");
     }
 
     std::size_t member_count() const override {
         // mls::Session::roster returns the leaf-node list for the
         // current epoch.
         return session_.roster().size();
+    }
+
+    std::vector<std::vector<std::uint8_t>> member_identities() const override {
+        std::vector<std::vector<std::uint8_t>> out;
+        for (const auto& leaf : session_.roster()) {
+            // Each leaf carries a Credential. We only handle BasicCredential
+            // (the one we use everywhere — the variant carries the
+            // raw identity bytes we passed at create / start_join).
+            // Other credential types (X.509, etc.) would surface here as
+            // empty entries; mlspp throws on get_basic for non-basic
+            // credentials, so swallow the throw.
+            try {
+                const auto& bc = leaf.credential.get<BasicCredential>();
+                out.push_back(std::vector<std::uint8_t>(
+                    bc.identity.begin(), bc.identity.end()));
+            } catch (...) {
+                out.emplace_back();   // unknown credential type
+            }
+        }
+        return out;
     }
 
 private:
@@ -224,5 +303,14 @@ std::unique_ptr<PendingMlsJoin> MlsGroup::start_join(
 }
 
 }  // namespace fb::crypto
+
+// In FB_HAVE_MLS=0 builds the facade methods all throw, but the pure-
+// virtual interface still has to compile against any consumer that
+// includes the header. The concrete MlsGroupImpl only exists in the
+// FB_HAVE_MLS=1 branch above; consumers that try to call methods on
+// a stub MlsGroup will hit pure-virtual calls only if they
+// successfully construct one — and create() / start_join() / from_blob
+// already throw before any concrete object is constructed, so this
+// is unreachable.
 
 #endif  // FB_HAVE_MLS

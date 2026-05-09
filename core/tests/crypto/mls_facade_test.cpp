@@ -139,6 +139,88 @@ TEST(MlsFacade, TwoMemberAddJoinRoundTrip) {
     EXPECT_EQ(*b_round, b_pt);
 }
 
+// Three members exercising member_identities() + a real Commit
+// broadcast: alice creates, adds bob, then adds carol. Carol must be
+// hydrated with the welcome from alice's add(carol). Bob must apply
+// the commit alice produced for the carol-add or he'll be stuck at
+// the previous epoch and decrypt of carol's first message will fail.
+TEST(MlsFacade, ThreeMemberMembershipAndCommitFanout) {
+    auto alice_id = seed(0xa1);
+    auto bob_id   = seed(0xb2);
+    auto carol_id = seed(0xc3);
+    auto group_id = seed(0x42);
+
+    auto alice = fb::crypto::MlsGroup::create(
+        std::span<const std::uint8_t, 32>(alice_id),
+        std::span<const std::uint8_t, 32>(group_id));
+
+    // Add bob.
+    auto bob_join = fb::crypto::MlsGroup::start_join(
+        std::span<const std::uint8_t, 32>(bob_id));
+    auto bob_kp = bob_join->key_package();
+    auto bob_add = alice->add_member(
+        std::span<const std::uint8_t>(bob_kp.data(), bob_kp.size()));
+    auto bob = bob_join->complete(
+        std::span<const std::uint8_t>(bob_add.welcome.data(),
+                                       bob_add.welcome.size()));
+
+    // Add carol — multi-member path. alice propose_add's,
+    // broadcasts the proposal to bob (who handle_proposal's it to
+    // stage locally), then alice commit_pending's. The Commit
+    // alice produces is now applicable by bob too because bob has
+    // the staged proposal in his local state. This matches the
+    // canonical MLS 2-broadcast flow shown in mlspp's
+    // test/session.cpp::broadcast_add().
+    auto carol_join = fb::crypto::MlsGroup::start_join(
+        std::span<const std::uint8_t, 32>(carol_id));
+    auto carol_kp = carol_join->key_package();
+
+    auto proposal = alice->propose_add_member(
+        std::span<const std::uint8_t>(carol_kp.data(), carol_kp.size()));
+    bob->handle_proposal(
+        std::span<const std::uint8_t>(proposal.data(), proposal.size()));
+
+    auto carol_add = alice->commit_pending();
+    auto carol = carol_join->complete(
+        std::span<const std::uint8_t>(carol_add.welcome.data(),
+                                       carol_add.welcome.size()));
+    bob->apply_commit(std::span<const std::uint8_t>(
+        carol_add.commit.data(), carol_add.commit.size()));
+
+    // member_identities() returns each member's BasicCredential identity
+    // bytes; this is what ChatClient uses to fan out commits.
+    EXPECT_EQ(alice->member_count(), 3u);
+    EXPECT_EQ(bob->member_count(),   3u);
+    EXPECT_EQ(carol->member_count(), 3u);
+
+    auto find_identity = [](const fb::crypto::MlsGroup& g, std::uint8_t fill) {
+        std::vector<std::uint8_t> wanted(32, fill);
+        for (const auto& id : g.member_identities()) {
+            if (id == wanted) return true;
+        }
+        return false;
+    };
+    for (auto* g : {alice.get(), bob.get(), carol.get()}) {
+        EXPECT_TRUE(find_identity(*g, 0xa1));
+        EXPECT_TRUE(find_identity(*g, 0xb2));
+        EXPECT_TRUE(find_identity(*g, 0xc3));
+    }
+
+    // Cross-direction round trips at the new (3-member) epoch.
+    const std::string m_text = "carol to the room";
+    std::vector<std::uint8_t> m_pt(m_text.begin(), m_text.end());
+    auto m_ct = carol->application_encrypt(
+        std::span<const std::uint8_t>(m_pt.data(), m_pt.size()));
+    auto a_round = alice->application_decrypt(
+        std::span<const std::uint8_t>(m_ct.data(), m_ct.size()));
+    auto b_round = bob->application_decrypt(
+        std::span<const std::uint8_t>(m_ct.data(), m_ct.size()));
+    ASSERT_TRUE(a_round.has_value());
+    ASSERT_TRUE(b_round.has_value());
+    EXPECT_EQ(*a_round, m_pt);
+    EXPECT_EQ(*b_round, m_pt);
+}
+
 #else  // FB_HAVE_MLS == 0
 
 TEST(MlsFacade, StubBuildThrowsNotImplemented) {

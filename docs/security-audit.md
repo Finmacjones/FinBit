@@ -351,9 +351,58 @@ In rough priority order:
    passes it to encrypt; receiver cross-checks vs reconstruction
    and uses it as outer_aad on decrypt; tampering detected; old
    senders with empty aad still work).
-4. Plan migration to MLS (RFC 9420) for channels — gets membership-
-   removal rekey + forward secrecy that SenderKeys can't.
+4. **Partial:** MLS (RFC 9420) for channels — opt-in pipeline shipped
+   (vendored mlspp, full A→D handshake, channel envelopes routed
+   through `mls::Session::protect/unprotect` when crypto=kMls).
+   See §10 for the persistence gap that's still open.
 5. Document explicitly to users: the centralized server learns
    metadata (who-talks-to-whom, who's-in-which-room-when), even
    though it never sees content. The roadmap's P2P phase is what
    addresses this.
+
+## 10. MLS persistence gap (open)
+
+mlspp does NOT expose state persistence on its public API:
+- `mls::Session` keeps its history behind a PIMPL.
+- `mls::State` has no public `tls::marshal` (only inner types like
+  `Tombstone` carry `TLS_SERIALIZABLE`).
+
+Both are upstream design choices, not bugs. The two viable paths to
+add persistence on top of FinBit's facade are:
+
+1. **Patch mlspp** to expose `tls::marshal(State)` + a matching
+   restore constructor. State has many internal invariants (chain
+   keys, leaf indices, tree hashes, transcript) so the patch needs
+   careful review and probably upstream contribution before it's
+   wise to ship.
+2. **Transcript replay above MlsGroup**:
+   - At `start_join`, save `(sig_priv.data, init_priv.data,
+     leaf_priv.data, key_package_bytes)` into the local store.
+     `HPKEPrivateKey::parse(suite, data)` and
+     `SignaturePrivateKey::parse(suite, data)` round-trip via
+     the public `data` field.
+   - At `complete(welcome)`, save the Welcome bytes that hydrated
+     us alongside the keys above.
+   - At every `apply_commit(c)`, append the commit bytes to a
+     per-channel transcript log.
+   - On restart: parse keys, reconstruct PendingJoin equivalent,
+     `complete(saved_welcome)` → State, replay every saved Commit
+     in order.
+   - Transcript stays bounded as long as the channel isn't
+     pathologically high-churn.
+
+Until either lands, MLS channels survive within a session but lose
+their group state on restart. Behaviour today:
+- `chan_state.crypto` persists (the channel REMEMBERS it's an MLS
+  channel after restart).
+- `cs.mls` is null on restore. ChatClient logs a clear "MLS channel
+  #X restored without in-memory state — re-invite members" message.
+- Channel envelope subscription continues. Inbound MLS messages
+  fail decrypt (best-effort fallthrough to SenderKeys decrypt
+  produces the same nullopt result; no crash, no spurious accept).
+- The user re-invites the channel members; the auto-orchestration
+  in step D's handlers re-establishes a fresh group.
+
+This is the one acknowledged "use it within a session" limitation
+of the v0 MLS opt-in. Documented in `core/src/crypto/mls_facade.cpp`
+serialize() and at the chan_list restore site.

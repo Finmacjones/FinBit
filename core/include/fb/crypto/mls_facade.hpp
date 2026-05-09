@@ -51,14 +51,44 @@ public:
 
     virtual ~MlsGroup() = default;
 
-    // Add a member by KeyPackage bytes. Produces an MLS Welcome (sent to the
-    // newcomer) and a Commit (broadcast to existing members).
+    // Add a member by KeyPackage bytes — the simple 2-party path.
+    // Produces an MLS Welcome (sent to the newcomer) and a Commit
+    // that references the embedded Add proposal. The Commit can be
+    // applied by the joiner via the Welcome alone, but EXISTING
+    // members beyond the inviter cannot apply this Commit because
+    // the underlying Proposal was pre-applied to the inviter's
+    // local state and the wire Commit only references it. Use the
+    // propose_add / handle_proposal / commit_pending triple below
+    // for >2-party groups.
     struct AddResult {
         std::vector<std::uint8_t> welcome;
         std::vector<std::uint8_t> commit;
     };
     [[nodiscard]] virtual AddResult add_member(
         std::span<const std::uint8_t> key_package) = 0;
+
+    // Two-broadcast Add for multi-member groups.
+    //
+    //   propose_add_member(kp)        — returns the wire-form Add
+    //     proposal bytes. The inviter broadcasts these to every
+    //     existing member (who all call handle_proposal on receipt)
+    //     BEFORE calling commit_pending. Each call accumulates one
+    //     pending proposal in the local State.
+    //
+    //   handle_proposal(proposal)     — apply an inbound Proposal
+    //     against our local state. Idempotent — receiving the same
+    //     proposal twice is a no-op (mlspp dedups internally).
+    //
+    //   commit_pending()              — close out every staged
+    //     proposal (ours + ones we received via handle_proposal)
+    //     into a single MLS Commit + Welcome. The commit advances
+    //     OUR epoch (self-applied internally), and is broadcast to
+    //     every other existing member who then apply_commit's it.
+    //     Welcome goes to all newly-added joiners.
+    [[nodiscard]] virtual std::vector<std::uint8_t> propose_add_member(
+        std::span<const std::uint8_t> key_package) = 0;
+    virtual void handle_proposal(std::span<const std::uint8_t> proposal) = 0;
+    [[nodiscard]] virtual AddResult commit_pending() = 0;
 
     // Remove a member by their LeafIndex (returned by add_member or known
     // from the group state).
@@ -81,7 +111,20 @@ public:
 
     // Number of members currently in the group.
     [[nodiscard]] virtual std::size_t member_count() const = 0;
+
+    // Identity bytes of each current member (BasicCredential's
+    // `identity` field; FinBit puts the user's 32-byte Ed25519
+    // pubkey there at create / start_join). Used by ChatClient to
+    // fan out an MlsCommit to every existing member after add /
+    // remove. Order matches mls::Session::roster()'s LeafIndex
+    // ordering, but callers shouldn't depend on a specific index.
+    [[nodiscard]] virtual std::vector<std::vector<std::uint8_t>>
+        member_identities() const = 0;
 };
+
+// Pure virtuals; the FB_HAVE_MLS=0 build never constructs an MlsGroup
+// (every static factory throws first), so unimplemented overrides
+// are unreachable. Keep the interface clean.
 
 // Joiner-side state: holds the freshly-generated mls::Client +
 // PendingJoin between key-package publication and Welcome receipt.

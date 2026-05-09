@@ -90,6 +90,12 @@ message MlsKeyPackage {
     bytes channel_id  = 1;   // 32-byte channel/group id the joiner targets
     bytes key_package = 2;   // tls::marshal output from PendingMlsJoin
 }
+message MlsProposal {
+    bytes channel_id = 1;
+    bytes proposal   = 2;   // wire-form Proposal (Add/Remove/Update); receiver
+                            // calls MlsGroup::handle_proposal to stage it
+                            // before the matching Commit lands.
+}
 message MlsWelcome {
     bytes  channel_id   = 1;
     string channel_name = 2;   // for UI sidebar; same role as ChannelKeyDistribution.channel_name
@@ -109,5 +115,6 @@ message DmPayload {
         MlsKeyPackage           mls_key_package    = 5;
         MlsWelcome              mls_welcome        = 6;
         MlsCommit               mls_commit         = 7;
+        MlsProposal             mls_proposal       = 8;
     }
 }

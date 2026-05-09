@@ -671,15 +671,28 @@ void MainWindow::onSendClicked() {
 }
 
 void MainWindow::onNewChannelClicked() {
+    // Two-prompt sequence (Qt's QInputDialog only does single-field
+    // prompts; a custom QDialog would be cleaner but adds 30 lines for
+    // a one-checkbox flow). The MLS prompt only fires if the user
+    // confirmed the name, and shows up as a Yes/No so it's
+    // explicit — defaulting to No keeps SenderKeys the surprise-free
+    // default.
     bool ok = false;
     const QString name = QInputDialog::getText(this, "New channel",
                                                "Channel name:", QLineEdit::Normal,
                                                "general", &ok);
     if (!ok || name.isEmpty()) return;
-    // Channel creation no longer also asks for a first peer — that was a
-    // confusing two-step modal and the prekey fetch could hang if the
-    // chosen username wasn't registered. Use the Invite button afterwards.
-    client_->create_local_channel(name);
+    const auto reply = QMessageBox::question(
+        this, "Channel encryption",
+        QString("Create #%1 with MLS (RFC 9420) encryption?\n\n"
+                "MLS gives proper member-removal forward secrecy that "
+                "SenderKeys can't, but is opt-in for now: state lives "
+                "in memory only — restarting the app loses the group "
+                "and you'll need to re-invite. Defaults to No.")
+            .arg(name),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    const bool use_mls = (reply == QMessageBox::Yes);
+    client_->create_local_channel(name, use_mls);
 }
 
 void MainWindow::onInviteClicked() {
