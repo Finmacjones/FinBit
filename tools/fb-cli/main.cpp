@@ -54,6 +54,7 @@
 #include "fb/crypto/sender_keys.hpp"
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
+#include "fb/net/tls_client.hpp"
 #include "fb/p2p/gossip.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
@@ -108,6 +109,14 @@ struct Args {
     bool p2p_relay  = false;        // just subscribe + relay (no dist, no decrypt)
     std::uint16_t p2p_port = 0;
     std::string p2p_dial;           // "host:port" of bootstrap peer
+    // TLS-wrapped raw transport (Phase 5+ "looks like web traffic on
+    // 443"). When --tls is set, the connection to --server is wrapped
+    // in TLS via fb::net::TlsClient. Server must be running with
+    // --tls-port + matching --tls-cert/--tls-key.
+    bool tls = false;
+    std::string tls_ca;             // CA file for cert verification
+    bool tls_insecure_skip_verify = false;   // dev/CI escape hatch
+    std::string tls_sni;            // override SNI hostname
 };
 
 void usage() {
@@ -127,6 +136,13 @@ void usage() {
               << "  --server HOST:PORT    default 127.0.0.1:8765\n"
               << "  --wait-ms N           how long to listen (default 5000)\n"
               << "  --linger-ms N         how long channel-create stays after sending (default 1500)\n"
+              << "TLS (Phase 5+ 'looks like web traffic on :443'):\n"
+              << "  --tls                 wrap the connection in TLS via fb::net::TlsClient\n"
+              << "                        (server must be on --tls-port with matching cert/key)\n"
+              << "  --tls-ca FILE         PEM file with the CA that signed the server cert\n"
+              << "                        (omit to use system CA bundle)\n"
+              << "  --tls-insecure-skip-verify  skip cert validation (dev / self-signed only)\n"
+              << "  --tls-sni HOST        override SNI hostname (defaults to --server host)\n"
               << "Default URL constant: " << fb::config::kDefaultServerUrl << "\n";
 }
 
@@ -177,6 +193,12 @@ bool parse(int argc, char** argv, Args& a) {
             if (!next(ms)) return false;
             a.linger_ms = std::atoi(ms.c_str());
         }
+        else if (s == "--tls") { a.tls = true; }
+        else if (s == "--tls-ca") { if (!next(a.tls_ca)) return false; }
+        else if (s == "--tls-insecure-skip-verify") {
+            a.tls_insecure_skip_verify = true;
+        }
+        else if (s == "--tls-sni") { if (!next(a.tls_sni)) return false; }
         else if (s == "--help" || s == "-h") { usage(); std::exit(0); }
         else { std::cerr << "unknown arg: " << s << "\n"; usage(); return false; }
     }
@@ -296,20 +318,62 @@ std::vector<std::uint8_t> pack_channel_key_payload(
     return serialize(p);
 }
 
-void blocking_send(fb::net::Socket& s, const std::vector<std::uint8_t>& payload) {
-    auto framed = fb::net::encode_frame(std::span<const std::uint8_t>(payload.data(), payload.size()));
-    std::size_t off = 0;
-    while (off < framed.size()) {
-        const auto n = ::send(s.fd(), framed.data() + off, framed.size() - off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            throw std::runtime_error(std::string("send: ") + strerror(errno));
-        }
-        off += static_cast<std::size_t>(n);
+// Conn — thin transport-agnostic handle. Holds either a raw Socket OR a
+// TlsClient; the rest of fb-cli speaks only to Conn so the wire format
+// (length-prefixed Frame protobufs) flows over either transport without
+// every call site branching. send_all/read_some block in keeping with
+// the existing fb-cli model.
+struct Conn {
+    fb::net::Socket*    sock = nullptr;
+    fb::net::TlsClient* tls  = nullptr;
+
+    [[nodiscard]] int fd() const {
+        return tls ? tls->fd() : sock->fd();
     }
+
+    void send_all(std::span<const std::uint8_t> data) {
+        if (tls) {
+            tls->blocking_send_all(data);
+            return;
+        }
+        std::size_t off = 0;
+        while (off < data.size()) {
+            const auto n = ::send(sock->fd(), data.data() + off,
+                                   data.size() - off, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error(std::string("send: ") + strerror(errno));
+            }
+            off += static_cast<std::size_t>(n);
+        }
+    }
+
+    // Returns 0 on EOF / clean shutdown / timeout. Caller distinguishes
+    // by tracking deadlines externally; the existing code only cares
+    // about ">0 means data, 0 means stop".
+    std::size_t read_some(std::span<std::uint8_t> out, int timeout_ms) {
+        if (tls) return tls->blocking_read(out, timeout_ms);
+        timeval tv{};
+        tv.tv_sec  = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
+        fd_set rset;
+        FD_ZERO(&rset);
+        FD_SET(sock->fd(), &rset);
+        const int sel = ::select(sock->fd() + 1, &rset, nullptr, nullptr, &tv);
+        if (sel <= 0) return 0;
+        const auto n = ::recv(sock->fd(), out.data(), out.size(), 0);
+        if (n <= 0) return 0;
+        return static_cast<std::size_t>(n);
+    }
+};
+
+void blocking_send(Conn& c, const std::vector<std::uint8_t>& payload) {
+    auto framed = fb::net::encode_frame(std::span<const std::uint8_t>(
+        payload.data(), payload.size()));
+    c.send_all(std::span<const std::uint8_t>(framed.data(), framed.size()));
 }
 
-std::optional<std::vector<std::uint8_t>> blocking_recv_frame(fb::net::Socket& s,
+std::optional<std::vector<std::uint8_t>> blocking_recv_frame(Conn& c,
                                                               fb::net::FrameDecoder& dec,
                                                               int timeout_ms) {
     std::vector<std::uint8_t> out;
@@ -318,25 +382,15 @@ std::optional<std::vector<std::uint8_t>> blocking_recv_frame(fb::net::Socket& s,
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     std::array<std::uint8_t, 4096> buf;
     while (std::chrono::steady_clock::now() < deadline) {
-        timeval tv{};
-        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    deadline - std::chrono::steady_clock::now())
                                    .count();
         if (remaining <= 0) break;
-        tv.tv_sec = remaining / 1'000'000;
-        tv.tv_usec = remaining % 1'000'000;
-        fd_set rset;
-        FD_ZERO(&rset);
-        FD_SET(s.fd(), &rset);
-        const int sel = ::select(s.fd() + 1, &rset, nullptr, nullptr, &tv);
-        if (sel < 0) {
-            if (errno == EINTR) continue;
-            return std::nullopt;
-        }
-        if (sel == 0) return std::nullopt;
-        const auto n = ::recv(s.fd(), buf.data(), buf.size(), 0);
-        if (n <= 0) return std::nullopt;
-        dec.feed(std::span<const std::uint8_t>(buf.data(), static_cast<std::size_t>(n)));
+        const auto n = c.read_some(
+            std::span<std::uint8_t>(buf.data(), buf.size()),
+            static_cast<int>(remaining));
+        if (n == 0) return std::nullopt;
+        dec.feed(std::span<const std::uint8_t>(buf.data(), n));
         if (dec.try_pop(out) == fb::net::FrameDecoder::Status::kFrameReady) return out;
     }
     return std::nullopt;
@@ -503,7 +557,31 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    auto sock = fb::net::tcp_connect(args.server_host, args.server_port);
+    // Transport selection. --tls wraps the connection in TLS via
+    // fb::net::TlsClient (Phase 5+ "looks like web traffic on :443").
+    // Without --tls we keep the raw TCP path the rest of the
+    // codebase has used since Phase 0 — same wire format on the
+    // socket, just no TLS layer below.
+    fb::net::Socket sock;
+    fb::net::TlsClient tls;
+    Conn conn;
+    if (args.tls) {
+        fb::net::TlsClientOptions tlsopts;
+        tlsopts.ca_file = args.tls_ca;
+        tlsopts.insecure_skip_verify = args.tls_insecure_skip_verify;
+        tlsopts.sni_hostname = args.tls_sni;
+        if (args.tls_insecure_skip_verify) {
+            std::fprintf(stderr,
+                "[fb-cli] WARNING: --tls-insecure-skip-verify — server "
+                "cert is NOT being validated. Use only against a known "
+                "self-signed dev server.\n");
+        }
+        tls.connect(args.server_host, args.server_port, tlsopts);
+        conn.tls = &tls;
+    } else {
+        sock = fb::net::tcp_connect(args.server_host, args.server_port);
+        conn.sock = &sock;
+    }
     fb::net::FrameDecoder dec;
 
     // 1. Send ClientHello
@@ -515,9 +593,9 @@ int main(int argc, char** argv) {
             identity.public_key().size()));
         hello->set_username(args.user);
         hello->set_protocol_version(fb::config::kProtocolVersion);
-        blocking_send(sock, serialize(f));
+        blocking_send(conn, serialize(f));
     }
-    auto hello_resp = blocking_recv_frame(sock, dec, 2000);
+    auto hello_resp = blocking_recv_frame(conn, dec, 2000);
     if (!hello_resp) { std::cerr << "no ServerHello\n"; return 3; }
     {
         fb::proto::Frame f;
@@ -536,7 +614,7 @@ int main(int argc, char** argv) {
         fb::proto::Frame ackf;
         ackf.mutable_hello_ack()->set_signature(
             std::string(reinterpret_cast<const char*>(sig.data()), sig.size()));
-        blocking_send(sock, serialize(ackf));
+        blocking_send(conn, serialize(ackf));
     }
 
     // 2. Upload prekey bundle (the X25519 pub is the signed prekey).
@@ -555,7 +633,7 @@ int main(int argc, char** argv) {
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch())
                 .count()));
-        blocking_send(sock, serialize(f));
+        blocking_send(conn, serialize(f));
     }
 
     // ---- In-band channel invite (Phase 1, no shared file) -----------------
@@ -565,9 +643,9 @@ int main(int argc, char** argv) {
         {
             fb::proto::Frame f;
             f.mutable_key_fetch()->set_username(args.peer);
-            blocking_send(sock, serialize(f));
+            blocking_send(conn, serialize(f));
         }
-        auto resp = blocking_recv_frame(sock, dec, 2000);
+        auto resp = blocking_recv_frame(conn, dec, 2000);
         if (!resp) { std::cerr << "no key bundle response\n"; return 5; }
         fb::proto::Frame f;
         if (!f.ParseFromArray(resp->data(), static_cast<int>(resp->size())) ||
@@ -594,7 +672,7 @@ int main(int argc, char** argv) {
             subf.mutable_chan_subscribe()->set_channel_group_id(
                 std::string(reinterpret_cast<const char*>(chan_id.data()),
                             chan_id.size()));
-            blocking_send(sock, serialize(subf));
+            blocking_send(conn, serialize(subf));
         }
 
         // 3. Pack the distribution into a DmPayload.channel_key and DM-send
@@ -629,7 +707,7 @@ int main(int argc, char** argv) {
             env->set_ciphertext(std::string(invite_inner.begin(), invite_inner.end()));
             env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
             env->set_protocol_version(fb::config::kProtocolVersion);
-            blocking_send(sock, serialize(envf));
+            blocking_send(conn, serialize(envf));
         }
         std::cerr << "[fb-cli] invited " << args.peer << " to #" << args.channel_name
                   << " via DM\n";
@@ -664,7 +742,7 @@ int main(int argc, char** argv) {
         env->set_ciphertext(std::string(chan_inner.begin(), chan_inner.end()));
         env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
         env->set_protocol_version(fb::config::kProtocolVersion);
-        blocking_send(sock, serialize(envf));
+        blocking_send(conn, serialize(envf));
         std::cerr << "[fb-cli] sent channel msg (" << pt.size() << "B plaintext) to #"
                   << args.channel_name << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(args.linger_ms));
@@ -680,7 +758,7 @@ int main(int argc, char** argv) {
             fb::proto::Frame f;
             f.mutable_chan_subscribe()->set_channel_group_id(
                 std::string(reinterpret_cast<const char*>(chan_id.data()), chan_id.size()));
-            blocking_send(sock, serialize(f));
+            blocking_send(conn, serialize(f));
         }
 
         if (args.channel_create) {
@@ -719,7 +797,7 @@ int main(int argc, char** argv) {
             env->set_ciphertext(std::string(msg.begin(), msg.end()));
             env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
             env->set_protocol_version(fb::config::kProtocolVersion);
-            blocking_send(sock, serialize(f2));
+            blocking_send(conn, serialize(f2));
             std::cerr << "[fb-cli] sent channel msg (" << pt.size() << "B plaintext)\n";
 
             // Linger so the server has time to fan out before we close.
@@ -758,7 +836,7 @@ int main(int argc, char** argv) {
                                        deadline - std::chrono::steady_clock::now())
                                        .count();
             if (remaining <= 0) break;
-            auto frame = blocking_recv_frame(sock, dec, static_cast<int>(remaining));
+            auto frame = blocking_recv_frame(conn, dec, static_cast<int>(remaining));
             if (!frame) continue;
             fb::proto::Frame f;
             if (!f.ParseFromArray(frame->data(), static_cast<int>(frame->size()))) continue;
@@ -807,9 +885,9 @@ int main(int argc, char** argv) {
         {
             fb::proto::Frame f;
             f.mutable_key_fetch()->set_username(args.peer);
-            blocking_send(sock, serialize(f));
+            blocking_send(conn, serialize(f));
         }
-        auto resp = blocking_recv_frame(sock, dec, 2000);
+        auto resp = blocking_recv_frame(conn, dec, 2000);
         if (!resp) { std::cerr << "no key bundle response\n"; return 5; }
         fb::proto::Frame f;
         if (!f.ParseFromArray(resp->data(), static_cast<int>(resp->size())) ||
@@ -855,7 +933,7 @@ int main(int argc, char** argv) {
         env->set_ciphertext(std::string(inner.begin(), inner.end()));
         env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
         env->set_protocol_version(fb::config::kProtocolVersion);
-        blocking_send(sock, serialize(f2));
+        blocking_send(conn, serialize(f2));
         std::cerr << "[fb-cli] sent " << args.text.size() << "B plaintext to " << args.peer
                   << "\n";
         return 0;
@@ -876,7 +954,7 @@ int main(int argc, char** argv) {
                                    deadline - std::chrono::steady_clock::now())
                                    .count();
         if (remaining <= 0) break;
-        auto frame = blocking_recv_frame(sock, dec, static_cast<int>(remaining));
+        auto frame = blocking_recv_frame(conn, dec, static_cast<int>(remaining));
         if (!frame) continue;
         fb::proto::Frame f;
         if (!f.ParseFromArray(frame->data(), static_cast<int>(frame->size()))) continue;
@@ -972,7 +1050,7 @@ int main(int argc, char** argv) {
             {
                 fb::proto::Frame qf;
                 qf.mutable_username_lookup()->set_pubkey(env.sender_pubkey());
-                blocking_send(sock, serialize(qf));
+                blocking_send(conn, serialize(qf));
             }
             std::cout << "MSG: " << payload.text() << std::endl;
         } else if (payload.body_case() == fb::proto::DmPayload::kChannelKey) {
@@ -996,7 +1074,7 @@ int main(int argc, char** argv) {
             // Subscribe to the channel so the server fans out future envelopes.
             fb::proto::Frame subf;
             subf.mutable_chan_subscribe()->set_channel_group_id(ck.channel_id());
-            blocking_send(sock, serialize(subf));
+            blocking_send(conn, serialize(subf));
             known_channels[ck.channel_id()] = ck.channel_name();
             std::cout << "INVITE: #" << ck.channel_name() << std::endl;
         }

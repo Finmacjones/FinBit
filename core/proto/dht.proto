@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+syntax = "proto3";
+
+package fb.proto;
+
+option optimize_for = LITE_RUNTIME;
+
+// =============================================================================
+// DHT provider records.
+//
+// A "provider record" is a signed binding from a peer's identity (Ed25519
+// pubkey) to a set of currently-reachable transport addresses. Peers publish
+// their own records into the DHT and look up other peers' records by pubkey.
+// Records carry a TTL — long-lived peers re-publish periodically; offline
+// peers' records are pruned when TTL expires.
+//
+// Same shape as libp2p's PeerRecord / SignedEnvelope but tailored to FinBit's
+// existing primitives (Ed25519 + canonical-byte signing, matching the
+// username log).
+//
+// Wire-form privacy: records are PUBLIC and gossiped widely, so they
+// intentionally leak (publisher_pubkey → reachable address) bindings. That's
+// the point of a peer-discovery layer. To hide presence, a peer simply
+// doesn't publish a record (and the DHT can't help others find them — they
+// stay reachable only via direct invite).
+// =============================================================================
+
+message ProviderRecord {
+    // 32-byte Ed25519 public key of the peer this record provides for.
+    // Identity = pubkey; the DHT key for storing/lookup is
+    // SHA-256(pubkey)[0..20] (matches kademlia.hpp::node_id_from_pubkey).
+    bytes  publisher_pubkey = 1;
+
+    // Transport addresses where this peer currently accepts connections.
+    // Format: "scheme://host:port" — e.g.
+    //   "wss://203.0.113.5:443"
+    //   "ws://[2001:db8::1]:8080"
+    //   "tcp://198.51.100.7:9000"
+    // Multi-homed peers list every reachable address.
+    repeated string addresses = 2;
+
+    // Unix-epoch milliseconds at the time of signing.
+    uint64 published_at_ms = 3;
+
+    // Record is invalid after published_at_ms + ttl_ms. Recommended
+    // ttl: 1 hour for online peers (force re-publish to confirm
+    // reachability).
+    uint64 ttl_ms = 4;
+
+    // 16 bytes of randomness — same purpose as in UserClaim: prevents
+    // identical canonical bytes when (publisher, addresses, time) are
+    // equal across two re-publishes.
+    bytes  nonce = 5;
+
+    // Ed25519 signature over canonical_signing_bytes(...) — see
+    // provider_records.hpp.
+    bytes  signature = 6;
+}
+
+// Wire envelope for DHT lookup responses: a peer asked "who provides for
+// pubkey X?" and the responder returns every fresh record they have for X.
+message ProviderLookupResponse {
+    repeated ProviderRecord records = 1;
+}

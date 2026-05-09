@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+syntax = "proto3";
+
+package fb.proto;
+
+option optimize_for = LITE_RUNTIME;
+
+// =============================================================================
+// Identity log — append-only signed claim log binding usernames to Ed25519
+// pubkeys. Entries are gossiped between peers; conflict resolution is
+// deterministic (smallest valid timestamp_ms wins). The chain instinct
+// without the chain: no consensus, no gas, no global ordering except by
+// timestamp; everyone independently computes the same "winner" given the
+// same set of claims.
+//
+// Wire layout designed to match what the signature covers exactly. Signature
+// is over canonical_serialize(UserClaim with signature field cleared) using
+// the claimant's Ed25519 sig_priv.
+// =============================================================================
+
+message UserClaim {
+    // Username, UTF-8, NFKC-normalized to lowercase. Length 3..32 bytes.
+    // Allowed charset (ASCII): a-z 0-9 . _ - (no whitespace, no @, no #).
+    // Wider Unicode is *encoded* as UTF-8 NFKC but the canonical
+    // comparison is on bytes — clients display whatever the bytes
+    // round-trip to.
+    string username     = 1;
+
+    // Ed25519 public key of the claimant. 32 bytes.
+    bytes  pubkey       = 2;
+
+    // Unix-epoch milliseconds at the time the claim was signed.
+    // Validators reject claims where timestamp_ms is more than
+    // kAcceptedClockSkewMs in the future relative to the validator's
+    // clock (default 5 minutes). No upper bound on age — old claims
+    // are how partition healing surfaces the "real" owner.
+    uint64 timestamp_ms = 3;
+
+    // 16 bytes of cryptographic randomness. Prevents two claims with
+    // the same (username, pubkey, timestamp_ms) from being identical
+    // bytes (would otherwise collide on the (username, pubkey) primary
+    // key in the log even if they were independently signed). Also
+    // makes the canonical bytes harder to grind against.
+    bytes  nonce        = 4;
+
+    // Ed25519 signature over canonical_serialize(UserClaim) with this
+    // signature field cleared. 64 bytes.
+    bytes  signature    = 5;
+}
+
+// Sync envelope: a peer asks for "every claim newer than this watermark".
+// Peers reply with a stream of UserClaim messages. The watermark is the
+// caller's local "highest timestamp_ms I've seen" — gossip remains O(delta)
+// per pair of peers in steady state.
+message ClaimsSinceRequest {
+    uint64 since_timestamp_ms = 1;
+    uint32 max_records        = 2;   // hint; receiver can return fewer
+}
+
+message ClaimsSinceResponse {
+    repeated UserClaim claims      = 1;
+    bool               truncated   = 2;   // more claims exist past the page
+    uint64             max_seen_ms = 3;   // highest timestamp in this batch
+}

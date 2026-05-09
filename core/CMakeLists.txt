@@ -41,6 +41,8 @@ set(FB_PROTO_FILES
     proto/sender_keys.proto
     proto/p2p.proto
     proto/dm_payload.proto
+    proto/identity_log.proto
+    proto/dht.proto
 )
 
 set(FB_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -88,6 +90,9 @@ add_library(fb_core STATIC
     src/p2p/host.cpp
     src/p2p/kademlia.cpp
     src/p2p/gossip.cpp
+    src/p2p/provider_records.cpp
+    src/identity/username_log.cpp
+    src/net/tls_client.cpp
 )
 
 target_include_directories(fb_core
@@ -155,6 +160,21 @@ if(FB_FEATURE_MLS AND TARGET mlspp)
     message(STATUS "fb_core: MLS (mlspp) ENABLED")
 else()
     target_compile_definitions(fb_core PUBLIC FB_HAVE_MLS=0)
+endif()
+
+# --- OpenSSL for client-side TLS (TlsClient) ------------------------------
+# Optional. Without it, fb::net::TlsClient throws "OpenSSL not compiled in"
+# at every entry point, but everything links + builds. With it, FB_HAVE_OPENSSL
+# is defined PUBLIC so consumers (fb-cli, chat_client) compile against
+# the real implementation.
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    target_link_libraries(fb_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(fb_core PUBLIC FB_HAVE_OPENSSL=1)
+    message(STATUS "fb_core: OpenSSL ${OPENSSL_VERSION} → TlsClient enabled")
+else()
+    target_compile_definitions(fb_core PUBLIC FB_HAVE_OPENSSL=0)
+    message(STATUS "fb_core: OpenSSL NOT found → TlsClient throws on use")
 endif()
 
 target_compile_features(fb_core PUBLIC cxx_std_20)

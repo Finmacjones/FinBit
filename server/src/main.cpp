@@ -144,7 +144,12 @@ struct Conn {
                     return -1;   // handshake failed
                 }
                 tls_handshake_done = true;
-                return fb::net::Socket::kReadRetry;  // re-arm; real data next round
+                // Fall through to SSL_read — the same TCP packet that
+                // completed the handshake may have application data
+                // tail-piggybacked. Returning kReadRetry here would
+                // park the loop waiting for an EPOLLIN that never
+                // comes (the data is in OpenSSL's buffer, not the
+                // socket).
             }
             int rc = SSL_read(ssl, buf.data(), static_cast<int>(buf.size()));
             if (rc > 0) return rc;
@@ -229,6 +234,11 @@ int main(int argc, char** argv) {
     std::uint16_t port = 8765;
     std::uint16_t ws_port = 0;       // 0 = disabled
     std::uint16_t tls_port = 0;      // 0 = disabled (built-in TLS WS)
+    std::uint16_t tls_raw_port = 0;  // 0 = disabled (TLS-wrapped raw frames
+                                      // — same wire shape as --port, just
+                                      // with a TLS layer below. Lets native
+                                      // clients run on a likely-open port
+                                      // like 443 without speaking WS.)
     std::string tls_cert, tls_key;
     std::string offline_db;
     bool public_listen = false;
@@ -240,6 +250,8 @@ int main(int argc, char** argv) {
             ws_port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
         else if (a == "--tls-port" && i + 1 < argc)
             tls_port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
+        else if (a == "--tls-raw-port" && i + 1 < argc)
+            tls_raw_port = static_cast<std::uint16_t>(std::atoi(argv[++i]));
         else if (a == "--tls-cert" && i + 1 < argc) tls_cert = argv[++i];
         else if (a == "--tls-key"  && i + 1 < argc) tls_key  = argv[++i];
         else if (a == "--offline-db" && i + 1 < argc) offline_db = argv[++i];
@@ -258,6 +270,11 @@ int main(int argc, char** argv) {
                 "  --tls-port P    TLS-wrapped WebSocket (wss://) — for browsers from\n"
                 "                  https:// pages without a reverse proxy. Requires\n"
                 "                  --tls-cert and --tls-key.\n"
+                "  --tls-raw-port P TLS-wrapped raw-frame transport for native clients\n"
+                "                  (fb-cli --tls / desktop client TLS mode). Same\n"
+                "                  protocol as --port but on TLS — looks like HTTPS\n"
+                "                  to a network observer, fits anywhere :443 is open.\n"
+                "                  Requires --tls-cert and --tls-key.\n"
                 "  --tls-cert F    PEM file with the server certificate chain\n"
                 "  --tls-key F     PEM file with the matching private key\n"
                 "  --offline-db F  SQLite path for offline queue + directory persistence\n"
@@ -741,6 +758,22 @@ int main(int argc, char** argv) {
             std::array<std::uint8_t, 4096> buf;
             for (;;) {
                 auto n = c.read_some(std::span<std::uint8_t>(buf.data(), buf.size()));
+#if FB_HAVE_OPENSSL
+                // SSL_accept needs to write its ServerHello /
+                // Certificate / etc. fragments before more client
+                // bytes arrive. read_some + SSL_accept won't make
+                // forward progress on the WRITE side without us
+                // explicitly calling SSL_write — push it here by
+                // calling write_some(empty), which on the SSL path
+                // re-enters SSL_accept and lets OpenSSL flush any
+                // pending output. Cheap no-op when handshake_done.
+                if (c.ssl && !c.tls_handshake_done &&
+                    n == fb::net::Socket::kReadRetry) {
+                    std::array<std::uint8_t, 1> dummy{};
+                    (void)c.write_some(
+                        std::span<const std::uint8_t>(dummy.data(), 0));
+                }
+#endif
                 if (n == fb::net::Socket::kReadRetry) break;
                 if (n <= 0) {
                     close_conn(fd);
@@ -803,7 +836,12 @@ int main(int argc, char** argv) {
                         return;
                     }
                 }
-                if (static_cast<std::size_t>(n) < buf.size()) break;
+                // Used to break here if read_some returned fewer bytes
+                // than requested — that's fine for plain TCP but
+                // catastrophic for TLS, where OpenSSL may have more
+                // application data already decrypted in its internal
+                // buffer waiting for the next SSL_read. Loop until
+                // read_some explicitly returns kReadRetry.
             }
         }
         if (events & EPOLLOUT) {
@@ -829,10 +867,11 @@ int main(int argc, char** argv) {
     // unique_ptr deleter.
     struct SslCtxDeleter { void operator()(SSL_CTX* p) const { if (p) SSL_CTX_free(p); } };
     std::unique_ptr<SSL_CTX, SslCtxDeleter> ssl_ctx;
-    if (tls_port != 0) {
+    if (tls_port != 0 || tls_raw_port != 0) {
         if (tls_cert.empty() || tls_key.empty()) {
             std::fprintf(stderr,
-                "[server] --tls-port requires both --tls-cert and --tls-key\n");
+                "[server] --tls-port / --tls-raw-port require "
+                "both --tls-cert and --tls-key\n");
             return 1;
         }
         SSL_library_init();
@@ -868,10 +907,12 @@ int main(int argc, char** argv) {
         }
     }
 #else
-    if (tls_port != 0) {
+    if (tls_port != 0 || tls_raw_port != 0) {
         std::fprintf(stderr,
-            "[server] this build was compiled without OpenSSL — --tls-port ignored\n");
+            "[server] this build was compiled without OpenSSL — "
+            "--tls-port / --tls-raw-port ignored\n");
         tls_port = 0;
+        tls_raw_port = 0;
     }
 #endif
 
@@ -919,6 +960,24 @@ int main(int argc, char** argv) {
                     [&](int lfd, std::uint32_t) { accept_loop(lfd, Transport::kWs, /*tls=*/true); });
         std::fprintf(stderr, "[server] WSS listening on %s:%u (TLS)\n",
                      bind_host.c_str(), static_cast<unsigned>(tls_port));
+    }
+
+    // TLS-wrapped raw frames. Same wire format the --port listener
+    // serves (length-prefixed Frame protobufs), just with a TLS layer
+    // below. Lets native clients run on a likely-open port like 443
+    // and look like HTTPS traffic to a passive observer.
+    std::optional<fb::net::Socket> tls_raw_listener;
+    if (tls_raw_port != 0) {
+        if (tls_cert.empty() || tls_key.empty()) {
+            std::fprintf(stderr,
+                "[server] --tls-raw-port requires --tls-cert and --tls-key\n");
+            return 2;
+        }
+        tls_raw_listener = fb::net::tcp_listen(bind_host, tls_raw_port);
+        loop.add_fd(tls_raw_listener->fd(), EPOLLIN,
+                    [&](int lfd, std::uint32_t) { accept_loop(lfd, Transport::kTcp, /*tls=*/true); });
+        std::fprintf(stderr, "[server] TLS-RAW listening on %s:%u (TLS, native clients)\n",
+                     bind_host.c_str(), static_cast<unsigned>(tls_raw_port));
     }
 
     std::fprintf(stderr, "[server] TCP listening on %s:%u\n", bind_host.c_str(),

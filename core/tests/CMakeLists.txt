@@ -11,6 +11,7 @@ add_executable(fb_core_tests
     net/frame_codec_test.cpp
     net/websocket_test.cpp
     store/sqlite_store_test.cpp
+    identity/username_log_test.cpp
     integration/mls_persistence_integration_test.cpp
     ratelimit/token_bucket_test.cpp
     media/sframe_test.cpp
@@ -19,6 +20,7 @@ add_executable(fb_core_tests
     mesh/mqtt_bridge_test.cpp
     p2p/kademlia_test.cpp
     p2p/gossip_test.cpp
+    p2p/provider_records_test.cpp
 )
 
 target_link_libraries(fb_core_tests
