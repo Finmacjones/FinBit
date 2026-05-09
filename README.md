@@ -19,7 +19,7 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 
 - **DMs** — Signal Double Ratchet over libsodium, AES-256-GCM (native) /
   XChaCha20-Poly1305 (WASM, no AES-NI). Server only ever sees ciphertext.
-  86 native tests + 7 web smokes pass.
+  90 native tests + 7 web smokes pass.
 - **Channels** — SenderKeys group encryption. Per-(group, sender) symmetric
   chains with replay rejection, out-of-order delivery, post-eviction key
   invalidation. Invitees join via a `channel_key` DM payload.
@@ -30,13 +30,33 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
   ClientHello + HelloAck. `RegisterReq` enforces claim-pubkey == auth-bound
   pubkey (no cross-binding). Second `Hello` on an authed connection is
   rejected. `USERNAME_TAKEN` `ControlMessage` on conflict.
-- **Voice + video** — 1:1 WebRTC. Web uses browser-native
+- **1:1 voice + video** — Real WebRTC. Web uses browser-native
   `RTCPeerConnection`. Desktop uses GStreamer `webrtcbin`. Both speak
   Opus + VP8 + standard SDP/trickle ICE — they interop. Signaling tunneled
   through the existing Double Ratchet (SDP / ICE never plaintext to the
-  relay or any TURN server).
-- **Persistence** — SQLite (encrypted-at-rest planned). DMs, channels,
-  prekey directory, offline queue all survive a server restart.
+  relay or any TURN server). DTLS-SRTP between peers + an SFrame layer on
+  encoded frames (per-call key derived from X3DH-shared ‖ HKDF(call_id))
+  so a future SFU still couldn't read media.
+- **Channel voice (full-mesh)** — Click `Call` while a channel is
+  selected: the desktop sends `RoomJoin`, the server fans out a
+  `RoomRoster` to every joined participant, and each pair auto-dials a
+  1:1 PeerConnection (glare-tiebreak by pubkey). Lazy session bootstrap:
+  if you've never DM'd a roster member, the client transparently does
+  `username_lookup → key_fetch → init_alice → retry`. Self-mute toggle
+  fans out across every leg. Caps around 5–6 participants until the SFU
+  upgrade lands.
+- **Envelope-level integrity** — `Envelope.aad = envelope_id ‖
+  u64_be(timestamp_ms)` is bound by the inner ratchet/SenderKeys AEAD
+  tag. A relay rewriting either field invalidates the tag; rewriting all
+  three consistently is detected by the receiver's cross-check.
+- **Persistence (encrypted at rest)** — SQLite, with every sensitive
+  column AEAD-wrapped per-row using XChaCha20-Poly1305 keys derived from
+  the vault seed via HKDF (`info = "FinBit-DB-<Table>-v1"`). Inbox,
+  outbox, ratchet sessions, channel state + peer distributions, channel
+  inbox, and the username cache all opaque on disk. `PRAGMA
+  user_version = 3` marks the encrypted schema; opening without a key
+  throws. Migrations from legacy plaintext run inside a single
+  transaction.
 - **WebSocket transport** on the server (`--ws-port`) so browser clients
   connect natively.
 - **P2P** — Kademlia DHT + gossipsub primitives in `core/`. fb-cli has
@@ -52,16 +72,19 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 | Subsystem | Blocker |
 |---|---|
 | MLS group crypto (replaces SenderKeys at scale) | mlspp not yet vendored |
-| SFrame on top of WebRTC (matters once an SFU lands) | DTLS-SRTP is sufficient for current P2P |
-| Group voice / video (SFU) | mediasoup or Janus integration |
+| SFU mode for >6-participant calls | mediasoup or Janus integration; full-mesh works for small rooms today |
 | Android client | NDK not installed in this dev env (Kotlin/Compose scaffold ready) |
+| iOS client | not started |
 
 The full architectural plan (Phases 0–5, libwebrtc story, federation) lives
 in `docs/architecture.md`. The wire protocol is in `docs/protocol-spec.md`.
 The threat model (what FinBit defends against, what it doesn't) is in
-`docs/threat-model.md`. What's intentionally not in v1.0.1 (group SFU, MLS,
-Android, server-side TLS, etc.) is in `docs/ROADMAP.md` with effort
-estimates and rationale.
+`docs/threat-model.md`; a layer-by-layer audit of the current
+implementation — primitives, protocols, at-rest, voice/video, plus a
+canary-grep verification that the server is empirically blind to message
+content — lives in `docs/security-audit.md`. What's intentionally not in
+v1.0.1 (group SFU, MLS, Android, server-side TLS, etc.) is in
+`docs/ROADMAP.md` with effort estimates and rationale.
 
 ---
 
@@ -87,15 +110,15 @@ sudo apt install cmake build-essential libsodium-dev libsqlite3-dev \
 ### 2. Build
 
 ```bash
-cmake -S . -B build/system
-cmake --build build/system -j
-ctest --test-dir build/system --output-on-failure   # 86 native tests
+cmake -S . -B build
+cmake --build build -j
+ctest --test-dir build --output-on-failure   # 90 native tests
 ```
 
 ### 3. Run a local relay
 
 ```bash
-build/system/server/fb_server --port 8765 --ws-port 8766 \
+build/server/fb_server --port 8765 --ws-port 8766 \
                               --offline-db /tmp/fb.db
 ```
 
@@ -109,7 +132,7 @@ You'll see:
 ### 4. Open the desktop client
 
 ```bash
-build/system/client-desktop/fb_desktop
+build/client-desktop/fb_desktop
 ```
 
 The login dialog asks for a username + passphrase the first time; subsequent
@@ -131,11 +154,18 @@ scripts/run-web-dev.sh
 In the browser, sign in with a passphrase, point the WS URL at
 `ws://127.0.0.1:8766`, and click **Connect**.
 
-### 6. Try a DM and a call
+### 6. Try a DM, a call, and a channel
 
 In two clients (any combination of desktop and web), claim distinct
 usernames, click the other peer in the DM list, send a message, and click
 **Call** or **Video**. You should hear / see each other.
+
+For a group voice call: one side clicks `+` and creates a channel, then
+`Invite` and types the other's username. Both peers click the channel,
+both click **Call** — the desktop's full-mesh dialer handshakes a
+PeerConnection between every pair (so a 3-person room is 3 paired calls,
+4-person is 6, etc., capped around 5–6 before bandwidth hurts). Self-
+mute on the call banner is one toggle that fans out across every leg.
 
 ---
 
@@ -144,7 +174,7 @@ usernames, click the other peer in the DM list, send a message, and click
 Bind to all interfaces and let the server print every reachable URL:
 
 ```bash
-build/system/server/fb_server --public --port 8765 --ws-port 8766 \
+build/server/fb_server --public --port 8765 --ws-port 8766 \
                               --offline-db /var/lib/fb.db
 ```
 
@@ -179,12 +209,14 @@ fb.example.com {
 ### Native tests
 
 ```bash
-ctest --test-dir build/system --output-on-failure
+ctest --test-dir build --output-on-failure
 ```
 
-Currently **86 tests** across 18 suites — crypto KAT, ratchet behaviour,
-SenderKeys forge/replay rejection, P2P relay + dedup, server directory,
-serial mesh round-trip, and more.
+Currently **90 tests** across 19 suites — crypto KAT, ratchet behaviour
+(including AAD-tamper rejection), SenderKeys forge/replay rejection,
+SqliteStore at-rest AEAD round-trip + canary-not-on-disk asserts +
+unkeyed-reopen rejection, P2P relay + dedup, server directory, serial
+mesh round-trip, and more.
 
 ### Web smokes
 
@@ -193,7 +225,7 @@ Web smokes are Node.js scripts that drive the WASM module + a real
 
 ```bash
 # Start the server in another terminal:
-build/system/server/fb_server --port 8765 --ws-port 8766
+build/server/fb_server --port 8765 --ws-port 8766
 
 cd client-web
 NODE=~/emsdk/node/22.16.0_64bit/bin/node    # or your system node
@@ -240,7 +272,8 @@ client-desktop/               fb_desktop — Qt6 client with login + calls
 client-web/                   WASM module + Discord-style HTML/CSS/JS UI
 client-mobile-android/        Kotlin/Compose scaffold (NDK pending)
 tools/                        fb-cli, mesh-loopback, e2e shell demos
-docs/                         architecture, protocol-spec, threat-model
+docs/                         architecture, protocol-spec, threat-model,
+                              security-audit (per-layer crypto walkthrough)
 scripts/                      build-wasm, build-libsodium-wasm,
                               build-paho, run-web-dev, etc.
 ```
@@ -254,7 +287,14 @@ subsystem.
 
 - **The server is a blind relay.** Every DM and channel message is opaque to
   it: the AEAD ciphertext, plus a recipient pubkey for routing, plus a
-  sender pubkey for rate limiting.
+  sender pubkey for rate limiting. Verified empirically — every
+  `tools/e2e/*.sh` round-trip greps the server log for a randomized
+  plaintext canary and fails the build if it appears.
+- **Envelope-level metadata is bound by the inner AEAD tag.**
+  `Envelope.aad = envelope_id ‖ u64_be(timestamp_ms)` is fed as
+  `outer_aad` to the inner ratchet/SenderKeys encrypt; receivers
+  cross-check `aad` against the reconstruction. A relay rewriting either
+  field (or substituting all three consistently) is detected.
 - **Identity = Ed25519 keypair.** No usernames, no email — your fingerprint
   (a 10-char Crockford base32) is the durable identifier. Usernames are a
   display affordance the server enforces uniqueness on.
@@ -262,17 +302,30 @@ subsystem.
   ~1.5s) over XChaCha20-Poly1305. KDF params bound into AEAD AAD so the
   vault format itself can't be downgraded by a write-capable attacker. v1
   vaults (104 bytes, no AAD) still readable for migration.
+- **Local SQLite store is encrypted at rest.** Inbox, outbox, ratchet
+  sessions, channel state + peer distributions, channel inbox, and the
+  username cache are AEAD-wrapped per row using XChaCha20-Poly1305 keys
+  derived from the vault seed via HKDF. A stolen data dir without the
+  passphrase yields no message content. `PRAGMA user_version = 3` marks
+  the encrypted schema; opening without a key throws.
+- **Voice + video has two layers.** DTLS-SRTP between peers (mandatory in
+  WebRTC) plus SFrame on encoded audio/video frames, keyed per call from
+  HKDF(X3DH-shared, info="FinBit-SFrame-call-v1-" ‖ hex(call_id)). For
+  v0's full-mesh topology each pair has its own DTLS-SRTP, server sees
+  no media; SFrame matters when an SFU eventually lands.
 - **Username binding is server-enforced.** Anyone with the public key can
   send messages claiming any username they like, but the server will only
   bind a username to one pubkey at a time — second client with a different
   pubkey gets a `USERNAME_TAKEN` `ControlMessage` and gets disconnected.
 - **What's NOT protected (yet):** transport-layer confidentiality (no
   built-in TLS — front the server with a reverse proxy), metadata against
-  the server (it sees who talks to whom and when, just not what), and
-  forward secrecy of channel history (SenderKeys is forward-secret per
-  message; the long-term escape valve is mlspp / RFC 9420 MLS).
+  the server (it sees who talks to whom and when, who's in which voice
+  room, just not what they're saying), and forward secrecy of channel
+  history (SenderKeys is forward-secret per message; the long-term escape
+  valve is mlspp / RFC 9420 MLS).
 
-Full threat model: `docs/threat-model.md`.
+Full threat model: `docs/threat-model.md`. Layer-by-layer audit of the
+implementation: `docs/security-audit.md`.
 
 ---
 
