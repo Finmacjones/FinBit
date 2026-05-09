@@ -19,10 +19,23 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 
 - **DMs** — Signal Double Ratchet over libsodium, AES-256-GCM (native) /
   XChaCha20-Poly1305 (WASM, no AES-NI). Server only ever sees ciphertext.
-  90 native tests + 7 web smokes pass.
-- **Channels** — SenderKeys group encryption. Per-(group, sender) symmetric
-  chains with replay rejection, out-of-order delivery, post-eviction key
-  invalidation. Invitees join via a `channel_key` DM payload.
+  146 native tests + 7 web smokes pass.
+- **Channels** — Two interoperable group-crypto paths:
+  - **SenderKeys** (default) — per-(group, sender) symmetric chains with
+    replay rejection, out-of-order delivery, post-eviction key
+    invalidation. Invitees join via a `channel_key` DM payload.
+  - **MLS / RFC 9420** (opt-in) — vendored
+    [cisco/mlspp](https://github.com/cisco/mlspp) via
+    `scripts/fetch-mlspp.sh` + `cmake -DFB_FEATURE_MLS=ON`. Full A→G
+    pipeline: in-band `MlsInviteRequest → MlsKeyPackage → MlsCommit
+    → MlsWelcome` four-step join, multi-member 2-broadcast Add, MLS
+    application encrypt/decrypt routed through `mls::State`,
+    UI checkbox in the channel-create dialog. Surviving restart via
+    an operation-replay persistence layer above `mls::State` (the
+    only acknowledged limitation in the v0 MLS path is now closed —
+    156 MLS-build tests pass including end-to-end alice/bob
+    restoration after process restart). See
+    `docs/security-audit.md §10` for the design.
 - **Login** — Argon2id-protected identity vault on disk. v2 format binds
   KDF params into AEAD AAD (no downgrade), MODERATE tier (~256 MiB / ~1.5s
   per guess). Vault file is byte-identical between web and desktop.
@@ -59,9 +72,55 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
   transaction.
 - **WebSocket transport** on the server (`--ws-port`) so browser clients
   connect natively.
-- **P2P** — Kademlia DHT + gossipsub primitives in `core/`. fb-cli has
-  `--p2p-create` / `--p2p-listen` modes; 4-peer no-server demo passes
-  (`tools/e2e/p2p_roundtrip.sh`).
+- **TLS transport** — three flavours, all using one OpenSSL link on the
+  server side:
+  - `--tls-port` — TLS-wrapped WebSocket (`wss://`). Browsers from
+    `https://` pages connect without a reverse proxy.
+  - `--tls-raw-port` — TLS-wrapped raw frames. Same wire format as
+    `--port`, just with TLS underneath. Lets fb-cli + the desktop
+    client run on a likely-open port like 443 and look like HTTPS to
+    a passive observer. Client side: fb-cli `--tls / --tls-ca /
+    --tls-insecure-skip-verify / --tls-sni`; the desktop client has
+    a "TLS / (insecure) / CA…" trio in the connect bar.
+  - `tls_client.{hpp,cpp}` — reusable OpenSSL client wrapper with
+    SNI, X509 hostname binding, and a select-driven non-blocking
+    handshake that handles WANT_READ / WANT_WRITE in both
+    directions.
+- **Serverless overlay** — full peer-to-peer username + reachability
+  layer that survives the central server going away:
+  - **Username log** — append-only signed claim log binding usernames
+    to Ed25519 pubkeys. Same shape as Nostr / Sigstore-Rekor: signed
+    events, no consensus, deterministic conflict resolution
+    (smallest valid timestamp wins). Eventually consistent through
+    gossip — late-arriving older claims flip the resolved owner
+    without breaking any rule.
+  - **DHT provider records** — signed `(pubkey → addresses + ttl)`
+    bindings keyed by publisher pubkey. `DhtNode::publish()` sends
+    to the K closest peers in the routing table; `lookup()` queries
+    them and aggregates deduped responses. Wire format keyed by
+    `node_id_from_pubkey = SHA-256(pubkey)[0..20]` (Kademlia
+    convention).
+  - **PeerEnvelope transport** — overlay traffic rides on either
+    (a) the central server's relay (`Frame.peer` with opaque
+    payload; server forwards by recipient pubkey, never parses the
+    contents) or (b) **direct TLS peer-to-peer** via `PeerNet`
+    (each node optionally runs a TLS listener; outbound dials go
+    through a connection pool). Wire format is the same on both
+    paths so the receiver-side dispatch is unchanged. ChatClient
+    prefers direct-P2P when the peer.addr is a dialable
+    `wss://...`; falls back to server-relay otherwise.
+  - **Bootstrap loader** — `~/.finbit/bootstrap.txt` (or
+    `$FB_BOOTSTRAP_FILE` / XDG / `/etc/finbit/`) seeds the routing
+    table on startup. One peer per line: `<hex-pubkey-32>  <addr>`
+    with `#` comments allowed.
+  - **Periodic cadence** — `republish_self` rotates our own
+    provider record before its TTL expires (default every 30
+    minutes; TTL is 1 hour). `gossip_pull_round` walks every
+    routing-table peer and `sync_with`s from a per-peer
+    high-watermark every 5 minutes.
+- **P2P (legacy)** — Kademlia DHT + gossipsub primitives in `core/`.
+  fb-cli has `--p2p-create` / `--p2p-listen` modes; 4-peer no-server
+  demo passes (`tools/e2e/p2p_roundtrip.sh`).
 - **Mesh bridge (serial)** — POSIX `termios` + brotli, fits a typical
   chat line in one ~200-byte LoRa frame.
 - **MQTT bridge** — Eclipse Paho C++ vendored under `third_party/`,
@@ -71,10 +130,11 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 
 | Subsystem | Blocker |
 |---|---|
-| MLS group crypto (replaces SenderKeys at scale) | foundation is in: vendored mlspp via `scripts/fetch-mlspp.sh`, opt-in build via `cmake -DFB_FEATURE_MLS=ON`, single-member round-trip works. Multi-member welcome/commit, DmPayload MLS variants, and the SenderKeys → MLS migration are the remaining steps. |
 | SFU mode for >6-participant calls | mediasoup or Janus integration; full-mesh works for small rooms today |
 | Android client | NDK not installed in this dev env (Kotlin/Compose scaffold ready) |
 | iOS client | not started |
+| Mutual-TLS for peer authentication | `PeerNet` currently lets the sender self-stamp their `sender_pubkey`. Signed records (DHT + username log) make it a routing hint not a trust claim, but a stricter binding (peer cert pinned to the identity Ed25519) would prevent peers from impersonating each other for routing-table updates. |
+| Desktop UI for `PeerNet` config | currently env-var driven (`FB_PEER_LISTEN_PORT/CERT/KEY`, `FB_PEER_DIALER_*`, `FB_PEER_PUBLIC_ADDR`). A "Network…" preferences panel is a small follow-up. |
 
 The full architectural plan (Phases 0–5, libwebrtc story, federation) lives
 in `docs/architecture.md`. The wire protocol is in `docs/protocol-spec.md`.
@@ -83,7 +143,7 @@ The threat model (what FinBit defends against, what it doesn't) is in
 implementation — primitives, protocols, at-rest, voice/video, plus a
 canary-grep verification that the server is empirically blind to message
 content — lives in `docs/security-audit.md`. What's intentionally not in
-v1.0.1 (group SFU, MLS, Android, server-side TLS, etc.) is in
+v1.x (SFU, mobile clients, mutual-TLS for peer auth, etc.) is in
 `docs/ROADMAP.md` with effort estimates and rationale.
 
 ---
@@ -112,7 +172,16 @@ sudo apt install cmake build-essential libsodium-dev libsqlite3-dev \
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # 90 native tests
+ctest --test-dir build --output-on-failure   # 146 native tests
+```
+
+For the MLS opt-in path:
+
+```bash
+scripts/fetch-mlspp.sh                       # vendor + apply patches
+cmake -S . -B build-mls -DFB_FEATURE_MLS=ON
+cmake --build build-mls -j
+ctest --test-dir build-mls --output-on-failure   # 156 native tests
 ```
 
 ### 3. Run a local relay
@@ -209,14 +278,36 @@ fb.example.com {
 ### Native tests
 
 ```bash
-ctest --test-dir build --output-on-failure
+ctest --test-dir build --output-on-failure       # 146 tests, default
+ctest --test-dir build-mls --output-on-failure   # 156 tests, FB_FEATURE_MLS=ON
 ```
 
-Currently **90 tests** across 19 suites — crypto KAT, ratchet behaviour
-(including AAD-tamper rejection), SenderKeys forge/replay rejection,
-SqliteStore at-rest AEAD round-trip + canary-not-on-disk asserts +
-unkeyed-reopen rejection, P2P relay + dedup, server directory, serial
-mesh round-trip, and more.
+The default build covers crypto KAT, ratchet behaviour (including
+AAD-tamper rejection), SenderKeys forge/replay rejection, SqliteStore
+at-rest AEAD round-trip + canary-not-on-disk asserts + unkeyed-reopen
+rejection, P2P relay + dedup, server directory, serial mesh
+round-trip, **DhtNode publish/lookup over an in-process bridge**,
+**UsernameGossip pull/push convergence**, **PeerNet TLS round-trip
+across two loopback instances** (skipped when `openssl(1)` isn't on
+PATH), bootstrap-file parser, plus the rest.
+
+The MLS build adds 10 more tests — `MlsFacade` for the wrapper layer
+(create / two-member add / three-member multi-broadcast / persistence
+seed + log replay), the matching `TmpDb.MlsGroup*` SQLite-table
+round-trips, and `MlsPersistTmpDb` integration tests that simulate a
+process restart and assert byte-equivalent post-restore behaviour.
+
+ASan + UBSan are clean against the same suite (one pre-existing
+timing-sensitive `TokenBucket.NeverExceedsBurst` excluded — not a
+regression):
+
+```bash
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -g'
+cmake --build build-asan --target fb_core_tests -j
+ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan \
+    -E TokenBucket.NeverExceedsBurst --output-on-failure
+```
 
 ### Web smokes
 
@@ -253,12 +344,20 @@ a randomized plaintext marker never appears in any relay's logs:
 ```bash
 tools/e2e/dm_roundtrip.sh                       # 1:1 DM via Double Ratchet
 tools/e2e/channel_inband_roundtrip.sh           # channel via DM-delivered SenderKeys
+tools/e2e/legacy_channel_file_mode_roundtrip.sh # channel join via shared dist file
 tools/e2e/p2p_roundtrip.sh                      # 4-peer P2P, no central server
 tools/e2e/offline_persist.sh                    # queued DM survives restart
 tools/e2e/server_persist_full.sh                # directory + prekeys + queue persist
 tools/e2e/username_resolve.sh                   # pubkey → username resolution
 tools/e2e/web_dm_roundtrip.sh                   # browser-style WebSocket DM
+tools/e2e/wss_dm_roundtrip.sh                   # full TLS round-trip via --tls-raw-port
+tools/e2e/peer_envelope_relay.sh                # PeerEnvelope (DHT/gossip) via central
+                                                # server's Frame.peer relay
 ```
+
+Each spins up its own `fb_server`, generates ephemeral certs where
+needed, and asserts a randomized plaintext marker never appears in
+the relay's logs.
 
 ---
 
@@ -317,12 +416,26 @@ subsystem.
   send messages claiming any username they like, but the server will only
   bind a username to one pubkey at a time — second client with a different
   pubkey gets a `USERNAME_TAKEN` `ControlMessage` and gets disconnected.
-- **What's NOT protected (yet):** transport-layer confidentiality (no
-  built-in TLS — front the server with a reverse proxy), metadata against
-  the server (it sees who talks to whom and when, who's in which voice
-  room, just not what they're saying), and forward secrecy of channel
-  history (SenderKeys is forward-secret per message; the long-term escape
-  valve is mlspp / RFC 9420 MLS).
+- **Transport-layer confidentiality is now built in.** Server has
+  `--tls-port` (browser WSS) and `--tls-raw-port` (native clients
+  including fb-cli + the desktop app). Both validate certs against
+  the system trust store by default; the desktop UI has a CA
+  picker for custom-CA pinning, plus an "(insecure)" escape hatch
+  for self-signed dev servers. Reverse proxy is no longer required
+  for end-to-end encryption to work over a hostile network.
+- **Group forward secrecy** has the long-term answer: MLS (RFC 9420)
+  ships behind `cmake -DFB_FEATURE_MLS=ON` with a UI checkbox
+  ("Create with MLS encryption?"). Operation-replay persistence
+  layer keeps MLS channels usable across restarts (closed §10
+  gap; see `docs/security-audit.md`).
+- **What's still NOT protected:** metadata against the server (it
+  sees who talks to whom and when, who's in which voice room — just
+  not what they're saying). The serverless overlay (`PeerNet` direct
+  P2P + DHT + username log gossip) is the way out: when both peers
+  have dialable addresses (`FB_PEER_PUBLIC_ADDR`), DHT/gossip
+  traffic skips the central server entirely. The central server
+  remains an optional fallback for unreachable peers, never sees
+  envelope contents.
 
 Full threat model: `docs/threat-model.md`. Layer-by-layer audit of the
 implementation: `docs/security-audit.md`.
