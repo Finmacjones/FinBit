@@ -72,7 +72,13 @@ CREATE TABLE IF NOT EXISTS srv_prekey_bundles (
 CREATE TABLE IF NOT EXISTS chan_state (
     name       TEXT PRIMARY KEY,
     channel_id BLOB NOT NULL,
-    own_dist   BLOB
+    own_dist   BLOB,
+    -- Per-channel cipher discriminator. 0 = SenderKeys (legacy/default),
+    -- 1 = MLS (RFC 9420 via mlspp). Old DBs without this column read back
+    -- as 0 thanks to ALTER TABLE ... DEFAULT 0 below — added in a
+    -- migration pass that's idempotent (CREATE IF NOT EXISTS makes the
+    -- ALTER necessary on upgrades).
+    crypto     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS chan_peers (
     channel_id BLOB NOT NULL,
@@ -243,6 +249,18 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
         throw_sqlite("open", s->impl_->db);
     }
     s->impl_->exec(kSchema);
+    // Idempotent column adds for legacy DBs created before each MLS-
+    // related column shipped. SQLite's CREATE TABLE IF NOT EXISTS
+    // can't extend an existing table; ALTER TABLE ADD COLUMN is the
+    // standard pattern. Each ALTER is wrapped in a try/swallow because
+    // SQLite returns SQLITE_ERROR (and our exec() throws) when the
+    // column already exists, and we want the call to be safely
+    // re-runnable on every open.
+    auto try_add_column = [&](const char* sql) {
+        try { s->impl_->exec(sql); } catch (const std::exception&) {}
+    };
+    try_add_column(
+        "ALTER TABLE chan_state ADD COLUMN crypto INTEGER NOT NULL DEFAULT 0;");
     s->impl_->exec("PRAGMA journal_mode = WAL;");
     s->impl_->exec("PRAGMA synchronous = NORMAL;");
 
@@ -724,7 +742,8 @@ std::optional<std::vector<std::uint8_t>> SqliteStore::srv_get_prekey_bundle(
 }
 
 void SqliteStore::chan_save(const std::string& name, std::span<const std::uint8_t> channel_id,
-                             std::span<const std::uint8_t> own_dist) {
+                             std::span<const std::uint8_t> own_dist,
+                             ChannelCrypto crypto) {
     std::vector<std::uint8_t> wrapped;
     std::span<const std::uint8_t> stored = own_dist;
     if (impl_->encrypt_at_rest && !own_dist.empty()) {
@@ -734,18 +753,22 @@ void SqliteStore::chan_save(const std::string& name, std::span<const std::uint8_
         stored = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
     }
     auto* stmt = impl_->prep(
-        "INSERT INTO chan_state(name, channel_id, own_dist) VALUES(?, ?, ?) "
+        "INSERT INTO chan_state(name, channel_id, own_dist, crypto) "
+        "VALUES(?, ?, ?, ?) "
         "ON CONFLICT(name) DO UPDATE SET channel_id = excluded.channel_id, "
-        "own_dist = excluded.own_dist;");
+        "own_dist = excluded.own_dist, crypto = excluded.crypto;");
     sqlite3_bind_text(stmt, 1, name.c_str(), -1, SQLITE_TRANSIENT);
     bind_blob(stmt, 2, channel_id);
     bind_blob(stmt, 3, stored);
+    sqlite3_bind_int(stmt, 4, static_cast<int>(crypto));
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
 }
 
 std::vector<SqliteStore::ChannelRow> SqliteStore::chan_list() const {
-    auto* stmt = impl_->prep("SELECT name, channel_id, own_dist FROM chan_state ORDER BY name;");
+    auto* stmt = impl_->prep(
+        "SELECT name, channel_id, own_dist, crypto FROM chan_state "
+        "ORDER BY name;");
     std::vector<ChannelRow> out;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         ChannelRow r;
@@ -764,6 +787,8 @@ std::vector<SqliteStore::ChannelRow> SqliteStore::chan_list() const {
         } else {
             r.own_dist = std::move(stored);
         }
+        const int c = sqlite3_column_int(stmt, 3);
+        r.crypto = (c == 1) ? ChannelCrypto::kMls : ChannelCrypto::kSenderKeys;
         out.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);

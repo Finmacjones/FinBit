@@ -56,6 +56,27 @@ std::vector<std::uint8_t> from_mls_bytes(const bytes& in) {
     return std::vector<std::uint8_t>(in.begin(), in.end());
 }
 
+// Joiner-side wrapper around mls::Client + PendingJoin. Holds the
+// generated mls::PendingJoin between key_package() publication and
+// complete(welcome). Single-use; complete() moves the underlying
+// state into the hydrated Session.
+class PendingMlsJoinImpl final : public PendingMlsJoin {
+public:
+    PendingMlsJoinImpl(Client client, PendingJoin pending)
+        : client_(std::move(client)), pending_(std::move(pending)) {}
+
+    std::vector<std::uint8_t> key_package() const override {
+        return from_mls_bytes(pending_.key_package());
+    }
+
+    std::unique_ptr<MlsGroup> complete(
+        std::span<const std::uint8_t> welcome) override;
+
+private:
+    Client      client_;     // kept alive so the credential outlives the join
+    PendingJoin pending_;
+};
+
 // PIMPL holding the live mlspp Session. Every MlsGroup method delegates
 // here. The shape mirrors the public interface 1:1.
 class MlsGroupImpl final : public MlsGroup {
@@ -65,7 +86,16 @@ public:
     AddResult add_member(std::span<const std::uint8_t> key_package) override {
         auto kp_bytes = to_mls_bytes(key_package);
         auto proposal = session_.add(kp_bytes);
-        auto [commit_b, welcome_b] = session_.commit({proposal});
+        // mls::Session::commit returns (welcome, commit) in THAT order,
+        // not (commit, welcome) — easy to get backwards.
+        auto [welcome_b, commit_b] = session_.commit({proposal});
+        // mls::Session caches the post-commit State in an internal
+        // outbound_cache keyed by the commit bytes; nothing actually
+        // advances our own epoch until we feed the commit back through
+        // handle(). Without this our member_count() stays at the old
+        // value and subsequent application_encrypt produces ciphertext
+        // the new member can't decrypt.
+        session_.handle(commit_b);
         AddResult r;
         r.welcome = from_mls_bytes(welcome_b);
         r.commit  = from_mls_bytes(commit_b);
@@ -74,7 +104,8 @@ public:
 
     std::vector<std::uint8_t> remove_member(std::uint32_t leaf_index) override {
         auto proposal = session_.remove(leaf_index);
-        auto [commit_b, _welcome] = session_.commit({proposal});
+        auto [_welcome, commit_b] = session_.commit({proposal});
+        session_.handle(commit_b);   // same self-apply as add_member
         return from_mls_bytes(commit_b);
     }
 
@@ -123,6 +154,12 @@ private:
 
 }  // namespace
 
+std::unique_ptr<MlsGroup> PendingMlsJoinImpl::complete(
+    std::span<const std::uint8_t> welcome) {
+    auto session = pending_.complete(to_mls_bytes(welcome));
+    return std::make_unique<MlsGroupImpl>(std::move(session));
+}
+
 std::unique_ptr<MlsGroup> MlsGroup::create(
     std::span<const std::uint8_t, 32> creator_identity,
     std::span<const std::uint8_t, 32> group_id) {
@@ -148,6 +185,17 @@ std::unique_ptr<MlsGroup> MlsGroup::from_blob(std::span<const std::uint8_t>) {
         "MlsGroup::from_blob: at-rest restore not yet wired");
 }
 
+std::unique_ptr<PendingMlsJoin> MlsGroup::start_join(
+    std::span<const std::uint8_t, 32> joiner_identity) {
+    const auto suite = CipherSuite{ kSuiteId };
+    auto sig_priv = SignaturePrivateKey::generate(suite);
+    auto cred = Credential::basic(to_mls_bytes(joiner_identity));
+    Client client(suite, sig_priv, cred);
+    auto pending = client.start_join();
+    return std::make_unique<PendingMlsJoinImpl>(std::move(client),
+                                                 std::move(pending));
+}
+
 }  // namespace fb::crypto
 
 #else  // FB_HAVE_MLS == 0
@@ -168,6 +216,11 @@ std::unique_ptr<MlsGroup> MlsGroup::create(std::span<const std::uint8_t, 32>,
 
 std::unique_ptr<MlsGroup> MlsGroup::from_blob(std::span<const std::uint8_t>) {
     unimpl("from_blob");
+}
+
+std::unique_ptr<PendingMlsJoin> MlsGroup::start_join(
+    std::span<const std::uint8_t, 32>) {
+    unimpl("start_join");
 }
 
 }  // namespace fb::crypto

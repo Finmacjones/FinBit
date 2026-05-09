@@ -133,6 +133,8 @@ TEST_F(TmpDb, ChannelStateAndPeers) {
     EXPECT_EQ(rows[0].name, "general");
     EXPECT_EQ(rows[0].channel_id, cid);
     EXPECT_EQ(rows[0].own_dist, own);
+    // Default crypto is SenderKeys when not specified explicitly.
+    EXPECT_EQ(rows[0].crypto, fb::store::SqliteStore::ChannelCrypto::kSenderKeys);
 
     auto peer = bytes({0xb});
     auto peer_dist = bytes({2, 3, 4});
@@ -141,6 +143,34 @@ TEST_F(TmpDb, ChannelStateAndPeers) {
     ASSERT_EQ(peers.size(), 1u);
     EXPECT_EQ(peers[0].peer_pub, peer);
     EXPECT_EQ(peers[0].peer_dist, peer_dist);
+}
+
+// Per-channel crypto column round-trips. New MLS channels read back
+// as kMls; legacy SenderKeys stays the default; the column survives a
+// reopen (single-process re-open the same path).
+TEST_F(TmpDb, ChannelCryptoRoundTripsAcrossReopen) {
+    auto cid_mls = bytes({0x01, 0x02});
+    auto cid_sk  = bytes({0x03, 0x04});
+    auto own = bytes({1, 2, 3});
+    {
+        auto s = fb::store::SqliteStore::open(path);
+        s->chan_save("mls-room", span_of(cid_mls), span_of(own),
+                     fb::store::SqliteStore::ChannelCrypto::kMls);
+        s->chan_save("sk-room", span_of(cid_sk), span_of(own),
+                     fb::store::SqliteStore::ChannelCrypto::kSenderKeys);
+    }
+    auto s = fb::store::SqliteStore::open(path);
+    auto rows = s->chan_list();
+    ASSERT_EQ(rows.size(), 2u);
+    auto by_name = [&](const std::string& nm) {
+        for (const auto& r : rows) if (r.name == nm) return r;
+        ADD_FAILURE() << "no row for " << nm;
+        return fb::store::SqliteStore::ChannelRow{};
+    };
+    EXPECT_EQ(by_name("mls-room").crypto,
+              fb::store::SqliteStore::ChannelCrypto::kMls);
+    EXPECT_EQ(by_name("sk-room").crypto,
+              fb::store::SqliteStore::ChannelCrypto::kSenderKeys);
 }
 
 TEST_F(TmpDb, ChannelInboxOrdering) {

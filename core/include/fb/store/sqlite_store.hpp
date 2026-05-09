@@ -137,14 +137,26 @@ public:
         std::span<const std::uint8_t> owner_pub) const;
 
     // ---- client-side channel persistence (Phase 1.5) ---------------------
+    // Per-channel cipher discriminator. Old channels created before MLS
+    // landed have no `crypto` column on disk → read back as kSenderKeys
+    // (= 0). New channels can be created with kMls; the inbound channel
+    // envelope path branches on this value to pick the right decoder.
+    enum class ChannelCrypto : int {
+        kSenderKeys = 0,
+        kMls        = 1,
+    };
+
     // A "channel" row holds the user-facing name and 32-byte channel id, plus
-    // our own SenderKeysDistribution blob (the chain we use for sending).
+    // our own SenderKeysDistribution blob (the chain we use for sending) and
+    // the per-channel cipher discriminator.
     void chan_save(const std::string& name, std::span<const std::uint8_t> channel_id,
-                   std::span<const std::uint8_t> own_dist);
+                   std::span<const std::uint8_t> own_dist,
+                   ChannelCrypto crypto = ChannelCrypto::kSenderKeys);
     struct ChannelRow {
         std::string               name;
         std::vector<std::uint8_t> channel_id;
         std::vector<std::uint8_t> own_dist;
+        ChannelCrypto             crypto = ChannelCrypto::kSenderKeys;
     };
     [[nodiscard]] std::vector<ChannelRow> chan_list() const;
 

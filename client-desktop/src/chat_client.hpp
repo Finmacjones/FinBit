@@ -56,12 +56,32 @@ public:
     // but DON'T write a distribution file or DM any peer. This is the
     // initial "+" flow in the desktop UI: the user creates the channel,
     // then optionally invites peers separately via invite_peer_to_channel().
-    void create_local_channel(const QString& name);
+    //
+    // `use_mls` opts the channel into RFC 9420 MLS encryption instead of
+    // SenderKeys. For an MLS channel the SenderKeys distribution is
+    // still generated (it's harmless and lets the channel fall back to
+    // SenderKeys if a peer has no MLS support yet) but the per-channel
+    // crypto flag is recorded so the receive path can pick the right
+    // decoder when MLS-protected envelopes start arriving. Only honoured
+    // when fb_core was built with FB_FEATURE_MLS=ON; on a stub build
+    // the flag is recorded but every actual MLS operation throws and
+    // SenderKeys remains the runtime cipher.
+    void create_local_channel(const QString& name, bool use_mls = false);
 
     // In-band invite: create the channel locally if needed, then DM the
     // current SenderKeysDistribution to `peer` so they can decrypt future
     // channel messages without exchanging a file.
     void invite_peer_to_channel(const QString& channel_name, const QString& peer);
+
+    // MLS-channel invite. Sends an MlsInviteRequest to `peer` over the
+    // existing pairwise Double Ratchet; the receiver's auto-responder
+    // (wired in chat_client.cpp's mlsInviteRequestReceived handler)
+    // generates a PendingMlsJoin, replies with their KeyPackage, and
+    // we close the loop with add_member + Welcome (also auto). The
+    // channel must already exist locally as an MLS channel
+    // (created via create_local_channel(name, /*use_mls=*/true)).
+    void invite_peer_to_mls_channel(const QString& channel_name,
+                                     const QString& peer);
 
     // Leave a channel: send ChannelUnsubscribe to the server, drop in-memory
     // state, and forget all on-disk traces (chan_state, chan_peers, chan_inbox,
@@ -86,6 +106,37 @@ public:
     // currently this just plumbs the protocol).
     void join_channel_call(const QString& channel_name, bool with_video);
     void leave_channel_call(const QString& channel_name);
+
+    // MLS (RFC 9420) handshake — DM-delivered protocol messages that
+    // ride the same Double Ratchet machinery as text. The four-step
+    // in-band invite is:
+    //   1. Inviter calls send_mls_invite_request(joiner, channel_id,
+    //      channel_name).
+    //   2. Joiner sees mlsInviteRequestReceived, generates a
+    //      PendingMlsJoin via MlsGroup::start_join, and replies with
+    //      send_mls_key_package(inviter, channel_id, kp_bytes).
+    //   3. Inviter sees mlsKeyPackageReceived, calls add_member, and
+    //      replies with send_mls_welcome(joiner, channel_id, name,
+    //      welcome_bytes). For each EXISTING member they also call
+    //      send_mls_commit(member, channel_id, commit_bytes).
+    //   4. Joiner sees mlsWelcomeReceived and calls
+    //      PendingMlsJoin::complete(welcome).
+    // The wiring in this header just plumbs each message through the
+    // ratchet — actually orchestrating an MlsGroup on top of the
+    // signals lives in the migration step (#157).
+    void send_mls_invite_request(const QString& peer,
+                                  const QByteArray& channel_id,
+                                  const QString& channel_name);
+    void send_mls_key_package(const QString& peer,
+                               const QByteArray& channel_id,
+                               const QByteArray& key_package);
+    void send_mls_welcome(const QString& peer,
+                           const QByteArray& channel_id,
+                           const QString& channel_name,
+                           const QByteArray& welcome);
+    void send_mls_commit(const QString& peer,
+                          const QByteArray& channel_id,
+                          const QByteArray& commit);
 
     // Mute / un-mute outbound audio on every active call. Affects both
     // 1:1 calls and every mesh leg simultaneously — the user clicking
@@ -130,6 +181,18 @@ public:
 signals:
     void connected(QString fingerprint);
     void log(QString line);
+    // MLS handshake inbound — one signal per DmPayload variant. The
+    // chat client just surfaces these; orchestration (calling
+    // MlsGroup::add_member, completing PendingMlsJoin, applying
+    // commits, broadcasting to existing members) lives outside.
+    void mlsInviteRequestReceived(QString peerFingerprint, QByteArray channelId,
+                                    QString channelName);
+    void mlsKeyPackageReceived(QString peerFingerprint, QByteArray channelId,
+                                QByteArray keyPackage);
+    void mlsWelcomeReceived(QString peerFingerprint, QByteArray channelId,
+                              QString channelName, QByteArray welcome);
+    void mlsCommitReceived(QString peerFingerprint, QByteArray channelId,
+                             QByteArray commit);
     // Inbound DM. `peerUsername` is the resolved registered username if the
     // local cache has it (so the UI can file the message under "dm:<user>"
     // immediately rather than under the fingerprint and migrating later);

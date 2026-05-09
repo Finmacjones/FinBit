@@ -25,6 +25,8 @@
 
 namespace fb::crypto {
 
+class PendingMlsJoin;
+
 class MlsGroup {
 public:
     // Create a brand-new MLS group. `creator_identity` is this user's
@@ -35,6 +37,17 @@ public:
 
     // Re-hydrate an MLS group from a persisted opaque blob.
     [[nodiscard]] static std::unique_ptr<MlsGroup> from_blob(std::span<const std::uint8_t> blob);
+
+    // Start the join half of the add_member flow. Produces a stateful
+    // PendingMlsJoin: the joiner generates a KeyPackage to publish,
+    // hands it to the inviter (over a Double Ratchet DM in our wire
+    // format), waits for the inviter to broadcast a Welcome, then
+    // calls PendingMlsJoin::complete(welcome) to materialize the
+    // hydrated MlsGroup. Until complete() runs the joiner has no
+    // group state — they're just waiting on a Welcome that may or may
+    // not arrive.
+    [[nodiscard]] static std::unique_ptr<PendingMlsJoin> start_join(
+        std::span<const std::uint8_t, 32> joiner_identity);
 
     virtual ~MlsGroup() = default;
 
@@ -68,6 +81,28 @@ public:
 
     // Number of members currently in the group.
     [[nodiscard]] virtual std::size_t member_count() const = 0;
+};
+
+// Joiner-side state: holds the freshly-generated mls::Client +
+// PendingJoin between key-package publication and Welcome receipt.
+// Single-use: complete() consumes the join and returns the hydrated
+// MlsGroup. Process-local (not persisted across restarts) — if the
+// user restarts before a Welcome arrives, they call start_join again
+// and republish a fresh KeyPackage.
+class PendingMlsJoin {
+public:
+    virtual ~PendingMlsJoin() = default;
+
+    // Bytes the joiner must publish to the inviter (typically wrapped
+    // in a DmPayload.mls_key_package on FinBit's wire). The same
+    // KeyPackage MUST be used for the matching complete() — mlspp
+    // pairs the KP's HPKE init key with the Welcome's encryption.
+    [[nodiscard]] virtual std::vector<std::uint8_t> key_package() const = 0;
+
+    // Hydrate the MlsGroup from the inviter's Welcome. Throws if the
+    // Welcome was generated for a different KeyPackage than ours.
+    [[nodiscard]] virtual std::unique_ptr<MlsGroup> complete(
+        std::span<const std::uint8_t> welcome) = 0;
 };
 
 }  // namespace fb::crypto

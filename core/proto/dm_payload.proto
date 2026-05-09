@@ -50,10 +50,64 @@ message MediaSignal {
     uint32 epoch   = 4;   // for SFRAME_KEY rotations; ignored otherwise
 }
 
+// MLS (RFC 9420) handshake bytes wrapped for delivery via the Double
+// Ratchet DM. Four variants make up the in-band invite flow:
+//
+//   MlsInviteRequest — inviter → joiner. Kicks off the three-step
+//     handshake: "I want to add you to #channel via MLS, please
+//     publish a KeyPackage targeted at this channel_id". Joiner's
+//     client (when it ships an auto-responder) replies with an
+//     MlsKeyPackage; if no responder is wired, the joiner sees a
+//     UI prompt and clicks "send my KP".
+//
+//   MlsKeyPackage — joiner → inviter. The joiner has called
+//     MlsGroup::start_join() and exports a KeyPackage; they DM it to
+//     the user who's running the channel so that user can call
+//     add_member. The KP is the joiner's HPKE init key + signed
+//     leaf; mlspp parses it via tls::get<KeyPackage>.
+//
+//   MlsWelcome — inviter → joiner. After add_member, the inviter
+//     unwraps {welcome, commit} and sends the welcome bytes here.
+//     The joiner feeds them to PendingMlsJoin::complete to hydrate
+//     the group.
+//
+//   MlsCommit — inviter → existing members (other than themselves).
+//     Channel envelopes already broadcast to subscribers; this
+//     variant rides the DM ratchet so each existing member can apply
+//     the commit and roll their own State to the new epoch. (Once
+//     channel envelopes carry an MLS-application discriminator we
+//     can move commits onto the channel envelope path too — for now
+//     DM keeps the receiver side simple.)
+//
+// All four carry a `channel_id` so the receiver knows which MLS
+// group to apply the bytes to without needing to peek at the MLS
+// payload itself.
+message MlsInviteRequest {
+    bytes  channel_id   = 1;
+    string channel_name = 2;   // for the joiner's UI prompt
+}
+message MlsKeyPackage {
+    bytes channel_id  = 1;   // 32-byte channel/group id the joiner targets
+    bytes key_package = 2;   // tls::marshal output from PendingMlsJoin
+}
+message MlsWelcome {
+    bytes  channel_id   = 1;
+    string channel_name = 2;   // for UI sidebar; same role as ChannelKeyDistribution.channel_name
+    bytes  welcome      = 3;   // tls::marshal of the mls::Welcome
+}
+message MlsCommit {
+    bytes channel_id = 1;
+    bytes commit     = 2;
+}
+
 message DmPayload {
     oneof body {
-        string                  text         = 1;
-        ChannelKeyDistribution  channel_key  = 2;
-        MediaSignal             media_signal = 3;
+        string                  text               = 1;
+        ChannelKeyDistribution  channel_key        = 2;
+        MediaSignal             media_signal       = 3;
+        MlsInviteRequest        mls_invite_request = 4;
+        MlsKeyPackage           mls_key_package    = 5;
+        MlsWelcome              mls_welcome        = 6;
+        MlsCommit               mls_commit         = 7;
     }
 }

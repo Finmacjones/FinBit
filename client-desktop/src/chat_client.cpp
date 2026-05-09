@@ -35,6 +35,7 @@
 #include "fb/crypto/identity.hpp"
 #include "fb/crypto/ratchet.hpp"
 #include "fb/crypto/sender_keys.hpp"
+#include "fb/crypto/mls_facade.hpp"
 #include "media_call.hpp"
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
@@ -138,6 +139,14 @@ std::vector<std::uint8_t> envelope_aad_bytes(
 struct PendingSend {
     std::string peer;
     std::string text;
+    // Optional pre-packed DmPayload bytes — used by MLS handshake
+    // sends (mls_invite_request / mls_key_package / mls_welcome /
+    // mls_commit) so they ride the same Double Ratchet machinery as
+    // regular text DMs without needing a parallel queue. When set,
+    // the worker encrypts these bytes verbatim instead of calling
+    // pack_text_payload(text). text is left empty in that case.
+    std::vector<std::uint8_t> pre_packed_payload;
+    bool has_pre_packed() const { return !pre_packed_payload.empty(); }
 };
 
 struct PendingChannelOp {
@@ -151,6 +160,7 @@ struct PendingChannelOp {
     std::string text;        // for send
     std::string peer;        // for invite
     bool        want_video = false;   // for kRoomJoin
+    bool        use_mls    = false;   // for kCreateLocal — opt into MLS at create time
 };
 
 // Outbound media-signal sends (OFFER/ANSWER/ICE/HANGUP/SFRAME_KEY) get
@@ -210,6 +220,54 @@ std::vector<std::uint8_t> pack_channel_key_payload(
     return out;
 }
 
+// MLS handshake packers — wrap each variant in a DmPayload for delivery
+// via the existing pairwise Double Ratchet. The four variants are
+// individually small (a KeyPackage is ~700B with the X25519 cipher
+// suite); they sit alongside ChannelKeyDistribution as in-band channel
+// management messages. See dm_payload.proto for the role of each.
+std::vector<std::uint8_t> pack_mls_invite_request_payload(
+    std::span<const std::uint8_t> channel_id, const std::string& channel_name) {
+    fb::proto::DmPayload p;
+    auto* m = p.mutable_mls_invite_request();
+    m->set_channel_id(std::string(channel_id.begin(), channel_id.end()));
+    m->set_channel_name(channel_name);
+    std::vector<std::uint8_t> out(p.ByteSizeLong());
+    if (!p.SerializeToArray(out.data(), static_cast<int>(out.size()))) out.clear();
+    return out;
+}
+std::vector<std::uint8_t> pack_mls_key_package_payload(
+    std::span<const std::uint8_t> channel_id, std::span<const std::uint8_t> kp) {
+    fb::proto::DmPayload p;
+    auto* m = p.mutable_mls_key_package();
+    m->set_channel_id(std::string(channel_id.begin(), channel_id.end()));
+    m->set_key_package(std::string(kp.begin(), kp.end()));
+    std::vector<std::uint8_t> out(p.ByteSizeLong());
+    if (!p.SerializeToArray(out.data(), static_cast<int>(out.size()))) out.clear();
+    return out;
+}
+std::vector<std::uint8_t> pack_mls_welcome_payload(
+    std::span<const std::uint8_t> channel_id, const std::string& channel_name,
+    std::span<const std::uint8_t> welcome) {
+    fb::proto::DmPayload p;
+    auto* m = p.mutable_mls_welcome();
+    m->set_channel_id(std::string(channel_id.begin(), channel_id.end()));
+    m->set_channel_name(channel_name);
+    m->set_welcome(std::string(welcome.begin(), welcome.end()));
+    std::vector<std::uint8_t> out(p.ByteSizeLong());
+    if (!p.SerializeToArray(out.data(), static_cast<int>(out.size()))) out.clear();
+    return out;
+}
+std::vector<std::uint8_t> pack_mls_commit_payload(
+    std::span<const std::uint8_t> channel_id, std::span<const std::uint8_t> commit) {
+    fb::proto::DmPayload p;
+    auto* m = p.mutable_mls_commit();
+    m->set_channel_id(std::string(channel_id.begin(), channel_id.end()));
+    m->set_commit(std::string(commit.begin(), commit.end()));
+    std::vector<std::uint8_t> out(p.ByteSizeLong());
+    if (!p.SerializeToArray(out.data(), static_cast<int>(out.size()))) out.clear();
+    return out;
+}
+
 std::array<std::uint8_t, 32> channel_id_from_name(const std::string& name) {
     std::array<std::uint8_t, 32> id{};
     crypto_generichash(id.data(), id.size(),
@@ -237,6 +295,23 @@ struct ChannelState {
     std::vector<std::uint8_t>         own_dist;       // serialized SenderKeysDistribution
     std::unique_ptr<fb::crypto::GroupSession> session = std::make_unique<fb::crypto::GroupSession>();
     bool                              subscribed = false;
+    // Per-channel cipher discriminator. Default stays SenderKeys so
+    // existing channels created before MLS landed don't change
+    // semantics on restore. New channels can be created with kMls via
+    // create_local_channel(name, /*use_mls=*/true).
+    fb::store::SqliteStore::ChannelCrypto crypto =
+        fb::store::SqliteStore::ChannelCrypto::kSenderKeys;
+    // MLS group state when crypto == kMls. In-memory only — mls::Session
+    // doesn't expose stable TLS-syntax marshalling on its public API,
+    // so MLS channels work within a session but the state vanishes on
+    // restart. Tracked as a follow-up; meanwhile the receive path
+    // gracefully falls back to SenderKeys decrypt when mls is null.
+    std::unique_ptr<fb::crypto::MlsGroup> mls;
+    // Joiner-side state when WE are mid-join on this channel (we've
+    // received an InviteRequest, replied with our KP, and are waiting
+    // for a Welcome). Single-use; complete()d on receipt of the
+    // Welcome.
+    std::unique_ptr<fb::crypto::PendingMlsJoin> pending_join;
 };
 
 struct ChatClient::Impl {
@@ -488,7 +563,8 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                 impl_->store->chan_save(
                     name,
                     std::span<const std::uint8_t>(cs.id.data(), cs.id.size()),
-                    std::span<const std::uint8_t>(cs.own_dist.data(), cs.own_dist.size()));
+                    std::span<const std::uint8_t>(cs.own_dist.data(), cs.own_dist.size()),
+                    cs.crypto);
             };
             auto persist_chan_session = [this](const std::string& name, const ChannelState& cs) {
                 if (!impl_->store) return;
@@ -517,6 +593,7 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                 ChannelState cs;
                 std::memcpy(cs.id.data(), row.channel_id.data(), 32);
                 cs.own_dist = row.own_dist;
+                cs.crypto = row.crypto;
 
                 // Try the full-state blob first; if absent, fall back to a
                 // fresh GroupSession + per-peer distribution install (sender
@@ -612,11 +689,46 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             if (cs.own_dist.empty()) {
                                 cs.own_dist = cs.session->create_own_send_chain();
                             }
+                            // Record the per-channel cipher choice. Even
+                            // for an MLS channel we keep the SenderKeys
+                            // distribution around — it's small, harmless,
+                            // and lets the receive path fall back if a
+                            // peer hasn't migrated yet.
+                            cs.crypto = op.use_mls
+                                ? fb::store::SqliteStore::ChannelCrypto::kMls
+                                : fb::store::SqliteStore::ChannelCrypto::kSenderKeys;
+                            if (op.use_mls) {
+                                // Create a fresh single-member MLS group
+                                // with us as the founder. The same
+                                // channel_id we derived above is the MLS
+                                // group_id — they're 32 bytes so the
+                                // mapping is direct, and using the same
+                                // value keeps server-side routing
+                                // unchanged for MLS channels.
+                                if (cs.id[0] == 0 && cs.id[1] == 0) {
+                                    cs.id = channel_id_from_name(op.channel_name);
+                                }
+                                try {
+                                    cs.mls = fb::crypto::MlsGroup::create(
+                                        std::span<const std::uint8_t, 32>(
+                                            impl_->identity->public_key().data(), 32),
+                                        std::span<const std::uint8_t, 32>(
+                                            cs.id.data(), 32));
+                                } catch (const std::exception& e) {
+                                    emit errorOccurred(QString(
+                                        "MLS create failed: %1 — falling back to "
+                                        "SenderKeys for #%2").arg(e.what())
+                                        .arg(QString::fromStdString(op.channel_name)));
+                                    cs.crypto =
+                                        fb::store::SqliteStore::ChannelCrypto::kSenderKeys;
+                                }
+                            }
                             subscribe_now();
                             persist_chan_meta(op.channel_name, cs);
                             persist_chan_session(op.channel_name, cs);
-                            emit log(QString("created local channel #%1 (no peers yet)")
-                                         .arg(QString::fromStdString(op.channel_name)));
+                            emit log(QString("created local channel #%1 (%2, no peers yet)")
+                                         .arg(QString::fromStdString(op.channel_name))
+                                         .arg(op.use_mls ? "MLS" : "SenderKeys"));
                         } catch (const std::exception& e) {
                             emit errorOccurred(
                                 QString("create channel failed: %1").arg(e.what()));
@@ -659,15 +771,40 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                             const auto env_aad = envelope_aad_bytes(
                                 std::span<const std::uint8_t>(envid.data(), envid.size()),
                                 now_ms);
-                            auto inner = cs.session->encrypt(
-                                std::span<const std::uint8_t>(pt.data(), pt.size()),
-                                std::span<const std::uint8_t>(env_aad.data(),
-                                                                env_aad.size()));
+                            // Branch on per-channel cipher: MLS channels
+                            // route the plaintext through MlsGroup::
+                            // application_encrypt; SenderKeys channels
+                            // keep using the existing GroupSession.
+                            // env_aad isn't bound by mls::Session::protect
+                            // (mlspp computes its own internal AAD over
+                            // the MLSCiphertext header) — for MLS we
+                            // leave Envelope.aad empty so receivers don't
+                            // mismatch; for SenderKeys it's bound as
+                            // before.
+                            std::vector<std::uint8_t> inner;
+                            const bool use_mls =
+                                cs.crypto == fb::store::SqliteStore::ChannelCrypto::kMls
+                                && cs.mls;
+                            if (use_mls) {
+                                inner = cs.mls->application_encrypt(
+                                    std::span<const std::uint8_t>(pt.data(), pt.size()));
+                            } else {
+                                inner = cs.session->encrypt(
+                                    std::span<const std::uint8_t>(pt.data(), pt.size()),
+                                    std::span<const std::uint8_t>(env_aad.data(),
+                                                                    env_aad.size()));
+                            }
                             fb::proto::Frame f;
                             auto* env = f.mutable_envelope();
                             env->set_envelope_id(std::string(envid.begin(), envid.end()));
                             env->set_timestamp_ms(now_ms);
-                            env->set_aad(std::string(env_aad.begin(), env_aad.end()));
+                            // Skip Envelope.aad for MLS — mls::Session
+                            // covers its own AAD internally; populating
+                            // Envelope.aad would make receivers reject
+                            // the message at the cross-check.
+                            if (!use_mls) {
+                                env->set_aad(std::string(env_aad.begin(), env_aad.end()));
+                            }
                             env->set_channel_group_id(std::string(
                                 reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
                             env->set_sender_pubkey(std::string(
@@ -938,8 +1075,13 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                         break;
                     }
                     // Wrap as DmPayload{text} so receivers can disambiguate
-                    // text from channel-key invites.
-                    auto pt = pack_text_payload(s.text);
+                    // text from channel-key invites — UNLESS the caller
+                    // already supplied a pre-packed payload (the MLS
+                    // handshake sends use this to ride the same ratchet
+                    // without needing a parallel queue).
+                    auto pt = s.has_pre_packed()
+                        ? std::move(s.pre_packed_payload)
+                        : pack_text_payload(s.text);
                     std::vector<std::uint8_t> envid(16);
                     randombytes_buf(envid.data(), envid.size());
                     const auto now_ms = static_cast<std::uint64_t>(
@@ -968,9 +1110,12 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                     env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                     env->set_protocol_version(fb::config::kProtocolVersion);
                     blocking_send(*impl_->sock, serialize(f));
-                    if (impl_->store) {
+                    if (impl_->store && !s.text.empty()) {
                         // Persist the original text bytes (not the wrapped
-                        // DmPayload blob) so on-disk history is human-readable.
+                        // DmPayload blob) so on-disk history is human-
+                        // readable. Skip pre-packed sends entirely —
+                        // those are protocol-internal MLS handshake
+                        // messages, not user chat.
                         std::vector<std::uint8_t> raw_text(s.text.begin(), s.text.end());
                         impl_->store->append_outbox(
                             std::span<const std::uint8_t>(envid.data(), envid.size()),
@@ -985,9 +1130,11 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                                           sess.peer_pub.size()),
                             s.peer);
                     }
-                    emit log(QString("sent %1B to %2")
-                                 .arg(static_cast<qulonglong>(s.text.size()))
-                                 .arg(QString::fromStdString(s.peer)));
+                    emit log(QString("sent %1B to %2%3")
+                                 .arg(static_cast<qulonglong>(
+                                     s.text.empty() ? pt.size() : s.text.size()))
+                                 .arg(QString::fromStdString(s.peer))
+                                 .arg(s.text.empty() ? " (mls protocol msg)" : ""));
                 }
 
                 // 2. Read with short timeout.
@@ -1374,20 +1521,44 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                         continue;
                                     }
                                 }
-                                auto pt = cs.session->decrypt(
-                                    std::span<const std::uint8_t>(
-                                        reinterpret_cast<const std::uint8_t*>(
-                                            sender_pub_bytes.data()),
-                                        sender_pub_bytes.size()),
-                                    std::span<const std::uint8_t>(
-                                        reinterpret_cast<const std::uint8_t*>(
-                                            env.ciphertext().data()),
-                                        env.ciphertext().size()),
-                                    std::span<const std::uint8_t>(
-                                        outer_aad.data(), outer_aad.size()));
+                                // Branch on per-channel cipher: MLS
+                                // channels route through MlsGroup::
+                                // application_decrypt; SenderKeys path
+                                // unchanged. If the channel is marked
+                                // MLS but our local mls is null (e.g.
+                                // we haven't completed a Welcome yet,
+                                // or restarted before serialize() was
+                                // wired) we fall through to SenderKeys
+                                // decrypt as a best-effort fallback.
+                                std::optional<std::vector<std::uint8_t>> pt;
+                                const bool use_mls =
+                                    cs.crypto == fb::store::SqliteStore::ChannelCrypto::kMls
+                                    && cs.mls;
+                                if (use_mls) {
+                                    pt = cs.mls->application_decrypt(
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                env.ciphertext().data()),
+                                            env.ciphertext().size()));
+                                } else {
+                                    pt = cs.session->decrypt(
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                sender_pub_bytes.data()),
+                                            sender_pub_bytes.size()),
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                env.ciphertext().data()),
+                                            env.ciphertext().size()),
+                                        std::span<const std::uint8_t>(
+                                            outer_aad.data(), outer_aad.size()));
+                                }
                                 if (!pt) {
-                                    emit log(QString("channel decrypt failed (likely sent "
-                                                     "before we installed dist for sender)"));
+                                    emit log(QString("channel decrypt failed (%1)")
+                                                 .arg(use_mls ? "MLS"
+                                                              : "SenderKeys — likely "
+                                                                "sent before we installed "
+                                                                "dist for sender"));
                                     continue;
                                 }
                                 fb::crypto::PubKey peer_pub_arr{};
@@ -1610,6 +1781,230 @@ void ChatClient::connect(const QString& host, std::uint16_t port, const QString&
                                              .arg(peer_fp));
                                 emit channelJoined(
                                     QString::fromStdString(ck.channel_name()));
+                            } else if (payload.body_case() ==
+                                       fb::proto::DmPayload::kMlsInviteRequest) {
+                                const auto& m = payload.mls_invite_request();
+                                if (m.channel_id().size() != 32) continue;
+                                const QByteArray cid_qb(
+                                    m.channel_id().data(),
+                                    static_cast<int>(m.channel_id().size()));
+                                emit mlsInviteRequestReceived(
+                                    peer_fp, cid_qb,
+                                    QString::fromStdString(m.channel_name()));
+                                emit log(QString("inbound MLS invite-request "
+                                                  "for #%1 from %2 — auto-replying "
+                                                  "with KeyPackage")
+                                             .arg(QString::fromStdString(m.channel_name()))
+                                             .arg(peer_fp));
+                                // Joiner-side auto-orchestration: create a
+                                // ChannelState entry (no MlsGroup yet —
+                                // only Welcome materialises one) and
+                                // generate a PendingMlsJoin. Send the KP
+                                // back to the inviter via the same DM
+                                // ratchet we just decoded the request on.
+                                try {
+                                    auto& cs = impl_->channels[m.channel_name()];
+                                    if (cs.id[0] == 0 && cs.id[1] == 0) {
+                                        std::memcpy(cs.id.data(),
+                                                    m.channel_id().data(), 32);
+                                        impl_->chan_id_to_name[std::string(
+                                            m.channel_id().begin(),
+                                            m.channel_id().end())] = m.channel_name();
+                                    }
+                                    cs.crypto =
+                                        fb::store::SqliteStore::ChannelCrypto::kMls;
+                                    if (!cs.pending_join) {
+                                        cs.pending_join =
+                                            fb::crypto::MlsGroup::start_join(
+                                                std::span<const std::uint8_t, 32>(
+                                                    impl_->identity->public_key().data(), 32));
+                                    }
+                                    auto kp = cs.pending_join->key_package();
+                                    auto reply_payload = pack_mls_key_package_payload(
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                m.channel_id().data()), 32),
+                                        std::span<const std::uint8_t>(
+                                            kp.data(), kp.size()));
+                                    PendingSend ps;
+                                    ps.peer = sname;
+                                    ps.pre_packed_payload = std::move(reply_payload);
+                                    {
+                                        std::lock_guard lk(impl_->mu);
+                                        impl_->queue.push_back(std::move(ps));
+                                    }
+                                    impl_->cv.notify_all();
+                                } catch (const std::exception& e) {
+                                    emit log(QString("MLS join-start failed: %1")
+                                                 .arg(e.what()));
+                                }
+                            } else if (payload.body_case() ==
+                                       fb::proto::DmPayload::kMlsKeyPackage) {
+                                const auto& m = payload.mls_key_package();
+                                if (m.channel_id().size() != 32) continue;
+                                const QByteArray cid_qb(
+                                    m.channel_id().data(),
+                                    static_cast<int>(m.channel_id().size()));
+                                emit mlsKeyPackageReceived(peer_fp, cid_qb,
+                                    QByteArray(m.key_package().data(),
+                                                static_cast<int>(m.key_package().size())));
+                                emit log(QString("inbound MLS KeyPackage (%1B) "
+                                                  "from %2 — calling add_member")
+                                             .arg(static_cast<int>(m.key_package().size()))
+                                             .arg(peer_fp));
+                                // Inviter-side auto-orchestration: feed the
+                                // KP into our MlsGroup via add_member,
+                                // unwrap the Welcome and Commit. Send the
+                                // Welcome back to the joiner; broadcast
+                                // the Commit to every other existing
+                                // member (skipped in v0 since we don't
+                                // track per-channel membership beyond the
+                                // immediate add).
+                                std::string chan_name;
+                                {
+                                    auto nit = impl_->chan_id_to_name.find(
+                                        std::string(m.channel_id().begin(),
+                                                     m.channel_id().end()));
+                                    if (nit != impl_->chan_id_to_name.end()) {
+                                        chan_name = nit->second;
+                                    }
+                                }
+                                if (chan_name.empty()) {
+                                    emit log("MLS KP arrived for unknown channel — dropping");
+                                    continue;
+                                }
+                                auto& cs = impl_->channels[chan_name];
+                                if (!cs.mls) {
+                                    emit log("MLS KP arrived but local MLS group "
+                                              "not initialised — dropping");
+                                    continue;
+                                }
+                                try {
+                                    auto add = cs.mls->add_member(
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                m.key_package().data()),
+                                            m.key_package().size()));
+                                    auto welcome_payload = pack_mls_welcome_payload(
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                m.channel_id().data()), 32),
+                                        chan_name,
+                                        std::span<const std::uint8_t>(
+                                            add.welcome.data(), add.welcome.size()));
+                                    PendingSend ps;
+                                    ps.peer = sname;
+                                    ps.pre_packed_payload = std::move(welcome_payload);
+                                    {
+                                        std::lock_guard lk(impl_->mu);
+                                        impl_->queue.push_back(std::move(ps));
+                                    }
+                                    impl_->cv.notify_all();
+                                    emit log(QString("MLS Welcome (%1B) queued for %2")
+                                                 .arg(static_cast<int>(add.welcome.size()))
+                                                 .arg(peer_fp));
+                                    // TODO(mls-multi-member): broadcast
+                                    // add.commit to every OTHER existing
+                                    // member of this channel via
+                                    // pack_mls_commit_payload. v0 only
+                                    // has 2-party MLS so the commit only
+                                    // matters for the inviter (already
+                                    // self-applied inside add_member).
+                                } catch (const std::exception& e) {
+                                    emit log(QString("MLS add_member failed: %1")
+                                                 .arg(e.what()));
+                                }
+                            } else if (payload.body_case() ==
+                                       fb::proto::DmPayload::kMlsWelcome) {
+                                const auto& m = payload.mls_welcome();
+                                if (m.channel_id().size() != 32) continue;
+                                const QByteArray cid_qb(
+                                    m.channel_id().data(),
+                                    static_cast<int>(m.channel_id().size()));
+                                emit mlsWelcomeReceived(peer_fp, cid_qb,
+                                    QString::fromStdString(m.channel_name()),
+                                    QByteArray(m.welcome().data(),
+                                                static_cast<int>(m.welcome().size())));
+                                emit log(QString("inbound MLS Welcome for #%1 "
+                                                  "from %2 — completing pending join")
+                                             .arg(QString::fromStdString(m.channel_name()))
+                                             .arg(peer_fp));
+                                // Joiner-side auto-orchestration: complete
+                                // our PendingMlsJoin → hydrated MlsGroup.
+                                auto& cs = impl_->channels[m.channel_name()];
+                                if (!cs.pending_join) {
+                                    emit log("MLS Welcome arrived without a pending join "
+                                              "— ignoring (re-issue an InviteRequest "
+                                              "to restart)");
+                                    continue;
+                                }
+                                try {
+                                    cs.mls = cs.pending_join->complete(
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                m.welcome().data()),
+                                            m.welcome().size()));
+                                    cs.pending_join.reset();
+                                    cs.crypto =
+                                        fb::store::SqliteStore::ChannelCrypto::kMls;
+                                    // Subscribe to the channel envelope
+                                    // fan-out so future application
+                                    // messages reach us.
+                                    if (!cs.subscribed) {
+                                        fb::proto::Frame subf;
+                                        subf.mutable_chan_subscribe()->set_channel_group_id(
+                                            m.channel_id());
+                                        blocking_send(*impl_->sock, serialize(subf));
+                                        cs.subscribed = true;
+                                    }
+                                    impl_->chan_id_to_name[std::string(
+                                        m.channel_id().begin(),
+                                        m.channel_id().end())] = m.channel_name();
+                                    emit channelJoined(QString::fromStdString(
+                                        m.channel_name()));
+                                    emit log(QString("MLS group hydrated for #%1 "
+                                                      "(member_count=%2)")
+                                                 .arg(QString::fromStdString(m.channel_name()))
+                                                 .arg(cs.mls->member_count()));
+                                } catch (const std::exception& e) {
+                                    emit log(QString("MLS complete failed: %1")
+                                                 .arg(e.what()));
+                                }
+                            } else if (payload.body_case() ==
+                                       fb::proto::DmPayload::kMlsCommit) {
+                                const auto& m = payload.mls_commit();
+                                if (m.channel_id().size() != 32) continue;
+                                const QByteArray cid_qb(
+                                    m.channel_id().data(),
+                                    static_cast<int>(m.channel_id().size()));
+                                emit mlsCommitReceived(peer_fp, cid_qb,
+                                    QByteArray(m.commit().data(),
+                                                static_cast<int>(m.commit().size())));
+                                emit log(QString("inbound MLS Commit (%1B) "
+                                                  "from %2 — applying")
+                                             .arg(static_cast<int>(m.commit().size()))
+                                             .arg(peer_fp));
+                                std::string chan_name;
+                                {
+                                    auto nit = impl_->chan_id_to_name.find(
+                                        std::string(m.channel_id().begin(),
+                                                     m.channel_id().end()));
+                                    if (nit != impl_->chan_id_to_name.end())
+                                        chan_name = nit->second;
+                                }
+                                if (chan_name.empty()) continue;
+                                auto& cs = impl_->channels[chan_name];
+                                if (!cs.mls) continue;
+                                try {
+                                    cs.mls->apply_commit(
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                m.commit().data()),
+                                            m.commit().size()));
+                                } catch (const std::exception& e) {
+                                    emit log(QString("MLS apply_commit failed: %1")
+                                                 .arg(e.what()));
+                                }
                             } else if (payload.body_case() ==
                                        fb::proto::DmPayload::kMediaSignal) {
                                 const auto& ms = payload.media_signal();
@@ -1835,11 +2230,14 @@ void ChatClient::send_to_channel(const QString& name, const QString& text) {
     impl_->cv.notify_all();
 }
 
-void ChatClient::create_local_channel(const QString& name) {
+void ChatClient::create_local_channel(const QString& name, bool use_mls) {
     {
         std::lock_guard lk(impl_->mu);
-        impl_->chan_queue.push_back({PendingChannelOp::Kind::kCreateLocal,
-                                      name.toStdString(), {}, {}, {}});
+        PendingChannelOp op;
+        op.kind         = PendingChannelOp::Kind::kCreateLocal;
+        op.channel_name = name.toStdString();
+        op.use_mls      = use_mls;
+        impl_->chan_queue.push_back(std::move(op));
     }
     impl_->cv.notify_all();
 }
@@ -1860,6 +2258,99 @@ void ChatClient::join_channel_call(const QString& channel_name, bool with_video)
         impl_->chan_queue.push_back({PendingChannelOp::Kind::kRoomJoin,
                                       channel_name.toStdString(), {}, {}, {},
                                       with_video});
+    }
+    impl_->cv.notify_all();
+}
+
+void ChatClient::invite_peer_to_mls_channel(const QString& channel_name,
+                                              const QString& peer) {
+    const auto cid = channel_id_from_name(channel_name.toStdString());
+    QByteArray cid_qb(reinterpret_cast<const char*>(cid.data()),
+                      static_cast<int>(cid.size()));
+    send_mls_invite_request(peer, cid_qb, channel_name);
+}
+
+// ----- MLS handshake send helpers ------------------------------------
+// Each builds a DmPayload of the matching variant, serializes it, and
+// pushes a pre-packed PendingSend onto the same queue as text DMs so
+// the worker encrypts + sends with the existing pairwise ratchet
+// (no parallel queue / no second crypto path).
+void ChatClient::send_mls_invite_request(const QString& peer,
+                                          const QByteArray& channel_id,
+                                          const QString& channel_name) {
+    auto payload = pack_mls_invite_request_payload(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(channel_id.constData()),
+            static_cast<std::size_t>(channel_id.size())),
+        channel_name.toStdString());
+    PendingSend ps;
+    ps.peer = peer.toStdString();
+    ps.pre_packed_payload = std::move(payload);
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->queue.push_back(std::move(ps));
+    }
+    impl_->cv.notify_all();
+}
+
+void ChatClient::send_mls_key_package(const QString& peer,
+                                       const QByteArray& channel_id,
+                                       const QByteArray& key_package) {
+    auto payload = pack_mls_key_package_payload(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(channel_id.constData()),
+            static_cast<std::size_t>(channel_id.size())),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(key_package.constData()),
+            static_cast<std::size_t>(key_package.size())));
+    PendingSend ps;
+    ps.peer = peer.toStdString();
+    ps.pre_packed_payload = std::move(payload);
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->queue.push_back(std::move(ps));
+    }
+    impl_->cv.notify_all();
+}
+
+void ChatClient::send_mls_welcome(const QString& peer,
+                                   const QByteArray& channel_id,
+                                   const QString& channel_name,
+                                   const QByteArray& welcome) {
+    auto payload = pack_mls_welcome_payload(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(channel_id.constData()),
+            static_cast<std::size_t>(channel_id.size())),
+        channel_name.toStdString(),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(welcome.constData()),
+            static_cast<std::size_t>(welcome.size())));
+    PendingSend ps;
+    ps.peer = peer.toStdString();
+    ps.pre_packed_payload = std::move(payload);
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->queue.push_back(std::move(ps));
+    }
+    impl_->cv.notify_all();
+}
+
+void ChatClient::send_mls_commit(const QString& peer,
+                                  const QByteArray& channel_id,
+                                  const QByteArray& commit) {
+    auto payload = pack_mls_commit_payload(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(channel_id.constData()),
+            static_cast<std::size_t>(channel_id.size())),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(commit.constData()),
+            static_cast<std::size_t>(commit.size())));
+    PendingSend ps;
+    ps.peer = peer.toStdString();
+    ps.pre_packed_payload = std::move(payload);
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->queue.push_back(std::move(ps));
     }
     impl_->cv.notify_all();
 }
