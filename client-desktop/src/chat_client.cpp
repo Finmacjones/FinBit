@@ -1225,30 +1225,71 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             .time_since_epoch()).count());
             };
             auto republish_self = [&]() {
-                if (!impl_->dht || impl_->own_p2p_addr.empty()) return;
+                if (!impl_->dht) return;
+                auto sig_pub = std::span<const std::uint8_t>(
+                    impl_->identity->public_key().data(),
+                    impl_->identity->public_key().size());
+                auto sig_priv = std::span<const std::uint8_t>(
+                    impl_->identity->secret_key().data(),
+                    impl_->identity->secret_key().size());
+
+                // 1. Reachability + relays. Skipped if no addr is
+                // declared — the prekey-only path below still works
+                // (we're "reachable only via relay" which is what
+                // NATed peers do).
+                if (!impl_->own_p2p_addr.empty()) {
+                    try {
+                        auto rec = fb::p2p::build_record(
+                            sig_pub, sig_priv,
+                            std::vector<std::string>{impl_->own_p2p_addr},
+                            now_ms(),
+                            fb::p2p::kDefaultProviderTtlMs,
+                            impl_->own_offline_relays);
+                        auto sent = impl_->dht->publish(rec);
+                        emit log(QString("DHT republish: addr=%1 "
+                                          "sent_to=%2 relays=%3")
+                                     .arg(QString::fromStdString(
+                                         impl_->own_p2p_addr))
+                                     .arg(static_cast<qulonglong>(sent))
+                                     .arg(static_cast<qulonglong>(
+                                         impl_->own_offline_relays.size())));
+                    } catch (const std::exception& e) {
+                        emit log(QString("DHT republish failed: %1")
+                                     .arg(e.what()));
+                    }
+                }
+
+                // 2. Prekey bundle. Always published when the DHT is
+                // wired — this is what lets other peers initiate a
+                // Double Ratchet with us via X3DH WITHOUT going
+                // through the central server's KeyBundleFetch path.
+                // SPK = our X25519 signed prekey (impl_->x25519.pub);
+                // we also sign the SPK bytes independently with our
+                // identity key so the binding survives outer-record
+                // re-publishes with rotated nonces.
                 try {
-                    auto sig_pub = std::span<const std::uint8_t>(
-                        impl_->identity->public_key().data(),
-                        impl_->identity->public_key().size());
-                    auto sig_priv = std::span<const std::uint8_t>(
-                        impl_->identity->secret_key().data(),
-                        impl_->identity->secret_key().size());
-                    auto rec = fb::p2p::build_record(
+                    std::array<std::uint8_t, crypto_sign_BYTES> spk_sig{};
+                    unsigned long long spk_sig_len = 0;
+                    if (crypto_sign_detached(
+                            spk_sig.data(), &spk_sig_len,
+                            impl_->x25519.pub.data(),
+                            impl_->x25519.pub.size(),
+                            impl_->identity->secret_key().data()) != 0) {
+                        return;
+                    }
+                    auto pkrec = fb::p2p::build_prekey_record(
                         sig_pub, sig_priv,
-                        std::vector<std::string>{impl_->own_p2p_addr},
+                        std::span<const std::uint8_t>(
+                            impl_->x25519.pub.data(), 32),
+                        std::span<const std::uint8_t>(
+                            spk_sig.data(), spk_sig_len),
                         now_ms(),
-                        fb::p2p::kDefaultProviderTtlMs,
-                        impl_->own_offline_relays);
-                    auto sent = impl_->dht->publish(rec);
-                    emit log(QString("DHT republish: addr=%1 sent_to=%2 "
-                                      "relays=%3")
-                                 .arg(QString::fromStdString(
-                                     impl_->own_p2p_addr))
-                                 .arg(static_cast<qulonglong>(sent))
-                                 .arg(static_cast<qulonglong>(
-                                     impl_->own_offline_relays.size())));
+                        fb::p2p::kDefaultProviderTtlMs);
+                    auto pksent = impl_->dht->publish_prekey(pkrec);
+                    emit log(QString("DHT prekey republish: sent_to=%1")
+                                 .arg(static_cast<qulonglong>(pksent)));
                 } catch (const std::exception& e) {
-                    emit log(QString("DHT republish failed: %1")
+                    emit log(QString("DHT prekey republish failed: %1")
                                  .arg(e.what()));
                 }
             };
@@ -2542,6 +2583,33 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                             env->set_protocol_version(fb::config::kProtocolVersion);
                             blocking_send(impl_->conn, serialize(f));
+                            // I3-publish: when gossipsub is wired,
+                            // also publish the same Envelope to the
+                            // channel topic. Receivers subscribed via
+                            // gossip see it and dispatch through the
+                            // same dispatch_envelope path; the
+                            // central server's chan_subscribe fan-out
+                            // keeps working in parallel. Receiver-
+                            // side dedup (envelope_id) drops the
+                            // duplicate so users see each message
+                            // exactly once.
+                            if (impl_->gossip) {
+                                std::vector<std::uint8_t> env_bytes(
+                                    env->ByteSizeLong());
+                                if (env->SerializeToArray(
+                                        env_bytes.data(),
+                                        static_cast<int>(env_bytes.size()))) {
+                                    const auto topic =
+                                        fb::p2p::channel_topic_name(
+                                            std::span<const std::uint8_t>(
+                                                cs.id.data(), cs.id.size()));
+                                    impl_->gossip->publish(
+                                        topic,
+                                        std::span<const std::uint8_t>(
+                                            env_bytes.data(),
+                                            env_bytes.size()));
+                                }
+                            }
                             // Persist channel state so the advanced send-chain
                             // survives a restart (own_next_index, own_chain_key).
                             persist_chan_session(op.channel_name, cs);
@@ -2819,6 +2887,124 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             }
                         }
                     }
+
+                    // I2b: serverless-first DM send. When we already
+                    // have a ratchet session for this peer AND the
+                    // DHT has a fresh wss:// reachability record for
+                    // them AND PeerNet is configured, encrypt + ship
+                    // direct. Falls through to the central-server
+                    // path on any miss (no session yet, no DHT
+                    // entry, no PeerNet).
+                    //
+                    // Scope intentionally limited to ESTABLISHED
+                    // sessions — first contact still uses the
+                    // X3DH-via-server flow because the DHT prekey
+                    // lookup is async (callback-based) and rewiring
+                    // the queue to wait on the lookup would balloon
+                    // this commit. After first contact, every
+                    // subsequent DM to the same peer takes the
+                    // direct path. As soon as send_to_peer evolves
+                    // to do a sync prekey lookup against
+                    // DhtNode.prekeys() (the LOCAL store), this
+                    // gates trip on first contact too.
+                    bool sent_direct = false;
+                    if (impl_->peer_net && impl_->dht &&
+                        impl_->sessions.count(s.peer) &&
+                        impl_->sessions[s.peer].rat) {
+                        auto& sess_direct = impl_->sessions[s.peer];
+                        const auto records = impl_->dht->store().get(
+                            std::span<const std::uint8_t>(
+                                sess_direct.peer_pub.data(),
+                                sess_direct.peer_pub.size()));
+                        std::string wss_addr;
+                        for (const auto& r : records) {
+                            for (const auto& a : r.addresses()) {
+                                if (a.rfind("wss://", 0) == 0) {
+                                    wss_addr = a;
+                                    break;
+                                }
+                            }
+                            if (!wss_addr.empty()) break;
+                        }
+                        if (!wss_addr.empty()) {
+                            try {
+                                // Build the DmPayload. Pre-packed
+                                // payloads (MLS handshakes) ride
+                                // through verbatim; otherwise pack
+                                // the text.
+                                auto inner = s.has_pre_packed()
+                                    ? s.pre_packed_payload
+                                    : pack_text_payload(s.text);
+                                std::vector<std::uint8_t> envid(16);
+                                randombytes_buf(envid.data(),
+                                                 envid.size());
+                                const auto ts = static_cast<std::uint64_t>(
+                                    std::chrono::duration_cast<
+                                        std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now()
+                                            .time_since_epoch()).count());
+                                auto outer_aad = envelope_aad_bytes(
+                                    std::span<const std::uint8_t>(
+                                        envid.data(), envid.size()),
+                                    ts);
+                                auto ct = sess_direct.rat->encrypt(
+                                    std::span<const std::uint8_t>(
+                                        inner.data(), inner.size()),
+                                    std::span<const std::uint8_t>(
+                                        outer_aad.data(),
+                                        outer_aad.size()));
+                                fb::proto::Envelope env;
+                                env.set_envelope_id(std::string(
+                                    envid.begin(), envid.end()));
+                                env.set_timestamp_ms(ts);
+                                env.set_user_pubkey(std::string(
+                                    sess_direct.peer_pub.begin(),
+                                    sess_direct.peer_pub.end()));
+                                env.set_sender_pubkey(std::string(
+                                    reinterpret_cast<const char*>(
+                                        impl_->identity->public_key().data()),
+                                    impl_->identity->public_key().size()));
+                                env.set_ciphertext(std::string(
+                                    ct.begin(), ct.end()));
+                                env.set_aad(std::string(
+                                    outer_aad.begin(), outer_aad.end()));
+                                env.set_aead_alg(
+                                    fb::config::aead_alg::kAes256Gcm);
+                                env.set_protocol_version(
+                                    fb::config::kProtocolVersion);
+                                std::vector<std::uint8_t> env_bytes(
+                                    env.ByteSizeLong());
+                                if (env.SerializeToArray(
+                                        env_bytes.data(),
+                                        static_cast<int>(env_bytes.size()))) {
+                                    fb::p2p::PeerInfo target{};
+                                    target.addr = wss_addr;
+                                    target.pubkey.assign(
+                                        sess_direct.peer_pub.begin(),
+                                        sess_direct.peer_pub.end());
+                                    wrap_peer_send(
+                                        fb::proto::PeerEnvelope::DM,
+                                        target,
+                                        std::span<const std::uint8_t>(
+                                            env_bytes.data(),
+                                            env_bytes.size()));
+                                    sent_direct = true;
+                                    emit log(QString("DM direct via "
+                                                      "PeerNet to %1 "
+                                                      "(server skipped)")
+                                                 .arg(QString::fromStdString(
+                                                     s.peer)));
+                                }
+                            } catch (const std::exception& e) {
+                                emit log(QString("direct-DM failed: %1; "
+                                                  "falling back to "
+                                                  "server").arg(e.what()));
+                                sent_direct = false;
+                            }
+                        }
+                    }
+                    if (sent_direct) continue;
+
                     auto& sess = impl_->sessions[s.peer];
                     if (!sess.rat) {
                         // Need to fetch peer bundle first.
