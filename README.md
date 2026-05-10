@@ -15,12 +15,11 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 | Login dialog | <img src="docs/screenshots/desktop-login.png" width="320"/> | (similar — `client-web/ui/login_ui.js`) |
 | Main UI | <img src="docs/screenshots/desktop-main.png" width="640"/> | Discord-style HTML/CSS/JS in `client-web/ui/` |
 
-> Screenshots are from an early build. The current connect bar adds a
-> `TLS / (insecure) / CA…` trio for direct `wss://` to a relay (no
-> reverse proxy needed), the channel-create dialog has an "MLS
-> encryption?" checkbox, and the activity log surfaces serverless
-> overlay events (`peer-net listening`, `dht published`, `gossip
-> joined fb-chan:…`) once the env-driven P2P stack is enabled.
+> The connect bar's `TLS / (insecure) / CA…` trio drives a direct
+> `wss://` to the relay (no reverse proxy needed). The channel-create
+> dialog has an "MLS encryption?" checkbox. **Show log** surfaces
+> serverless overlay events (`peer-net listening`, `dht published`,
+> `gossip joined fb-chan:…`) once the env-driven P2P stack is on.
 
 ## What's real today
 
