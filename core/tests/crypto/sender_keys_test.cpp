@@ -114,6 +114,66 @@ TEST(SenderKeys, RemovePeerStopsDecryption) {
     EXPECT_FALSE(bob.decrypt(span_of(alice_id), span_of(e2), {}).has_value());
 }
 
+// Post-eviction key isolation: after a member is removed and the
+// remaining members re-key, the evicted member CANNOT decrypt new
+// channel traffic. This is the property that makes channel removal
+// meaningful — the evicted member kept their old chain key state in
+// memory, but the new distribution gives them no way to derive
+// future message keys.
+//
+// Scenario:
+//   1. Alice creates a send chain v1; Bob and Carol install it.
+//   2. Carol is evicted (e.g. kicked from the channel).
+//   3. Alice re-keys: create_own_send_chain() produces chain v2.
+//   4. Bob installs the new distribution and decrypts v2 traffic.
+//   5. Carol, holding the old v1 distribution, MUST NOT decrypt v2
+//      traffic — the chain_id mismatch rejection in
+//      RekeyingProducesNewChainId is precisely the defense, but
+//      this test asserts it specifically in the post-eviction
+//      threat model.
+TEST(SenderKeys, EvictedMemberCannotDecryptPostRekeyTraffic) {
+    fb::crypto::GroupSession alice, bob, carol;
+    const auto alice_id = bytes("alice");
+
+    // v1 — all three start with the same distribution.
+    auto dist_v1 = alice.create_own_send_chain();
+    bob.install_peer_distribution(span_of(alice_id), span_of(dist_v1));
+    carol.install_peer_distribution(span_of(alice_id), span_of(dist_v1));
+
+    auto pre = alice.encrypt(bytes("pre-eviction-msg"), {});
+    EXPECT_TRUE(bob.decrypt(span_of(alice_id), span_of(pre), {}).has_value());
+    EXPECT_TRUE(carol.decrypt(span_of(alice_id), span_of(pre), {}).has_value());
+
+    // Evict carol (no API on alice's side — eviction is a higher-layer
+    // decision; the crypto effect is that alice re-keys, generating a
+    // new distribution which is delivered ONLY to bob).
+    auto dist_v2 = alice.create_own_send_chain();
+    bob.install_peer_distribution(span_of(alice_id), span_of(dist_v2));
+    // carol does NOT receive dist_v2.
+
+    // Alice sends a post-eviction message under v2.
+    auto post = alice.encrypt(bytes("post-eviction-secret"), {});
+
+    // Bob can read it — he has v2.
+    auto bob_pt = bob.decrypt(span_of(alice_id), span_of(post), {});
+    ASSERT_TRUE(bob_pt.has_value());
+    EXPECT_EQ(std::string(bob_pt->begin(), bob_pt->end()),
+              "post-eviction-secret");
+
+    // Carol CANNOT — she's still on v1; chain_id mismatch.
+    auto carol_pt = carol.decrypt(span_of(alice_id), span_of(post), {});
+    EXPECT_FALSE(carol_pt.has_value())
+        << "evicted member decrypted post-rekey traffic — channel eviction "
+           "is broken (post-compromise security gap)";
+
+    // Even if alice sends MANY more messages on v2, carol stays locked out.
+    for (int i = 0; i < 5; ++i) {
+        auto e = alice.encrypt(bytes("msg-" + std::to_string(i)), {});
+        EXPECT_TRUE(bob.decrypt(span_of(alice_id), span_of(e), {}).has_value());
+        EXPECT_FALSE(carol.decrypt(span_of(alice_id), span_of(e), {}).has_value());
+    }
+}
+
 TEST(SenderKeys, RekeyingProducesNewChainId) {
     fb::crypto::GroupSession alice, bob;
     auto dist1 = alice.create_own_send_chain();

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
@@ -23,6 +24,13 @@ struct IoLoop::Impl {
     int wake_r = -1;
     int wake_w = -1;
     std::atomic_bool running{false};
+    // `mu` protects `handlers` and `timers` against concurrent access
+    // from arbitrary registrant threads (calling add_fd / remove_fd /
+    // schedule) and the I/O thread (running run() and dispatching
+    // callbacks). Caught by TSan in the security validation pass —
+    // the previous unsynchronised hashtable / priority_queue access
+    // was a real data race exposed by P2PGossip / RoomGossip tests.
+    std::mutex mu;
     std::unordered_map<int, FdReadyCallback> handlers;
 
     struct PendingTimer {
@@ -89,11 +97,16 @@ void IoLoop::add_fd(int fd, std::uint32_t events, FdReadyCallback cb) {
     epoll_event ev{};
     ev.events = events;
     ev.data.fd = fd;
-    auto it = impl_->handlers.find(fd);
-    const int op = (it == impl_->handlers.end()) ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+    bool exists;
+    {
+        std::lock_guard lk(impl_->mu);
+        exists = impl_->handlers.find(fd) != impl_->handlers.end();
+    }
+    const int op = exists ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
     if (epoll_ctl(impl_->epfd, op, fd, &ev) < 0) {
         throw std::runtime_error(std::string("epoll_ctl: ") + strerror(errno));
     }
+    std::lock_guard lk(impl_->mu);
     impl_->handlers[fd] = std::move(cb);
 }
 
@@ -108,11 +121,15 @@ void IoLoop::mod_fd(int fd, std::uint32_t events) {
 
 void IoLoop::remove_fd(int fd) {
     epoll_ctl(impl_->epfd, EPOLL_CTL_DEL, fd, nullptr);
+    std::lock_guard lk(impl_->mu);
     impl_->handlers.erase(fd);
 }
 
 void IoLoop::schedule(std::chrono::milliseconds delay, TimerCallback cb) {
-    impl_->timers.push({std::chrono::steady_clock::now() + delay, std::move(cb)});
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->timers.push({std::chrono::steady_clock::now() + delay, std::move(cb)});
+    }
     impl_->rearm_timer();
 }
 
@@ -142,18 +159,33 @@ void IoLoop::run() {
                     r = ::read(impl_->timerfd, &expirations, sizeof(expirations));
                 } while (r < 0 && errno == EINTR);
                 const auto now = std::chrono::steady_clock::now();
-                while (!impl_->timers.empty() && impl_->timers.top().at <= now) {
-                    auto cb = std::move(impl_->timers.top().cb);
-                    impl_->timers.pop();
-                    cb();
+                // Drain ready timers under lock; invoke callbacks
+                // OUTSIDE the lock so a callback that calls back
+                // into schedule() / add_fd() doesn't deadlock.
+                std::vector<TimerCallback> ready;
+                {
+                    std::lock_guard lk(impl_->mu);
+                    while (!impl_->timers.empty() &&
+                           impl_->timers.top().at <= now) {
+                        ready.push_back(
+                            std::move(const_cast<Impl::PendingTimer&>(
+                                impl_->timers.top()).cb));
+                        impl_->timers.pop();
+                    }
                 }
+                for (auto& cb : ready) cb();
                 impl_->rearm_timer();
                 continue;
             }
-            auto it = impl_->handlers.find(fd);
-            if (it != impl_->handlers.end()) {
-                it->second(fd, ev);
+            // Same pattern for fd callbacks: copy under lock, invoke
+            // unlocked so re-entrant add_fd doesn't deadlock.
+            FdReadyCallback cb;
+            {
+                std::lock_guard lk(impl_->mu);
+                auto it = impl_->handlers.find(fd);
+                if (it != impl_->handlers.end()) cb = it->second;
             }
+            if (cb) cb(fd, ev);
         }
     }
 }

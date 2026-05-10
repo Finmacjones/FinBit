@@ -106,6 +106,24 @@ struct DoubleRatchet::State {
     // (peer_dh_pub, n) -> message_key. We use a flat std::map for the cache;
     // ordering keeps eviction simple. Total cap kMaxSkip across all entries.
     std::map<std::pair<Bytes32, std::uint32_t>, Bytes32> skipped;
+
+    // Wipe every byte that could be live key material on destruction:
+    // dhs_priv (our DH private key), rk (root key), cks/ckr (chain keys),
+    // and every cached skipped message key. Without this, a freed State
+    // page sits in the allocator with the keys still readable until the
+    // page is reused. Caught by the security validation pass — defaulted
+    // ~State left these unwiped.
+    ~State() {
+        sodium_memzero(dhs_priv.data(), dhs_priv.size());
+        sodium_memzero(rk.data(),       rk.size());
+        sodium_memzero(cks.data(),      cks.size());
+        sodium_memzero(ckr.data(),      ckr.size());
+        sodium_memzero(dhs_pub.data(),  dhs_pub.size());
+        sodium_memzero(dhr_pub.data(),  dhr_pub.size());
+        for (auto& [k, mk] : skipped) {
+            sodium_memzero(mk.data(), mk.size());
+        }
+    }
 };
 
 DoubleRatchet::DoubleRatchet() : state_(std::make_unique<State>()) {}

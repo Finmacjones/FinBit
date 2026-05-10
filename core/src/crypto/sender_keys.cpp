@@ -83,6 +83,13 @@ struct PerPeerChain {
     std::map<std::pair<std::array<std::uint8_t, 16>, std::uint32_t>,
              std::array<std::uint8_t, 32>>
         skipped;
+
+    ~PerPeerChain() {
+        sodium_memzero(chain_key.data(), chain_key.size());
+        for (auto& [k, mk] : skipped) {
+            sodium_memzero(mk.data(), mk.size());
+        }
+    }
 };
 
 struct GroupSession::Impl {
@@ -94,6 +101,14 @@ struct GroupSession::Impl {
 
     // Receiver side: peer_id -> chain.
     std::map<std::string, PerPeerChain> peers;
+
+    // Wipe the sender-side chain key on destruction. Per-peer chains
+    // wipe themselves via PerPeerChain::~PerPeerChain when the map is
+    // destroyed. Caught by the security validation pass — defaulted
+    // ~Impl left these unwiped.
+    ~Impl() {
+        sodium_memzero(own_chain_key.data(), own_chain_key.size());
+    }
 };
 
 GroupSession::GroupSession() : impl_(std::make_unique<Impl>()) {}

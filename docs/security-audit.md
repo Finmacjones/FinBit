@@ -479,6 +479,28 @@ republish for full-mesh signaling without the central server).
 
 ### How to re-run
 
+### Deeper validation (later in the same window)
+
+After the §11 baseline pass surfaced the question "what would catch
+something the baseline misses", a second pass added wider-coverage
+machinery and **two real bugs were caught and fixed**:
+
+| Layer | Method | Finding |
+|---|---|---|
+| **Wire encryption (statistical)** | socat-tap proxy + driver script generates 30 DM round-trips of varied 2 KB plaintexts + 5 channel rounds (~120 KB raw wire bytes); decoded the hex column to bytes; computed Shannon entropy + chi² + grep for every plaintext token at 4/6/8/12/16/24-byte substring lengths over 65 distinct markers | **0 substring leaks at any length** across the 65 markers. Entropy 7.96/8.00 bits/byte; chi² inflated by protocol framing (length prefixes + 32-byte routing pubkeys, both unencrypted by design — verified by cross-checking that usernames *do* appear, as expected) |
+| **Wire-form replay (live)** | `Ratchet.WireFormEnvelopeReplayIsRejected` — encrypts via Double Ratchet, hands the wire bytes to bob's decrypt twice, then a third time with a flipped outer AAD | All three rejection cases pass: replay rejected by message-key consumption; AAD rewrite rejected by AEAD tag |
+| **mTLS peer impersonation** | `PeerNet.MutualTlsIdentityPinningSucceedsAndRejects` (existing) | A→B with wrong pinned pubkey: dial throws "identity-pin failure" inside PeerNet's worker, bytes never reach B |
+| **Protobuf decoder fuzzing** | clang `libFuzzer` + `-fsanitize=fuzzer,address,undefined`; harness covering Envelope / Frame / PeerEnvelope / RoomRoster `ParseFromArray`; 60 s pass | **21,296,952 inputs at 349 K/s, no crashes / no ASan / no UBSan hits**. Soft hardening note: protobuf logs UTF-8 errors on `string` fields like `ControlMessage.detail` / `RoomOffer.sdp` — could be `bytes` to silence (not a crash, just noisy) |
+| **🐛 Sensitive-memory zeroization** | grep audit + destructor inspection | **FIXED**: `DoubleRatchet::State` and `SenderKeys::GroupSession::Impl` had defaulted destructors that left root keys / chain keys / DH private keys live in freed allocator pages. Added explicit `~State()` / `~Impl()` / `~PerPeerChain()` that `sodium_memzero` every key-bearing field plus the cached skipped-message-key map values. Regression test `Ratchet.KeyMaterialZeroizedOnDestruction` |
+| **🐛 TSan on threaded subsystems** | `build-tsan/` with `-fsanitize=thread`; full `ctest` run | **FIXED**: real data race in `fb::net::IoLoop::add_fd` / `remove_fd` / `schedule` / `run` — `handlers` (`unordered_map<int, callback>`) and `timers` (`priority_queue`) accessed concurrently from registrant threads (P2PNode dial, etc.) and the I/O thread without any mutex. Caught by P2PGossip / RoomGossip / ChannelGossip tests under TSan. Added `Impl::mu` covering both containers; callbacks now copied under lock and invoked unlocked to prevent deadlock against re-entrant `add_fd` / `schedule` |
+| **Channel post-eviction key isolation** | `SenderKeys.EvictedMemberCannotDecryptPostRekeyTraffic` — Alice / Bob / Carol on chain v1, Carol evicted, Alice rekeys to v2, Bob installs v2, Alice sends 6 messages on v2 | Bob decrypts all 6, Carol decrypts none — chain_id mismatch on every attempt |
+| **DHT signed-record poisoning** | Existing `BadSignatureRejected` + `TamperedPublishIsDroppedByReceiver` + new `SpoofedPublisherPubkeyRejected` (attacker has own valid keypair, signs a record, then rewrites `publisher_pubkey` to victim's hoping for a naive verifier) | All three rejected at `ProviderStore::put` — verification uses the in-record `publisher_pubkey`, so a swap invalidates the signature |
+| **Friend-relay opacity** | New `OfflineRelay.RelayCannotReadDepositedEnvelopeContents` — Alice ratchet-encrypts a known canary, deposits the wire-form ciphertext into an `OfflineRelayStore`, fetches it back as if she were the relay operator inspecting her queue, greps the held bytes for the canary literal AND every 6/8/10/12/14/16-byte substring | All grep checks pass — relay holds AEAD ciphertext only, never plaintext |
+
+**Two real bugs found and fixed.** The ratchet/SenderKeys destructors and the IoLoop race were both genuine issues that the prior test suite never exercised. The ratchet leak was a defense-in-depth gap (the keys are freed when out of scope, they just stay in allocator pages until reused — not exploitable across processes but a real cold-boot / heap-spraying surface). The IoLoop race was a real concurrency bug that could have produced silent missed events or use-after-free under load.
+
+Final counts: **176 default / 186 MLS / 175 ASan / 175 TSan**, all green. Sanitizers clean across the whole suite, including the post-fix concurrency code.
+
 ```bash
 # Adversarial smokes (web + e2e canaries)
 build/server/fb_server --port 8765 --ws-port 8766 --offline-db /tmp/fb.db &
@@ -507,4 +529,21 @@ ctest --test-dir build -R "RoomBeaconLeak" --output-on-failure
 # ASan + UBSan
 ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan \
     -E 'TokenBucket.NeverExceedsBurst' --output-on-failure
+
+# TSan (separate build — incompatible with ASan)
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
+    -DFB_ENABLE_SANITIZERS=OFF \
+    -DCMAKE_CXX_FLAGS='-fsanitize=thread -fno-omit-frame-pointer -g -O1' \
+    -DCMAKE_EXE_LINKER_FLAGS='-fsanitize=thread'
+cmake --build build-tsan --target fb_core_tests -j
+TSAN_OPTIONS=halt_on_error=0 ctest --test-dir build-tsan \
+    -E 'TokenBucket.NeverExceedsBurst' --output-on-failure
+
+# libFuzzer pass on protobuf decoders (60 s)
+clang++ -std=c++20 -O1 -g -fsanitize=fuzzer,address,undefined \
+    -I core/include -I build/core/generated $(pkg-config --cflags protobuf) \
+    /tmp/fuzz_proto.cpp build/core/libfb_core.a \
+    $(pkg-config --libs protobuf) -lsodium -lpthread -o /tmp/fuzz_proto
+mkdir -p /tmp/fuzz-corpus
+ASAN_OPTIONS=detect_leaks=0 /tmp/fuzz_proto /tmp/fuzz-corpus -max_total_time=60
 ```

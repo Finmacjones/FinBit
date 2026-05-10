@@ -14,12 +14,19 @@
 
 #include "fb/p2p/offline_relay.hpp"
 
+#include "fb/crypto/ratchet.hpp"
+#include <sodium.h>
+
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -125,4 +132,80 @@ TEST(OfflineRelay, DistinctRecipientsAreIndependent) {
     auto carol_out = s.fetch_and_clear(as_span(carol));
     EXPECT_EQ(carol_out.size(), 1u);
     EXPECT_EQ(carol_out[0][0], 2);
+}
+
+// Opacity: a peer acting as an OFFLINE_DEPOSIT relay holds AEAD-
+// encrypted Envelope ciphertext, NOT plaintext. The relay's view of
+// the deposited blob (whatever bytes Alice handed it via deposit())
+// must not contain the plaintext canary that Alice sent. This is the
+// property the README claims: "The central server [or friend-relay]
+// remains an optional fallback for unreachable peers, never sees
+// envelope contents."
+//
+// We exercise the actual production path: Alice's Double Ratchet
+// produces ciphertext; the ciphertext is what the relay receives via
+// deposit(); the relay's internal blob exactly equals what fetch()
+// returns, and that blob must not contain the canary.
+TEST(OfflineRelay, RelayCannotReadDepositedEnvelopeContents) {
+    sodium_init();
+
+    // Set up a Double Ratchet pair so we can produce real ciphertext.
+    std::array<std::uint8_t, 32> shared{};
+    for (std::size_t i = 0; i < shared.size(); ++i) {
+        shared[i] = static_cast<std::uint8_t>(0xC3 ^ i);
+    }
+    std::array<std::uint8_t, 32> bob_priv{};
+    randombytes_buf(bob_priv.data(), bob_priv.size());
+    std::array<std::uint8_t, 32> bob_pub{};
+    ASSERT_EQ(0, crypto_scalarmult_base(bob_pub.data(), bob_priv.data()));
+    auto alice = fb::crypto::DoubleRatchet::init_alice(shared, bob_pub);
+
+    // Alice encrypts a known canary.
+    const std::string canary =
+        "OPACITY-CANARY-deadbeef-friend-relay-must-not-see-this";
+    std::vector<std::uint8_t> aad{0x01, 0x02, 0x03, 0x04};
+    std::vector<std::uint8_t> plaintext(canary.begin(), canary.end());
+    auto ct = alice.encrypt(
+        std::span<const std::uint8_t>(plaintext.data(), plaintext.size()),
+        std::span<const std::uint8_t>(aad.data(), aad.size()));
+
+    // The "envelope" the relay sees is the ratchet ciphertext (in the
+    // production path it's a wire-form fb::proto::Envelope wrapping
+    // ct; for opacity testing the wrapper adds nothing — only ct
+    // could possibly leak plaintext).
+    fb::p2p::OfflineRelayStore relay;
+    std::vector<std::uint8_t> bob_id(32, 0xb0);
+    ASSERT_EQ(relay.deposit(as_span(bob_id), as_span(ct)),
+              fb::p2p::OfflineRelayStore::DepositResult::kAccepted);
+
+    // The relay operator inspects what they're holding — fetch is
+    // exactly what they have access to via the storage layer.
+    auto held = relay.fetch_and_clear(as_span(bob_id));
+    ASSERT_EQ(held.size(), 1u);
+    const auto& blob = held[0];
+
+    // Plaintext canary must NOT appear in the blob bytes.
+    auto find_substr = [&](std::string_view needle) {
+        if (needle.size() > blob.size()) return false;
+        for (std::size_t i = 0; i + needle.size() <= blob.size(); ++i) {
+            if (std::memcmp(blob.data() + i, needle.data(),
+                              needle.size()) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+    EXPECT_FALSE(find_substr(canary))
+        << "relay can read the full plaintext canary it deposited — "
+           "AEAD layer is broken";
+    // Also scan for short substrings — even a 6-byte plaintext run
+    // appearing here would be a structural leak.
+    for (std::size_t L = 6; L <= 16 && L <= canary.size(); L += 2) {
+        for (std::size_t i = 0; i + L <= canary.size(); ++i) {
+            std::string_view sub(canary.data() + i, L);
+            EXPECT_FALSE(find_substr(sub))
+                << "relay sees " << L << "-byte plaintext substring "
+                   "starting at canary offset " << i << ": " << sub;
+        }
+    }
 }

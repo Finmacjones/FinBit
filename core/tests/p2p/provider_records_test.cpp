@@ -135,6 +135,31 @@ TEST(ProviderStore, BadSignatureRejected) {
               fb::p2p::ProviderStore::PutResult::kRejectedSig);
 }
 
+// Spoofed publisher attack: attacker has their OWN valid keypair,
+// generates a real signed record advertising their own routes, then
+// rewrites publisher_pubkey to the VICTIM's pubkey hoping the
+// receiver only checks the signature against the bytes-as-they-look.
+// The receiver must verify the signature against publisher_pubkey
+// (which is now the victim's), and that verification must fail
+// because the signature was produced under attacker's secret key.
+TEST(ProviderStore, SpoofedPublisherPubkeyRejected) {
+    auto attacker = gen_kp();
+    auto victim   = gen_kp();
+    auto rec = fb::p2p::build_record(
+        as_span(attacker.pub), as_span(attacker.sec),
+        { "wss://attacker.evil:443" }, kT0, kTtl);
+    // Rewrite publisher_pubkey to the victim's identity, keep the
+    // attacker's signature intact. A naive receiver that only checks
+    // "does the signature decode" without checking against
+    // publisher_pubkey would accept this.
+    rec.set_publisher_pubkey(std::string(victim.pub.begin(), victim.pub.end()));
+    fb::p2p::ProviderStore store;
+    EXPECT_EQ(store.put(rec, kNow),
+              fb::p2p::ProviderStore::PutResult::kRejectedSig)
+        << "store accepted a record whose signature was made under "
+           "a key OTHER than the claimed publisher_pubkey";
+}
+
 TEST(ProviderStore, EmptyAddressListRejected) {
     auto kp = gen_kp();
     fb::proto::ProviderRecord rec;
