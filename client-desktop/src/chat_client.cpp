@@ -700,133 +700,14 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     peer, wire);
                 });
 
-            // ---- DM-text decrypt helper (I1) ----
-            // Focused refactor of the existing inline kEnvelope DM
-            // path. Reused by both Frame.envelope (server-relay) and
-            // PeerEnvelope::DM (direct-P2P) so the user-visible
-            // "alice DMs bob" works identically over both transports.
-            //
-            // Scope: TEXT payloads only. Other DmPayload kinds
-            // (channel_key, mls_*, media_signal) still flow through
-            // the existing inline kEnvelope handler — those have
-            // deeper integration with channel state / MLS pending
-            // joins / media call queues that would balloon this
-            // helper. A follow-up can hoist them in too.
-            //
-            // Returns true if the envelope decrypted to a TEXT
-            // payload AND messageReceived was emitted; false on any
-            // failure (bad crypto, non-text payload, malformed AAD).
-            // Caller can fall through to the inline kEnvelope handler
-            // on false to preserve the legacy code path for non-text
-            // payloads.
-            auto try_decrypt_dm_text =
-                [this](const fb::proto::Envelope& env) -> bool {
-                if (env.sender_pubkey().size() != 32) return false;
-                const std::string sender_pub_bytes(
-                    env.sender_pubkey().begin(),
-                    env.sender_pubkey().end());
-
-                // Locate (or create) the ratchet session for this
-                // peer. Same logic as the inline kEnvelope handler:
-                // reuse an existing session if one exists for this
-                // pubkey; otherwise spin up a fresh init_bob.
-                std::array<std::uint8_t, 32> sender_pub_arr{};
-                std::memcpy(sender_pub_arr.data(),
-                             sender_pub_bytes.data(), 32);
-                std::string sname;
-                for (auto& [name, s] : impl_->sessions) {
-                    if (s.rat && s.peer_pub == sender_pub_arr) {
-                        sname = name;
-                        break;
-                    }
-                }
-                if (sname.empty()) {
-                    sname = "peer:" + sender_pub_bytes.substr(0, 8);
-                }
-                auto& sess = impl_->sessions[sname];
-                if (!sess.rat) {
-                    std::array<std::uint8_t, 32> peer_x{};
-                    if (crypto_sign_ed25519_pk_to_curve25519(
-                            peer_x.data(),
-                            reinterpret_cast<const std::uint8_t*>(
-                                sender_pub_bytes.data())) != 0) {
-                        return false;
-                    }
-                    auto shared = derive_shared_secret(
-                        impl_->x25519,
-                        std::span<const std::uint8_t, 32>(
-                            peer_x.data(), 32));
-                    sess.rat.emplace(
-                        fb::crypto::DoubleRatchet::init_bob(
-                            std::span<const std::uint8_t, 32>(
-                                shared.data(), shared.size()),
-                            std::span<const std::uint8_t, 32>(
-                                impl_->x25519.priv.data(), 32),
-                            std::span<const std::uint8_t, 32>(
-                                impl_->x25519.pub.data(), 32)));
-                    sess.peer_pub = sender_pub_arr;
-                    sess.peer_x   = peer_x;
-                }
-
-                // Re-derive + cross-check Envelope.aad just like the
-                // existing inline path.
-                std::vector<std::uint8_t> outer_aad(
-                    env.aad().begin(), env.aad().end());
-                if (!outer_aad.empty()) {
-                    std::vector<std::uint8_t> envid(
-                        env.envelope_id().begin(),
-                        env.envelope_id().end());
-                    auto expected = envelope_aad_bytes(
-                        std::span<const std::uint8_t>(envid.data(),
-                                                       envid.size()),
-                        env.timestamp_ms());
-                    if (expected != outer_aad) return false;
-                }
-
-                // Decrypt via the ratchet.
-                std::vector<std::uint8_t> ct(env.ciphertext().begin(),
-                                              env.ciphertext().end());
-                std::optional<std::vector<std::uint8_t>> pt;
-                try {
-                    pt = sess.rat->decrypt(
-                        std::span<const std::uint8_t>(ct.data(), ct.size()),
-                        std::span<const std::uint8_t>(outer_aad.data(),
-                                                       outer_aad.size()));
-                } catch (...) { return false; }
-                if (!pt) return false;
-
-                // Parse the inner DmPayload. Only TEXT goes through
-                // this helper — everything else returns false so the
-                // caller can let the inline kEnvelope handler take
-                // over.
-                fb::proto::DmPayload payload;
-                if (!payload.ParseFromArray(
-                        pt->data(), static_cast<int>(pt->size()))) {
-                    return false;
-                }
-                if (payload.body_case() != fb::proto::DmPayload::kText) {
-                    return false;
-                }
-
-                // Fingerprint = peer's stable display ID; cached
-                // username if we know it (same lookup the inline
-                // path does).
-                const auto peer_fp = QString::fromStdString(
-                    fb::crypto::Identity::fingerprint(sender_pub_arr));
-                QString cached_username;
-                if (impl_->store) {
-                    if (auto u = impl_->store->peer_name(
-                            std::span<const std::uint8_t>(
-                                sender_pub_arr.data(),
-                                sender_pub_arr.size()))) {
-                        cached_username = QString::fromStdString(*u);
-                    }
-                }
-                emit messageReceived(peer_fp, cached_username,
-                    QString::fromStdString(payload.text()));
-                return true;
-            };
-            (void)try_decrypt_dm_text;   // referenced from PeerEnvelope dispatch
+            // I1's try_decrypt_dm_text helper used to live here as a
+            // focused TEXT-only handler so PeerEnvelope::DM had a
+            // way to decrypt + emit messageReceived without touching
+            // the giant inline kEnvelope body. The R refactor
+            // (later in this worker) hoisted that whole body into
+            // dispatch_envelope, which handles every DmPayload kind
+            // — text, channel_key, mls_*, media_signal — over every
+            // transport. The TEXT-only helper is no longer needed.
             // ---- PeerNet (direct peer-to-peer) ----
             // Optional. Configured via env vars so the desktop UI
             // doesn't need an "expose my port" toggle yet:
@@ -931,21 +812,27 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 impl_->gossip->set_on_topic_message(
                     [this](const std::string& topic,
                             std::span<const std::uint8_t> payload,
-                            const fb::p2p::PeerInfo& origin) {
+                            const fb::p2p::PeerInfo& /*origin*/) {
                         // Channel topics are "fb-chan:<hex>"; payload
-                        // is a serialized Envelope. We surface the
-                        // arrival via the activity log; full
-                        // channel-decrypt routing into ChannelState
-                        // is the same refactor pending for direct-DM
-                        // dispatch — both share the kEnvelope inline
-                        // body that hasn't been hoisted yet.
+                        // is a serialized Envelope. Push onto the
+                        // overlay_inbox so the worker thread routes
+                        // it through dispatch_envelope on its next
+                        // tick (gossip threads aren't allowed to
+                        // touch ChannelState / sessions directly).
+                        // Tagged with sender_pubkey="GOSS" so the
+                        // drain knows to feed dispatch_envelope
+                        // instead of parsing as Frame.peer.
+                        Impl::OverlayInboundMsg m;
+                        m.bytes.assign(payload.begin(), payload.end());
+                        m.sender_pubkey =
+                            std::vector<std::uint8_t>{'G','O','S','S'};
+                        std::lock_guard lk(impl_->overlay_inbox_mu);
+                        impl_->overlay_inbox.push_back(std::move(m));
                         emit log(QString("channel gossip: topic=%1 "
-                                          "%2B from %3-byte peer")
+                                          "queued %2B")
                                      .arg(QString::fromStdString(topic))
                                      .arg(static_cast<qulonglong>(
-                                         payload.size()))
-                                     .arg(static_cast<qulonglong>(
-                                         origin.pubkey.size())));
+                                         payload.size())));
                     });
                 impl_->gossip->start();
                 emit log(QString("gossip P2PNode started on :%1")
@@ -1386,1138 +1273,20 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 }
             };
 
-            // Main I/O loop.
-            std::vector<std::uint8_t> rxbuf(4096);
-            while (impl_->running) {
-                // 0a. Drain inbound overlay messages from PeerNet
-                //     workers (direct-P2P traffic). Same dispatch
-                //     path as server-relayed Frame.peer below.
-                std::deque<Impl::OverlayInboundMsg> overlay_drain;
-                {
-                    std::lock_guard lk(impl_->overlay_inbox_mu);
-                    overlay_drain.swap(impl_->overlay_inbox);
-                }
-                for (auto& m : overlay_drain) {
-                    fb::proto::Frame f;
-                    if (!f.ParseFromArray(m.bytes.data(),
-                                           static_cast<int>(m.bytes.size()))) {
-                        continue;
-                    }
-                    if (f.body_case() != fb::proto::Frame::kPeer) continue;
-                    const auto& pe = f.peer();
-                    fb::p2p::PeerInfo from{};
-                    if (pe.sender_pubkey().size() == 32) {
-                        from.id = fb::p2p::node_id_from_pubkey(
-                            std::span<const std::uint8_t>(
-                                reinterpret_cast<const std::uint8_t*>(
-                                    pe.sender_pubkey().data()),
-                                32));
-                        from.pubkey.assign(pe.sender_pubkey().begin(),
-                                            pe.sender_pubkey().end());
-                        if (impl_->dht) impl_->dht->observe(from);
-                    }
-                    auto payload = std::span<const std::uint8_t>(
-                        reinterpret_cast<const std::uint8_t*>(
-                            pe.payload().data()),
-                        pe.payload().size());
-                    switch (pe.kind()) {
-                        case fb::proto::PeerEnvelope::DHT:
-                            if (impl_->dht) impl_->dht->on_message(from, payload);
-                            break;
-                        case fb::proto::PeerEnvelope::GOSSIP:
-                            if (impl_->username_gossip)
-                                impl_->username_gossip->on_message(from, payload);
-                            break;
-                        case fb::proto::PeerEnvelope::DM: {
-                            // Direct-P2P DM via PeerNet: payload is
-                            // a wire-form Envelope. Decrypt + emit
-                            // via try_decrypt_dm_text (TEXT path
-                            // only; other DmPayload kinds still
-                            // route through the inline kEnvelope
-                            // handler on the server-relay path).
-                            fb::proto::Envelope inner;
-                            if (!inner.ParseFromArray(
-                                    payload.data(),
-                                    static_cast<int>(payload.size()))) {
-                                break;
-                            }
-                            if (try_decrypt_dm_text(inner)) {
-                                emit log("DM (PeerNet) decrypted via "
-                                          "I1 helper");
-                            } else {
-                                emit log("DM (PeerNet) received but "
-                                          "decrypt failed or non-text "
-                                          "payload");
-                            }
-                            break;
-                        }
-                        case fb::proto::PeerEnvelope::OFFLINE_DEPOSIT: {
-                            // Someone designated us as a relay for
-                            // pe.recipient_pubkey and is depositing
-                            // an encrypted blob. Store opaquely —
-                            // we can't decrypt (it's encrypted to
-                            // the recipient).
-                            if (!impl_->offline_store) break;
-                            const auto& rec = pe.recipient_pubkey();
-                            if (rec.size() != 32) break;
-                            auto r = impl_->offline_store->deposit(
-                                std::span<const std::uint8_t>(
-                                    reinterpret_cast<const std::uint8_t*>(
-                                        rec.data()), 32),
-                                payload);
-                            emit log(QString("OFFLINE_DEPOSIT: %1")
-                                .arg(r == fb::p2p::OfflineRelayStore::DepositResult::kAccepted
-                                     ? "accepted"
-                                     : "rejected"));
-                            break;
-                        }
-                        case fb::proto::PeerEnvelope::OFFLINE_FETCH: {
-                            // Recipient is asking for everything
-                            // we've held for them. The sender's
-                            // pubkey IS the recipient pubkey here
-                            // (you can only fetch your own queue).
-                            if (!impl_->offline_store) break;
-                            if (from.pubkey.size() != 32) break;
-                            auto blobs = impl_->offline_store
-                                ->fetch_and_clear(
-                                    std::span<const std::uint8_t>(
-                                        from.pubkey.data(),
-                                        from.pubkey.size()));
-                            if (!blobs.empty()) {
-                                emit log(QString("OFFLINE_FETCH: "
-                                    "delivering %1 queued blob(s) "
-                                    "to peer")
-                                    .arg(static_cast<qulonglong>(
-                                        blobs.size())));
-                            }
-                            for (const auto& b : blobs) {
-                                wrap_peer_send(
-                                    fb::proto::PeerEnvelope::OFFLINE_DELIVERY,
-                                    from,
-                                    std::span<const std::uint8_t>(
-                                        b.data(), b.size()));
-                            }
-                            break;
-                        }
-                        case fb::proto::PeerEnvelope::OFFLINE_DELIVERY: {
-                            // A relay is delivering a queued blob to
-                            // us. The blob is a wire-form Envelope
-                            // we can decrypt the same way as direct
-                            // DM delivery.
-                            fb::proto::Envelope inner;
-                            if (!inner.ParseFromArray(
-                                    payload.data(),
-                                    static_cast<int>(payload.size()))) {
-                                break;
-                            }
-                            if (try_decrypt_dm_text(inner)) {
-                                emit log("DM (offline-relay) "
-                                          "decrypted");
-                            }
-                            break;
-                        }
-                        default: break;
-                    }
-                }
-
-                // 0b. Periodic maintenance ticks.
-                {
-                    const auto t = now_ms();
-                    if (t - impl_->last_self_publish_ms
-                            >= kRepublishIntervalMs) {
-                        impl_->last_self_publish_ms = t;
-                        republish_self();
-                    }
-                    if (t - impl_->last_gossip_pull_ms
-                            >= kGossipPullIntervalMs) {
-                        impl_->last_gossip_pull_ms = t;
-                        gossip_pull_round();
-                    }
-                }
-
-                // 0. Drain pending channel ops.
-                std::deque<PendingChannelOp> chan_ops;
-                {
-                    std::lock_guard lk(impl_->mu);
-                    chan_ops.swap(impl_->chan_queue);
-                }
-                for (auto& op : chan_ops) {
-                    auto& cs = impl_->channels[op.channel_name];
-                    if (cs.id[0] == 0 && cs.id[1] == 0 && cs.id[2] == 0) {
-                        cs.id = channel_id_from_name(op.channel_name);
-                        impl_->chan_id_to_name[std::string(
-                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size())] =
-                            op.channel_name;
-                    }
-                    auto subscribe_now = [&]() {
-                        if (cs.subscribed) return;
-                        fb::proto::Frame f;
-                        f.mutable_chan_subscribe()->set_channel_group_id(
-                            std::string(reinterpret_cast<const char*>(cs.id.data()),
-                                        cs.id.size()));
-                        blocking_send(impl_->conn, serialize(f));
-                        cs.subscribed = true;
-                        // I3: also subscribe via gossipsub when
-                        // P2PNode is configured. Channel envelope
-                        // fan-out then works without a central
-                        // server (each member who's subscribed
-                        // receives via gossip flood).
-                        if (impl_->gossip) {
-                            const auto topic =
-                                fb::p2p::channel_topic_name(
-                                    std::span<const std::uint8_t>(
-                                        cs.id.data(), cs.id.size()));
-                            impl_->gossip->subscribe(topic);
-                            emit log(QString("gossip subscribed to "
-                                              "channel topic %1")
-                                         .arg(QString::fromStdString(
-                                             topic.substr(0, 24)) + "…"));
-                        }
-                        emit channelJoined(QString::fromStdString(op.channel_name));
-                        emit log(QString("subscribed to channel #%1")
-                                     .arg(QString::fromStdString(op.channel_name)));
-                    };
-                    if (op.kind == PendingChannelOp::Kind::kCreate) {
-                        try {
-                            cs.own_dist = cs.session->create_own_send_chain();
-                            write_file_bytes(op.dist_path,
-                                             std::span<const std::uint8_t>(cs.own_dist.data(),
-                                                                            cs.own_dist.size()));
-                            emit log(QString("created channel #%1 — distribution at %2")
-                                         .arg(QString::fromStdString(op.channel_name))
-                                         .arg(QString::fromStdString(op.dist_path)));
-                            subscribe_now();
-                            persist_chan_meta(op.channel_name, cs);
-                            persist_chan_session(op.channel_name, cs);
-                        } catch (const std::exception& e) {
-                            emit errorOccurred(
-                                QString("create channel failed: %1").arg(e.what()));
-                        }
-                    } else if (op.kind == PendingChannelOp::Kind::kCreateLocal) {
-                        // Lightweight create: own SenderKeys chain + subscribe,
-                        // but no distribution file and no peer DM. The user
-                        // invites peers separately via the Invite button.
-                        try {
-                            if (cs.own_dist.empty()) {
-                                cs.own_dist = cs.session->create_own_send_chain();
-                            }
-                            // Record the per-channel cipher choice. Even
-                            // for an MLS channel we keep the SenderKeys
-                            // distribution around — it's small, harmless,
-                            // and lets the receive path fall back if a
-                            // peer hasn't migrated yet.
-                            cs.crypto = op.use_mls
-                                ? fb::store::SqliteStore::ChannelCrypto::kMls
-                                : fb::store::SqliteStore::ChannelCrypto::kSenderKeys;
-                            if (op.use_mls) {
-                                // Create a fresh single-member MLS group
-                                // with us as the founder. The same
-                                // channel_id we derived above is the MLS
-                                // group_id — they're 32 bytes so the
-                                // mapping is direct, and using the same
-                                // value keeps server-side routing
-                                // unchanged for MLS channels.
-                                if (cs.id[0] == 0 && cs.id[1] == 0) {
-                                    cs.id = channel_id_from_name(op.channel_name);
-                                }
-                                try {
-                                    cs.mls = fb::crypto::MlsGroup::create(
-                                        std::span<const std::uint8_t, 32>(
-                                            impl_->identity->public_key().data(), 32),
-                                        std::span<const std::uint8_t, 32>(
-                                            cs.id.data(), 32));
-                                    // Persist the seed BEFORE returning
-                                    // success — if the process dies
-                                    // between create and the first
-                                    // commit, the empty group is still
-                                    // restorable.
-                                    persist_mls_seed(cs);
-                                } catch (const std::exception& e) {
-                                    emit errorOccurred(QString(
-                                        "MLS create failed: %1 — falling back to "
-                                        "SenderKeys for #%2").arg(e.what())
-                                        .arg(QString::fromStdString(op.channel_name)));
-                                    cs.crypto =
-                                        fb::store::SqliteStore::ChannelCrypto::kSenderKeys;
-                                }
-                            }
-                            subscribe_now();
-                            persist_chan_meta(op.channel_name, cs);
-                            persist_chan_session(op.channel_name, cs);
-                            emit log(QString("created local channel #%1 (%2, no peers yet)")
-                                         .arg(QString::fromStdString(op.channel_name))
-                                         .arg(op.use_mls ? "MLS" : "SenderKeys"));
-                        } catch (const std::exception& e) {
-                            emit errorOccurred(
-                                QString("create channel failed: %1").arg(e.what()));
-                        }
-                    } else if (op.kind == PendingChannelOp::Kind::kJoin) {
-                        try {
-                            auto dist_blob = read_file_bytes(op.dist_path);
-                            cs.own_dist = std::move(dist_blob);
-                            // Stage the dist for installation when the first
-                            // inbound channel envelope arrives (we still
-                            // don't know the *sender* pubkey here — Phase 1
-                            // simplification: every channel msg carries
-                            // sender_pubkey in the envelope so we install
-                            // lazily per-sender on first sight).
-                            emit log(QString("joined channel #%1 from %2")
-                                         .arg(QString::fromStdString(op.channel_name))
-                                         .arg(QString::fromStdString(op.dist_path)));
-                            subscribe_now();
-                            persist_chan_meta(op.channel_name, cs);
-                            persist_chan_session(op.channel_name, cs);
-                        } catch (const std::exception& e) {
-                            emit errorOccurred(
-                                QString("join channel failed: %1").arg(e.what()));
-                        }
-                    } else if (op.kind == PendingChannelOp::Kind::kSend) {
-                        if (cs.own_dist.empty()) {
-                            emit errorOccurred(
-                                QString("cannot send to #%1: not created/joined yet")
-                                    .arg(QString::fromStdString(op.channel_name)));
-                            continue;
-                        }
-                        try {
-                            std::vector<std::uint8_t> pt(op.text.begin(), op.text.end());
-                            std::vector<std::uint8_t> envid(16);
-                            randombytes_buf(envid.data(), envid.size());
-                            const auto now_ms = static_cast<std::uint64_t>(
-                                std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count());
-                            const auto env_aad = envelope_aad_bytes(
-                                std::span<const std::uint8_t>(envid.data(), envid.size()),
-                                now_ms);
-                            // Branch on per-channel cipher: MLS channels
-                            // route the plaintext through MlsGroup::
-                            // application_encrypt; SenderKeys channels
-                            // keep using the existing GroupSession.
-                            // env_aad isn't bound by mls::Session::protect
-                            // (mlspp computes its own internal AAD over
-                            // the MLSCiphertext header) — for MLS we
-                            // leave Envelope.aad empty so receivers don't
-                            // mismatch; for SenderKeys it's bound as
-                            // before.
-                            std::vector<std::uint8_t> inner;
-                            const bool use_mls =
-                                cs.crypto == fb::store::SqliteStore::ChannelCrypto::kMls
-                                && cs.mls;
-                            if (use_mls) {
-                                inner = cs.mls->application_encrypt(
-                                    std::span<const std::uint8_t>(pt.data(), pt.size()));
-                            } else {
-                                inner = cs.session->encrypt(
-                                    std::span<const std::uint8_t>(pt.data(), pt.size()),
-                                    std::span<const std::uint8_t>(env_aad.data(),
-                                                                    env_aad.size()));
-                            }
-                            fb::proto::Frame f;
-                            auto* env = f.mutable_envelope();
-                            env->set_envelope_id(std::string(envid.begin(), envid.end()));
-                            env->set_timestamp_ms(now_ms);
-                            // Skip Envelope.aad for MLS — mls::Session
-                            // covers its own AAD internally; populating
-                            // Envelope.aad would make receivers reject
-                            // the message at the cross-check.
-                            if (!use_mls) {
-                                env->set_aad(std::string(env_aad.begin(), env_aad.end()));
-                            }
-                            env->set_channel_group_id(std::string(
-                                reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
-                            env->set_sender_pubkey(std::string(
-                                reinterpret_cast<const char*>(
-                                    impl_->identity->public_key().data()),
-                                impl_->identity->public_key().size()));
-                            env->set_ciphertext(std::string(inner.begin(), inner.end()));
-                            env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
-                            env->set_protocol_version(fb::config::kProtocolVersion);
-                            blocking_send(impl_->conn, serialize(f));
-                            // Persist channel state so the advanced send-chain
-                            // survives a restart (own_next_index, own_chain_key).
-                            persist_chan_session(op.channel_name, cs);
-                            // Persist sent channel message for history replay.
-                            if (impl_->store) {
-                                const auto now_ms = static_cast<std::uint64_t>(
-                                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::system_clock::now().time_since_epoch())
-                                        .count());
-                                impl_->store->chan_append_inbox(
-                                    std::span<const std::uint8_t>(cs.id.data(), cs.id.size()),
-                                    std::span<const std::uint8_t>(
-                                        impl_->identity->public_key().data(), 32),
-                                    std::span<const std::uint8_t>(pt.data(), pt.size()),
-                                    now_ms);
-                            }
-                            emit log(QString("sent %1B to #%2")
-                                         .arg(pt.size())
-                                         .arg(QString::fromStdString(op.channel_name)));
-                        } catch (const std::exception& e) {
-                            emit errorOccurred(
-                                QString("channel send failed: %1").arg(e.what()));
-                        }
-                    } else if (op.kind == PendingChannelOp::Kind::kLeave) {
-                        // ChannelUnsubscribe over the wire so the server stops
-                        // fanning out for us, then drop everything on disk.
-                        if (cs.subscribed) {
-                            fb::proto::Frame uf;
-                            uf.mutable_chan_unsubscribe()->set_channel_group_id(
-                                std::string(reinterpret_cast<const char*>(cs.id.data()),
-                                            cs.id.size()));
-                            blocking_send(impl_->conn, serialize(uf));
-                        }
-                        if (impl_->store) {
-                            impl_->store->chan_delete(
-                                op.channel_name,
-                                std::span<const std::uint8_t>(cs.id.data(), cs.id.size()));
-                        }
-                        impl_->chan_id_to_name.erase(std::string(
-                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
-                        impl_->channels.erase(op.channel_name);
-                        emit log(QString("left #%1 (sidebar entry, sessions, persisted state "
-                                         "all cleared)")
-                                     .arg(QString::fromStdString(op.channel_name)));
-                    } else if (op.kind == PendingChannelOp::Kind::kRoomJoin) {
-                        // Group-call signaling: announce ourselves to the
-                        // room. Server replies with RoomRoster broadcasts
-                        // (handled in the read loop) on every membership
-                        // change. The room_id IS the channel_group_id —
-                        // ensure the channel exists before joining.
-                        if (cs.id[0] == 0 && cs.id[1] == 0) {
-                            cs.id = channel_id_from_name(op.channel_name);
-                        }
-                        fb::proto::Frame jf;
-                        auto* rj = jf.mutable_room_join();
-                        rj->set_room_id(std::string(
-                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
-                        rj->set_want_audio(true);
-                        rj->set_want_video(op.want_video);
-                        blocking_send(impl_->conn, serialize(jf));
-                        emit log(QString("joined call on #%1 (video=%2)")
-                                     .arg(QString::fromStdString(op.channel_name))
-                                     .arg(op.want_video ? "yes" : "no"));
-                    } else if (op.kind == PendingChannelOp::Kind::kRoomLeave) {
-                        if (cs.id[0] == 0 && cs.id[1] == 0) {
-                            cs.id = channel_id_from_name(op.channel_name);
-                        }
-                        fb::proto::Frame lf;
-                        lf.mutable_room_leave()->set_room_id(std::string(
-                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
-                        blocking_send(impl_->conn, serialize(lf));
-                        emit log(QString("left call on #%1")
-                                     .arg(QString::fromStdString(op.channel_name)));
-                    } else if (op.kind == PendingChannelOp::Kind::kInvite) {
-                        // Route based on the channel's per-channel cipher.
-                        // For MLS channels we send an MlsInviteRequest
-                        // (the four-step in-band handshake from step D);
-                        // for SenderKeys channels we keep the existing
-                        // channel-key DM-distribution flow.
-                        if (cs.crypto ==
-                            fb::store::SqliteStore::ChannelCrypto::kMls) {
-                            // Build + enqueue MlsInviteRequest payload.
-                            // Channel id derived from name to match
-                            // create_local_channel's id derivation.
-                            if (cs.id[0] == 0 && cs.id[1] == 0) {
-                                cs.id = channel_id_from_name(op.channel_name);
-                            }
-                            auto invite_payload =
-                                pack_mls_invite_request_payload(
-                                    std::span<const std::uint8_t>(
-                                        cs.id.data(), cs.id.size()),
-                                    op.channel_name);
-                            PendingSend ps;
-                            ps.peer = op.peer;
-                            ps.pre_packed_payload = std::move(invite_payload);
-                            {
-                                std::lock_guard lk(impl_->mu);
-                                impl_->queue.push_back(std::move(ps));
-                            }
-                            impl_->cv.notify_all();
-                            emit log(QString("MLS invite-request queued: "
-                                              "%1 → #%2")
-                                         .arg(QString::fromStdString(op.peer))
-                                         .arg(QString::fromStdString(op.channel_name)));
-                            continue;
-                        }
-                        // SenderKeys path (default): in-band invite — ensure
-                        // we have a chain, then queue a DM to `peer`
-                        // carrying the channel-key payload.
-                        if (cs.own_dist.empty()) {
-                            try {
-                                cs.own_dist = cs.session->create_own_send_chain();
-                                emit log(QString("created channel #%1 for invite")
-                                             .arg(QString::fromStdString(op.channel_name)));
-                            } catch (const std::exception& e) {
-                                emit errorOccurred(
-                                    QString("channel create-for-invite failed: %1")
-                                        .arg(e.what()));
-                                continue;
-                            }
-                        }
-                        subscribe_now();
-                        // Queue a DM with the channel-key payload. We piggy-
-                        // back on the existing send_to_peer pipeline (which
-                        // packs DmPayload{text}) by pushing a *raw* DM here
-                        // with a sentinel — actually simpler: enqueue
-                        // directly via the same path with a special marker.
-                        // The cleanest path is to inline it: build the
-                        // ratchet message and send right here, since we
-                        // already have access to sessions[peer].
-                        auto& peer_sess = impl_->sessions[op.peer];
-                        if (!peer_sess.rat) {
-                            // Trigger prekey fetch like normal send-to-peer
-                            // would; then re-queue the invite for retry.
-                            fb::proto::Frame f;
-                            f.mutable_key_fetch()->set_username(op.peer);
-                            blocking_send(impl_->conn, serialize(f));
-                            emit log(QString("fetching prekey for %1 to deliver invite")
-                                         .arg(QString::fromStdString(op.peer)));
-                            std::lock_guard lk(impl_->mu);
-                            impl_->pending_fetch_targets.push_back(op.peer);
-                            impl_->chan_queue.push_front(std::move(op));
-                            break;
-                        }
-                        auto pt = pack_channel_key_payload(
-                            std::span<const std::uint8_t>(cs.id.data(), cs.id.size()),
-                            op.channel_name,
-                            std::span<const std::uint8_t>(cs.own_dist.data(),
-                                                           cs.own_dist.size()));
-                        std::vector<std::uint8_t> envid(16);
-                        randombytes_buf(envid.data(), envid.size());
-                        const auto now_ms = static_cast<std::uint64_t>(
-                            std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count());
-                        const auto env_aad = envelope_aad_bytes(
-                            std::span<const std::uint8_t>(envid.data(), envid.size()),
-                            now_ms);
-                        auto inner = peer_sess.rat->encrypt(
-                            std::span<const std::uint8_t>(pt.data(), pt.size()),
-                            std::span<const std::uint8_t>(env_aad.data(),
-                                                            env_aad.size()));
-                        fb::proto::Frame f;
-                        auto* env = f.mutable_envelope();
-                        env->set_envelope_id(std::string(envid.begin(), envid.end()));
-                        env->set_timestamp_ms(now_ms);
-                        env->set_aad(std::string(env_aad.begin(), env_aad.end()));
-                        env->set_user_pubkey(std::string(
-                            reinterpret_cast<const char*>(peer_sess.peer_pub.data()),
-                            peer_sess.peer_pub.size()));
-                        env->set_sender_pubkey(std::string(
-                            reinterpret_cast<const char*>(
-                                impl_->identity->public_key().data()),
-                            impl_->identity->public_key().size()));
-                        env->set_ciphertext(std::string(inner.begin(), inner.end()));
-                        env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
-                        env->set_protocol_version(fb::config::kProtocolVersion);
-                        blocking_send(impl_->conn, serialize(f));
-                        // Persist channel meta (own_dist may be brand-new).
-                        persist_chan_meta(op.channel_name, cs);
-                        persist_chan_session(op.channel_name, cs);
-                        emit log(QString("invited %1 to #%2")
-                                     .arg(QString::fromStdString(op.peer))
-                                     .arg(QString::fromStdString(op.channel_name)));
-                    }
-                }
-
-                // 1a. Drain pending media-signal sends.
-                {
-                    std::deque<PendingMediaSignal> ms;
-                    {
-                        std::lock_guard lk(impl_->mu);
-                        ms.swap(impl_->media_queue);
-                    }
-                    for (auto& sig : ms) {
-                        // Find the per-peer ratchet session by pubkey.
-                        Impl::Session* sess = nullptr;
-                        for (auto& [name, s] : impl_->sessions) {
-                            if (s.peer_pub == sig.peer_pub) { sess = &s; break; }
-                        }
-                        if (!sess || !sess->rat) {
-                            fb::crypto::PubKey want{};
-                            std::memcpy(want.data(), sig.peer_pub.data(), 32);
-                            const QString want_fp = QString::fromStdString(
-                                fb::crypto::Identity::fingerprint(want));
-                            emit log(QString("media signal dropped — no session "
-                                             "for peer (kind=%1 want_fp=%2 sessions=%3)")
-                                         .arg(sig.kind).arg(want_fp)
-                                         .arg(impl_->sessions.size()));
-                            continue;
-                        }
-                        auto pt = pack_media_signal_payload(
-                            std::span<const std::uint8_t, 16>(sig.call_id.data(), 16),
-                            sig.kind,
-                            std::span<const std::uint8_t>(sig.payload.data(), sig.payload.size()),
-                            sig.epoch);
-                        std::vector<std::uint8_t> envid(16);
-                        randombytes_buf(envid.data(), envid.size());
-                        const auto now_ms = static_cast<std::uint64_t>(
-                            std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch()).count());
-                        const auto env_aad = envelope_aad_bytes(
-                            std::span<const std::uint8_t>(envid.data(), envid.size()),
-                            now_ms);
-                        auto inner = sess->rat->encrypt(
-                            std::span<const std::uint8_t>(pt.data(), pt.size()),
-                            std::span<const std::uint8_t>(env_aad.data(),
-                                                            env_aad.size()));
-                        fb::proto::Frame f;
-                        auto* env = f.mutable_envelope();
-                        env->set_envelope_id(std::string(envid.begin(), envid.end()));
-                        env->set_timestamp_ms(now_ms);
-                        env->set_aad(std::string(env_aad.begin(), env_aad.end()));
-                        env->set_user_pubkey(std::string(
-                            reinterpret_cast<const char*>(sig.peer_pub.data()),
-                            sig.peer_pub.size()));
-                        env->set_sender_pubkey(std::string(
-                            reinterpret_cast<const char*>(impl_->identity->public_key().data()),
-                            impl_->identity->public_key().size()));
-                        env->set_ciphertext(std::string(inner.begin(), inner.end()));
-                        env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
-                        env->set_protocol_version(fb::config::kProtocolVersion);
-                        blocking_send(impl_->conn, serialize(f));
-                    }
-                }
-
-                // 1. Drain pending sends.
-                std::deque<PendingSend> to_send;
-                {
-                    std::lock_guard lk(impl_->mu);
-                    to_send.swap(impl_->queue);
-                }
-                for (auto& s : to_send) {
-                    // If the target looks like a fingerprint ("XXXXX-XXXXX")
-                    // — which is what the UI puts in the field when the user
-                    // replies to a peer whose username hasn't resolved yet —
-                    // try to find an existing session whose peer_pub matches
-                    // the fingerprint, and rebind this send to that session's
-                    // original key. Without this, key_fetch goes out for the
-                    // fingerprint-as-username, the server returns not-found,
-                    // and the failsafe fires "no such user" even though we
-                    // already have a working ratchet for the actual peer.
-                    if (s.peer.size() == 11 && s.peer[5] == '-' &&
-                        !impl_->sessions.count(s.peer)) {
-                        for (const auto& [name, sess_existing] : impl_->sessions) {
-                            if (!sess_existing.rat) continue;
-                            fb::crypto::PubKey pk{};
-                            std::memcpy(pk.data(), sess_existing.peer_pub.data(), 32);
-                            if (fb::crypto::Identity::fingerprint(pk) == s.peer) {
-                                emit log(QString("rebinding reply: fp %1 -> session '%2'")
-                                             .arg(QString::fromStdString(s.peer))
-                                             .arg(QString::fromStdString(name)));
-                                s.peer = name;
-                                break;
-                            }
-                        }
-                    }
-                    auto& sess = impl_->sessions[s.peer];
-                    if (!sess.rat) {
-                        // Need to fetch peer bundle first.
-                        fb::proto::Frame f;
-                        f.mutable_key_fetch()->set_username(s.peer);
-                        blocking_send(impl_->conn, serialize(f));
-                        emit log(QString("fetching prekey for %1")
-                                     .arg(QString::fromStdString(s.peer)));
-                        // Re-enqueue; we'll handle the response in the read
-                        // loop and re-try.
-                        std::lock_guard lk(impl_->mu);
-                        impl_->pending_fetch_targets.push_back(s.peer);
-                        impl_->queue.push_front(std::move(s));
-                        break;
-                    }
-                    // Wrap as DmPayload{text} so receivers can disambiguate
-                    // text from channel-key invites — UNLESS the caller
-                    // already supplied a pre-packed payload (the MLS
-                    // handshake sends use this to ride the same ratchet
-                    // without needing a parallel queue).
-                    auto pt = s.has_pre_packed()
-                        ? std::move(s.pre_packed_payload)
-                        : pack_text_payload(s.text);
-                    std::vector<std::uint8_t> envid(16);
-                    randombytes_buf(envid.data(), envid.size());
-                    const auto now_ms = static_cast<std::uint64_t>(
-                        std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch())
-                            .count());
-                    const auto env_aad = envelope_aad_bytes(
-                        std::span<const std::uint8_t>(envid.data(), envid.size()),
-                        now_ms);
-                    auto inner = sess.rat->encrypt(
-                        std::span<const std::uint8_t>(pt.data(), pt.size()),
-                        std::span<const std::uint8_t>(env_aad.data(),
-                                                        env_aad.size()));
-                    fb::proto::Frame f;
-                    auto* env = f.mutable_envelope();
-                    env->set_envelope_id(std::string(envid.begin(), envid.end()));
-                    env->set_timestamp_ms(now_ms);
-                    env->set_aad(std::string(env_aad.begin(), env_aad.end()));
-                    env->set_user_pubkey(std::string(
-                        reinterpret_cast<const char*>(sess.peer_pub.data()),
-                        sess.peer_pub.size()));
-                    env->set_sender_pubkey(std::string(
-                        reinterpret_cast<const char*>(impl_->identity->public_key().data()),
-                        impl_->identity->public_key().size()));
-                    env->set_ciphertext(std::string(inner.begin(), inner.end()));
-                    env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
-                    env->set_protocol_version(fb::config::kProtocolVersion);
-                    blocking_send(impl_->conn, serialize(f));
-                    if (impl_->store && !s.text.empty()) {
-                        // Persist the original text bytes (not the wrapped
-                        // DmPayload blob) so on-disk history is human-
-                        // readable. Skip pre-packed sends entirely —
-                        // those are protocol-internal MLS handshake
-                        // messages, not user chat.
-                        std::vector<std::uint8_t> raw_text(s.text.begin(), s.text.end());
-                        impl_->store->append_outbox(
-                            std::span<const std::uint8_t>(envid.data(), envid.size()),
-                            std::span<const std::uint8_t>(sess.peer_pub.data(),
-                                                          sess.peer_pub.size()),
-                            std::span<const std::uint8_t>(raw_text.data(), raw_text.size()),
-                            now_ms);
-                        // Remember the username we used to send to this pubkey
-                        // so the sidebar's DM list survives a restart.
-                        impl_->store->cache_peer_name(
-                            std::span<const std::uint8_t>(sess.peer_pub.data(),
-                                                          sess.peer_pub.size()),
-                            s.peer);
-                    }
-                    emit log(QString("sent %1B to %2%3")
-                                 .arg(static_cast<qulonglong>(
-                                     s.text.empty() ? pt.size() : s.text.size()))
-                                 .arg(QString::fromStdString(s.peer))
-                                 .arg(s.text.empty() ? " (mls protocol msg)" : ""));
-                }
-
-                // 2. Read with short timeout. Conn::read_some
-                // unifies plain TCP and TLS — 0 means timeout or
-                // peer-closed; >0 means bytes available.
-                {
-                    auto n = conn_read_with_timeout(impl_->conn,
-                        std::span<std::uint8_t>(rxbuf.data(), rxbuf.size()),
-                        100);
-                if (n > 0) {
-                    impl_->dec.feed(std::span<const std::uint8_t>(
-                        rxbuf.data(), n));
-                    std::vector<std::uint8_t> frame;
-                    while (impl_->dec.try_pop(frame) ==
-                           fb::net::FrameDecoder::Status::kFrameReady) {
-                        fb::proto::Frame f;
-                        if (!f.ParseFromArray(frame.data(),
-                                              static_cast<int>(frame.size()))) {
-                            continue;
-                        }
-                        if (f.body_case() == fb::proto::Frame::kControl) {
-                            const auto& cm = f.control();
-                            if (cm.code() == fb::proto::ControlMessage::USERNAME_TAKEN) {
-                                emit errorOccurred(
-                                    QString("This username is already registered to a "
-                                            "different identity on the server. Sign out "
-                                            "and pick a different name (or restore the "
-                                            "original identity from its recovery code)."));
-                                impl_->stop_requested = true;
-                            }
-                            continue;
-                        }
-                        if (f.body_case() == fb::proto::Frame::kPeer) {
-                            // Inbound overlay envelope from another
-                            // peer (server forwarded by recipient
-                            // pubkey). Dispatch by kind to the right
-                            // overlay object.
-                            const auto& pe = f.peer();
-                            fb::p2p::PeerInfo from{};
-                            if (pe.sender_pubkey().size() == 32) {
-                                from.id = fb::p2p::node_id_from_pubkey(
-                                    std::span<const std::uint8_t>(
-                                        reinterpret_cast<const std::uint8_t*>(
-                                            pe.sender_pubkey().data()),
-                                        32));
-                                from.pubkey.assign(
-                                    pe.sender_pubkey().begin(),
-                                    pe.sender_pubkey().end());
-                                // Touch the routing table — every
-                                // sender we hear from is a viable
-                                // peer for our DHT lookups.
-                                if (impl_->dht) impl_->dht->observe(from);
-                            }
-                            auto payload = std::span<const std::uint8_t>(
-                                reinterpret_cast<const std::uint8_t*>(
-                                    pe.payload().data()),
-                                pe.payload().size());
-                            switch (pe.kind()) {
-                                case fb::proto::PeerEnvelope::DHT:
-                                    if (impl_->dht) {
-                                        impl_->dht->on_message(from, payload);
-                                    }
-                                    break;
-                                case fb::proto::PeerEnvelope::GOSSIP:
-                                    if (impl_->username_gossip) {
-                                        impl_->username_gossip->on_message(
-                                            from, payload);
-                                    }
-                                    break;
-                                case fb::proto::PeerEnvelope::DM: {
-                                    fb::proto::Envelope inner;
-                                    if (!inner.ParseFromArray(
-                                            payload.data(),
-                                            static_cast<int>(payload.size()))) {
-                                        break;
-                                    }
-                                    if (try_decrypt_dm_text(inner)) {
-                                        emit log("DM (server-relay) "
-                                                  "decrypted via I1");
-                                    }
-                                    break;
-                                }
-                                case fb::proto::PeerEnvelope::OFFLINE_DEPOSIT: {
-                                    if (!impl_->offline_store) break;
-                                    const auto& rec = pe.recipient_pubkey();
-                                    if (rec.size() != 32) break;
-                                    impl_->offline_store->deposit(
-                                        std::span<const std::uint8_t>(
-                                            reinterpret_cast<const std::uint8_t*>(
-                                                rec.data()), 32),
-                                        payload);
-                                    break;
-                                }
-                                case fb::proto::PeerEnvelope::OFFLINE_FETCH: {
-                                    if (!impl_->offline_store) break;
-                                    if (from.pubkey.size() != 32) break;
-                                    auto blobs = impl_->offline_store
-                                        ->fetch_and_clear(
-                                            std::span<const std::uint8_t>(
-                                                from.pubkey.data(),
-                                                from.pubkey.size()));
-                                    for (const auto& b : blobs) {
-                                        wrap_peer_send(
-                                            fb::proto::PeerEnvelope::OFFLINE_DELIVERY,
-                                            from,
-                                            std::span<const std::uint8_t>(
-                                                b.data(), b.size()));
-                                    }
-                                    break;
-                                }
-                                case fb::proto::PeerEnvelope::OFFLINE_DELIVERY: {
-                                    fb::proto::Envelope inner;
-                                    if (!inner.ParseFromArray(
-                                            payload.data(),
-                                            static_cast<int>(payload.size()))) {
-                                        break;
-                                    }
-                                    if (try_decrypt_dm_text(inner)) {
-                                        emit log("DM (offline-relay) "
-                                                  "decrypted");
-                                    }
-                                    break;
-                                }
-                                default:
-                                    break;
-                            }
-                            continue;
-                        }
-                        if (f.body_case() == fb::proto::Frame::kRoomRoster) {
-                            const auto& rr = f.room_roster();
-                            if (rr.room_id().size() != 32) continue;
-                            // Resolve the room_id back to a channel name —
-                            // it's the channel's group_id verbatim.
-                            std::array<std::uint8_t, 32> rid{};
-                            std::memcpy(rid.data(), rr.room_id().data(), 32);
-                            auto nit = impl_->chan_id_to_name.find(
-                                std::string(rr.room_id().begin(), rr.room_id().end()));
-                            QString chan_name;
-                            if (nit != impl_->chan_id_to_name.end()) {
-                                chan_name = QString::fromStdString(nit->second);
-                            }
-                            QStringList fps;
-                            for (const auto& p : rr.participants()) {
-                                if (p.identity_pubkey().size() != 32) continue;
-                                fb::crypto::PubKey k{};
-                                std::memcpy(k.data(), p.identity_pubkey().data(), 32);
-                                fps << QString::fromStdString(
-                                    fb::crypto::Identity::fingerprint(k));
-                            }
-                            emit log(QString("room roster for #%1: %2 participant(s)")
-                                         .arg(chan_name.isEmpty() ? "<unknown>" : chan_name)
-                                         .arg(fps.size()));
-                            emit channelCallRoster(chan_name, fps);
-
-                            // Mesh-dial: build the set of OTHER participants
-                            // in the room, diff against who we've already
-                            // dialed/accepted, and dispatch start_call_to_pub
-                            // on the Qt main thread for each new peer where
-                            // we're on the higher side of the pubkey
-                            // tiebreak (the lower side waits for our OFFER).
-                            // Departed peers get their MediaCall hung up.
-                            std::set<std::string> roster_peer_keys;
-                            std::vector<std::array<std::uint8_t, 32>> to_dial;
-                            const std::string room_id_str(rr.room_id().begin(),
-                                                           rr.room_id().end());
-                            const auto& my_pub = impl_->identity->public_key();
-                            for (const auto& p : rr.participants()) {
-                                if (p.identity_pubkey().size() != 32) continue;
-                                if (std::equal(my_pub.begin(), my_pub.end(),
-                                               p.identity_pubkey().begin())) {
-                                    continue;   // skip self
-                                }
-                                roster_peer_keys.insert(std::string(
-                                    p.identity_pubkey().begin(),
-                                    p.identity_pubkey().end()));
-                            }
-                            auto& meshed = impl_->room_mesh_peers[room_id_str];
-                            // Hang up calls for peers that left.
-                            std::vector<std::string> to_drop;
-                            for (const auto& peer_key : meshed) {
-                                if (!roster_peer_keys.count(peer_key)) {
-                                    to_drop.push_back(peer_key);
-                                }
-                            }
-                            for (const auto& peer_key : to_drop) {
-                                meshed.erase(peer_key);
-                                MediaCall* call = nullptr;
-                                {
-                                    auto it = impl_->calls_by_peer.find(peer_key);
-                                    if (it != impl_->calls_by_peer.end()) {
-                                        call = it->second.call;
-                                    }
-                                }
-                                if (call) {
-                                    QMetaObject::invokeMethod(call, [call]() {
-                                        call->hangup();
-                                    }, Qt::QueuedConnection);
-                                }
-                            }
-                            // Dial new peers (only on the higher-pubkey side).
-                            for (const auto& peer_key : roster_peer_keys) {
-                                if (meshed.count(peer_key)) continue;
-                                std::array<std::uint8_t, 32> peer_pub_arr{};
-                                std::memcpy(peer_pub_arr.data(),
-                                            peer_key.data(), 32);
-                                const bool i_dial = std::lexicographical_compare(
-                                    peer_pub_arr.begin(), peer_pub_arr.end(),
-                                    my_pub.begin(), my_pub.end());
-                                meshed.insert(peer_key);   // claim it either way
-                                if (!i_dial) continue;     // wait for inbound
-                                fb::crypto::PubKey arr{};
-                                std::memcpy(arr.data(), peer_pub_arr.data(), 32);
-                                const QString fp_label = QString::fromStdString(
-                                    fb::crypto::Identity::fingerprint(arr));
-                                // Decide here whether we have a usable session
-                                // for this peer or need to bootstrap one. If
-                                // bootstrap, queue the username_lookup right
-                                // now — the response handler will follow
-                                // through with key_fetch and ultimately
-                                // re-dispatch start_call_to_pub.
-                                bool have_session = false;
-                                for (const auto& [_, s] : impl_->sessions) {
-                                    if (s.rat && s.peer_pub == peer_pub_arr) {
-                                        have_session = true;
-                                        break;
-                                    }
-                                }
-                                if (have_session) {
-                                    to_dial.push_back(peer_pub_arr);
-                                    emit log(QString("mesh-dial: room #%1 → %2")
-                                                 .arg(chan_name).arg(fp_label));
-                                } else {
-                                    Impl::PendingMeshDial pd;
-                                    pd.room_id    = room_id_str;
-                                    pd.with_video = false;
-                                    pd.label      = fp_label;
-                                    impl_->pending_mesh_dials[peer_key] = pd;
-                                    fb::proto::Frame qf;
-                                    qf.mutable_username_lookup()->set_pubkey(
-                                        std::string(peer_key.begin(), peer_key.end()));
-                                    blocking_send(impl_->conn, serialize(qf));
-                                    emit log(QString("mesh-bootstrap: %1 has no "
-                                                      "session yet, resolving "
-                                                      "username for key fetch")
-                                                 .arg(fp_label));
-                                }
-                            }
-                            // Dispatch dials on the main thread.
-                            for (const auto& peer_pub_arr : to_dial) {
-                                std::array<std::uint8_t, 32> pub_copy = peer_pub_arr;
-                                fb::crypto::PubKey arr{};
-                                std::memcpy(arr.data(), pub_copy.data(), 32);
-                                const QString label = QString::fromStdString(
-                                    fb::crypto::Identity::fingerprint(arr));
-                                std::string room_copy = room_id_str;
-                                QMetaObject::invokeMethod(this,
-                                    [this, pub_copy, label, room_copy]() {
-                                        if (!start_call_to_pub(
-                                                pub_copy, label,
-                                                /*with_video=*/false, room_copy)) {
-                                            emit log(QString(
-                                                "mesh-dial: already calling %1")
-                                                .arg(label));
-                                        }
-                                    }, Qt::QueuedConnection);
-                            }
-                            continue;
-                        }
-                        if (f.body_case() == fb::proto::Frame::kUsernameResp) {
-                            const auto& r = f.username_resp();
-                            if (r.found() && r.pubkey().size() == 32 &&
-                                !r.username().empty()) {
-                                std::vector<std::uint8_t> pk(r.pubkey().begin(),
-                                                              r.pubkey().end());
-                                if (impl_->store) {
-                                    impl_->store->cache_peer_name(
-                                        std::span<const std::uint8_t>(pk.data(), pk.size()),
-                                        r.username());
-                                }
-                                fb::crypto::PubKey arr{};
-                                std::memcpy(arr.data(), pk.data(), 32);
-                                emit peerUsernameResolved(
-                                    QString::fromStdString(
-                                        fb::crypto::Identity::fingerprint(arr)),
-                                    QString::fromStdString(r.username()));
-                                // Mesh-bootstrap step 2: if we asked who this
-                                // peer is because we want to mesh-dial them,
-                                // follow through with a key_fetch now that we
-                                // have a username. The kKeyFetchResp success
-                                // path will retry start_call_to_pub once the
-                                // session is up.
-                                const std::string peer_pub_str(r.pubkey().begin(),
-                                                                r.pubkey().end());
-                                if (impl_->pending_mesh_dials.count(peer_pub_str)) {
-                                    fb::proto::Frame kf;
-                                    kf.mutable_key_fetch()->set_username(r.username());
-                                    blocking_send(impl_->conn, serialize(kf));
-                                    impl_->pending_fetch_targets.push_back(r.username());
-                                    impl_->mesh_bootstrap_pending[r.username()] =
-                                        peer_pub_str;
-                                    emit log(QString("mesh-bootstrap: fetching "
-                                                      "prekey for %1")
-                                                 .arg(QString::fromStdString(
-                                                     r.username())));
-                                }
-                            } else if (r.pubkey().size() == 32) {
-                                // username_lookup returned NOT_FOUND for a
-                                // peer we wanted to dial. Drop the pending
-                                // bootstrap so we don't leak state.
-                                const std::string peer_pub_str(r.pubkey().begin(),
-                                                                r.pubkey().end());
-                                if (impl_->pending_mesh_dials.erase(peer_pub_str)) {
-                                    emit log("mesh-bootstrap: server doesn't "
-                                              "know this peer — giving up");
-                                }
-                            }
-                            continue;
-                        }
-                        if (f.body_case() == fb::proto::Frame::kKeyFetchResp) {
-                            const auto& r = f.key_fetch_resp();
-                            // Pull the username this fetch was for off the
-                            // FIFO. Both DM-send and channel-invite paths
-                            // record their fetches here, so this works
-                            // whichever path triggered the lookup.
-                            std::string fetched_for;
-                            {
-                                std::lock_guard lk(impl_->mu);
-                                if (!impl_->pending_fetch_targets.empty()) {
-                                    fetched_for = impl_->pending_fetch_targets.front();
-                                    impl_->pending_fetch_targets.pop_front();
-                                }
-                            }
-                            if (fetched_for.empty()) {
-                                emit log("key_fetch_resp without an in-flight fetch — "
-                                          "ignoring");
-                                continue;
-                            }
-                            if (!r.found() || r.bundle().identity_pubkey().size() != 32 ||
-                                r.bundle().signed_prekey().size() != 32) {
-                                // Failsafe — drop every queued op (DM or
-                                // invite) targeting this nonexistent peer
-                                // so we don't loop firing key_fetch forever,
-                                // then surface a single error to the UI.
-                                std::size_t dm_dropped = 0, inv_dropped = 0;
-                                {
-                                    std::lock_guard lk(impl_->mu);
-                                    auto qend = std::remove_if(
-                                        impl_->queue.begin(), impl_->queue.end(),
-                                        [&](const PendingSend& s){
-                                            return s.peer == fetched_for;
-                                        });
-                                    dm_dropped = static_cast<std::size_t>(
-                                        std::distance(qend, impl_->queue.end()));
-                                    impl_->queue.erase(qend, impl_->queue.end());
-                                    auto cend = std::remove_if(
-                                        impl_->chan_queue.begin(), impl_->chan_queue.end(),
-                                        [&](const PendingChannelOp& o){
-                                            return o.kind == PendingChannelOp::Kind::kInvite
-                                                && o.peer == fetched_for;
-                                        });
-                                    inv_dropped = static_cast<std::size_t>(
-                                        std::distance(cend, impl_->chan_queue.end()));
-                                    impl_->chan_queue.erase(cend, impl_->chan_queue.end());
-                                }
-                                emit errorOccurred(QString(
-                                    "no such user: '%1' is not registered on "
-                                    "this server (or hasn't connected yet) — "
-                                    "%2 message(s) and %3 invite(s) dropped")
-                                    .arg(QString::fromStdString(fetched_for))
-                                    .arg(dm_dropped).arg(inv_dropped));
-                                // Mesh-bootstrap cleanup: if this failed
-                                // fetch was a mesh-dial bootstrap, drop the
-                                // pending dial state so we don't leak it.
-                                auto bit = impl_->mesh_bootstrap_pending.find(fetched_for);
-                                if (bit != impl_->mesh_bootstrap_pending.end()) {
-                                    impl_->pending_mesh_dials.erase(bit->second);
-                                    impl_->mesh_bootstrap_pending.erase(bit);
-                                }
-                                continue;
-                            }
-                            // Successful fetch: bind a session keyed by the
-                            // username we asked for. The queue's front entry
-                            // (DM or invite) will pick this session up on
-                            // the next worker pass.
-                            auto& sess = impl_->sessions[fetched_for];
-                            std::memcpy(sess.peer_pub.data(),
-                                        r.bundle().identity_pubkey().data(), 32);
-                            std::memcpy(sess.peer_x.data(), r.bundle().signed_prekey().data(),
-                                        32);
-                            auto shared = derive_shared_secret(
-                                impl_->x25519,
-                                std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32));
-                            sess.rat.emplace(fb::crypto::DoubleRatchet::init_alice(
-                                std::span<const std::uint8_t, 32>(shared.data(), shared.size()),
-                                std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32)));
-                            sess.initialized_as_alice = true;
-                            emit log(QString("ratchet ready for %1")
-                                         .arg(QString::fromStdString(fetched_for)));
-                            // Mesh-bootstrap step 3: if this fetch was for a
-                            // mesh-dial we deferred, the session is now ready
-                            // — retry start_call_to_pub on the main thread
-                            // so the call actually fires. Without this the
-                            // call slot in calls_by_peer never gets created
-                            // even though the ratchet exists.
-                            auto bit = impl_->mesh_bootstrap_pending.find(fetched_for);
-                            if (bit != impl_->mesh_bootstrap_pending.end()) {
-                                const std::string peer_pub_str = bit->second;
-                                impl_->mesh_bootstrap_pending.erase(bit);
-                                auto dit = impl_->pending_mesh_dials.find(peer_pub_str);
-                                if (dit != impl_->pending_mesh_dials.end()) {
-                                    std::array<std::uint8_t, 32> peer_pub_arr{};
-                                    std::memcpy(peer_pub_arr.data(),
-                                                peer_pub_str.data(), 32);
-                                    QString label = dit->second.label;
-                                    bool with_video = dit->second.with_video;
-                                    std::string room_id = dit->second.room_id;
-                                    impl_->pending_mesh_dials.erase(dit);
-                                    emit log(QString("mesh-bootstrap: session ready, "
-                                                      "retrying dial to %1").arg(label));
-                                    QMetaObject::invokeMethod(this,
-                                        [this, peer_pub_arr, label, with_video,
-                                         room_id]() {
-                                            start_call_to_pub(peer_pub_arr, label,
-                                                              with_video, room_id);
-                                        }, Qt::QueuedConnection);
-                                }
-                            }
-                            // Notify so the queue is re-processed on the
-                            // next loop iteration immediately.
-                            impl_->cv.notify_all();
-                        } else if (f.body_case() == fb::proto::Frame::kEnvelope) {
-                            const auto& env = f.envelope();
+            // R: hoisted dispatch_envelope (formerly inline
+            // kEnvelope body in the worker loop). Both server-relayed
+            // Frame.envelope, direct-P2P PeerEnvelope::DM, and
+            // gossip topic deliveries route through here so every
+            // transport sees the same decrypt + dispatch pipeline.
+            //
+            // The body was lifted verbatim and wrapped in a single-
+            // iteration for-loop so the original continue; statements
+            // (which used to skip to the next Frame in the worker loop)
+            // continue this once-loop instead, exiting the lambda.
+            // No semantic change, ~900 lines moved.
+            auto dispatch_envelope = [&](const fb::proto::Envelope& env_in) {
+                for (int _hoisted_once = 0; _hoisted_once < 1; ++_hoisted_once) {
+                            const auto& env = env_in;
                             if (env.sender_pubkey().size() != 32) continue;
                             const std::string sender_pub_bytes(env.sender_pubkey().begin(),
                                                                 env.sender_pubkey().end());
@@ -3410,6 +2179,1156 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     },
                                     Qt::QueuedConnection);
                             }
+                }
+            };
+
+
+            // Main I/O loop.
+            std::vector<std::uint8_t> rxbuf(4096);
+            while (impl_->running) {
+                // 0a. Drain inbound overlay messages from PeerNet
+                //     workers (direct-P2P traffic). Same dispatch
+                //     path as server-relayed Frame.peer below.
+                std::deque<Impl::OverlayInboundMsg> overlay_drain;
+                {
+                    std::lock_guard lk(impl_->overlay_inbox_mu);
+                    overlay_drain.swap(impl_->overlay_inbox);
+                }
+                for (auto& m : overlay_drain) {
+                    // Gossip-tagged messages (sender_pubkey="GOSS")
+                    // are wire-form Envelopes from a P2PNode topic
+                    // delivery — feed straight to dispatch_envelope.
+                    if (m.sender_pubkey.size() == 4 &&
+                        m.sender_pubkey[0] == 'G' &&
+                        m.sender_pubkey[1] == 'O' &&
+                        m.sender_pubkey[2] == 'S' &&
+                        m.sender_pubkey[3] == 'S') {
+                        fb::proto::Envelope env;
+                        if (env.ParseFromArray(m.bytes.data(),
+                                static_cast<int>(m.bytes.size()))) {
+                            dispatch_envelope(env);
+                        }
+                        continue;
+                    }
+                    fb::proto::Frame f;
+                    if (!f.ParseFromArray(m.bytes.data(),
+                                           static_cast<int>(m.bytes.size()))) {
+                        continue;
+                    }
+                    if (f.body_case() != fb::proto::Frame::kPeer) continue;
+                    const auto& pe = f.peer();
+                    fb::p2p::PeerInfo from{};
+                    if (pe.sender_pubkey().size() == 32) {
+                        from.id = fb::p2p::node_id_from_pubkey(
+                            std::span<const std::uint8_t>(
+                                reinterpret_cast<const std::uint8_t*>(
+                                    pe.sender_pubkey().data()),
+                                32));
+                        from.pubkey.assign(pe.sender_pubkey().begin(),
+                                            pe.sender_pubkey().end());
+                        if (impl_->dht) impl_->dht->observe(from);
+                    }
+                    auto payload = std::span<const std::uint8_t>(
+                        reinterpret_cast<const std::uint8_t*>(
+                            pe.payload().data()),
+                        pe.payload().size());
+                    switch (pe.kind()) {
+                        case fb::proto::PeerEnvelope::DHT:
+                            if (impl_->dht) impl_->dht->on_message(from, payload);
+                            break;
+                        case fb::proto::PeerEnvelope::GOSSIP:
+                            if (impl_->username_gossip)
+                                impl_->username_gossip->on_message(from, payload);
+                            break;
+                        case fb::proto::PeerEnvelope::DM: {
+                            // Direct-P2P DM via PeerNet: payload is
+                            // a wire-form Envelope. Decrypt + emit
+                            // via try_decrypt_dm_text (TEXT path
+                            // only; other DmPayload kinds still
+                            // route through the inline kEnvelope
+                            // handler on the server-relay path).
+                            fb::proto::Envelope inner;
+                            if (!inner.ParseFromArray(
+                                    payload.data(),
+                                    static_cast<int>(payload.size()))) {
+                                break;
+                            }
+                            // Direct-P2P DM via PeerNet: route the
+                            // wire-form Envelope through the same
+                            // dispatch pipeline server-relayed
+                            // envelopes use. All DmPayload kinds
+                            // are handled identically.
+                            dispatch_envelope(inner);
+                            emit log("DM (PeerNet) dispatched");
+                            break;
+                        }
+                        case fb::proto::PeerEnvelope::OFFLINE_DEPOSIT: {
+                            // Someone designated us as a relay for
+                            // pe.recipient_pubkey and is depositing
+                            // an encrypted blob. Store opaquely —
+                            // we can't decrypt (it's encrypted to
+                            // the recipient).
+                            if (!impl_->offline_store) break;
+                            const auto& rec = pe.recipient_pubkey();
+                            if (rec.size() != 32) break;
+                            auto r = impl_->offline_store->deposit(
+                                std::span<const std::uint8_t>(
+                                    reinterpret_cast<const std::uint8_t*>(
+                                        rec.data()), 32),
+                                payload);
+                            emit log(QString("OFFLINE_DEPOSIT: %1")
+                                .arg(r == fb::p2p::OfflineRelayStore::DepositResult::kAccepted
+                                     ? "accepted"
+                                     : "rejected"));
+                            break;
+                        }
+                        case fb::proto::PeerEnvelope::OFFLINE_FETCH: {
+                            // Recipient is asking for everything
+                            // we've held for them. The sender's
+                            // pubkey IS the recipient pubkey here
+                            // (you can only fetch your own queue).
+                            if (!impl_->offline_store) break;
+                            if (from.pubkey.size() != 32) break;
+                            auto blobs = impl_->offline_store
+                                ->fetch_and_clear(
+                                    std::span<const std::uint8_t>(
+                                        from.pubkey.data(),
+                                        from.pubkey.size()));
+                            if (!blobs.empty()) {
+                                emit log(QString("OFFLINE_FETCH: "
+                                    "delivering %1 queued blob(s) "
+                                    "to peer")
+                                    .arg(static_cast<qulonglong>(
+                                        blobs.size())));
+                            }
+                            for (const auto& b : blobs) {
+                                wrap_peer_send(
+                                    fb::proto::PeerEnvelope::OFFLINE_DELIVERY,
+                                    from,
+                                    std::span<const std::uint8_t>(
+                                        b.data(), b.size()));
+                            }
+                            break;
+                        }
+                        case fb::proto::PeerEnvelope::OFFLINE_DELIVERY: {
+                            // A relay is delivering a queued blob to
+                            // us. The blob is a wire-form Envelope
+                            // we can decrypt the same way as direct
+                            // DM delivery.
+                            fb::proto::Envelope inner;
+                            if (!inner.ParseFromArray(
+                                    payload.data(),
+                                    static_cast<int>(payload.size()))) {
+                                break;
+                            }
+                            dispatch_envelope(inner);
+                            emit log("DM (offline-relay) dispatched");
+                            break;
+                        }
+                        default: break;
+                    }
+                }
+
+                // 0b. Periodic maintenance ticks.
+                {
+                    const auto t = now_ms();
+                    if (t - impl_->last_self_publish_ms
+                            >= kRepublishIntervalMs) {
+                        impl_->last_self_publish_ms = t;
+                        republish_self();
+                    }
+                    if (t - impl_->last_gossip_pull_ms
+                            >= kGossipPullIntervalMs) {
+                        impl_->last_gossip_pull_ms = t;
+                        gossip_pull_round();
+                    }
+                }
+
+                // 0. Drain pending channel ops.
+                std::deque<PendingChannelOp> chan_ops;
+                {
+                    std::lock_guard lk(impl_->mu);
+                    chan_ops.swap(impl_->chan_queue);
+                }
+                for (auto& op : chan_ops) {
+                    auto& cs = impl_->channels[op.channel_name];
+                    if (cs.id[0] == 0 && cs.id[1] == 0 && cs.id[2] == 0) {
+                        cs.id = channel_id_from_name(op.channel_name);
+                        impl_->chan_id_to_name[std::string(
+                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size())] =
+                            op.channel_name;
+                    }
+                    auto subscribe_now = [&]() {
+                        if (cs.subscribed) return;
+                        fb::proto::Frame f;
+                        f.mutable_chan_subscribe()->set_channel_group_id(
+                            std::string(reinterpret_cast<const char*>(cs.id.data()),
+                                        cs.id.size()));
+                        blocking_send(impl_->conn, serialize(f));
+                        cs.subscribed = true;
+                        // I3: also subscribe via gossipsub when
+                        // P2PNode is configured. Channel envelope
+                        // fan-out then works without a central
+                        // server (each member who's subscribed
+                        // receives via gossip flood).
+                        if (impl_->gossip) {
+                            const auto topic =
+                                fb::p2p::channel_topic_name(
+                                    std::span<const std::uint8_t>(
+                                        cs.id.data(), cs.id.size()));
+                            impl_->gossip->subscribe(topic);
+                            emit log(QString("gossip subscribed to "
+                                              "channel topic %1")
+                                         .arg(QString::fromStdString(
+                                             topic.substr(0, 24)) + "…"));
+                        }
+                        emit channelJoined(QString::fromStdString(op.channel_name));
+                        emit log(QString("subscribed to channel #%1")
+                                     .arg(QString::fromStdString(op.channel_name)));
+                    };
+                    if (op.kind == PendingChannelOp::Kind::kCreate) {
+                        try {
+                            cs.own_dist = cs.session->create_own_send_chain();
+                            write_file_bytes(op.dist_path,
+                                             std::span<const std::uint8_t>(cs.own_dist.data(),
+                                                                            cs.own_dist.size()));
+                            emit log(QString("created channel #%1 — distribution at %2")
+                                         .arg(QString::fromStdString(op.channel_name))
+                                         .arg(QString::fromStdString(op.dist_path)));
+                            subscribe_now();
+                            persist_chan_meta(op.channel_name, cs);
+                            persist_chan_session(op.channel_name, cs);
+                        } catch (const std::exception& e) {
+                            emit errorOccurred(
+                                QString("create channel failed: %1").arg(e.what()));
+                        }
+                    } else if (op.kind == PendingChannelOp::Kind::kCreateLocal) {
+                        // Lightweight create: own SenderKeys chain + subscribe,
+                        // but no distribution file and no peer DM. The user
+                        // invites peers separately via the Invite button.
+                        try {
+                            if (cs.own_dist.empty()) {
+                                cs.own_dist = cs.session->create_own_send_chain();
+                            }
+                            // Record the per-channel cipher choice. Even
+                            // for an MLS channel we keep the SenderKeys
+                            // distribution around — it's small, harmless,
+                            // and lets the receive path fall back if a
+                            // peer hasn't migrated yet.
+                            cs.crypto = op.use_mls
+                                ? fb::store::SqliteStore::ChannelCrypto::kMls
+                                : fb::store::SqliteStore::ChannelCrypto::kSenderKeys;
+                            if (op.use_mls) {
+                                // Create a fresh single-member MLS group
+                                // with us as the founder. The same
+                                // channel_id we derived above is the MLS
+                                // group_id — they're 32 bytes so the
+                                // mapping is direct, and using the same
+                                // value keeps server-side routing
+                                // unchanged for MLS channels.
+                                if (cs.id[0] == 0 && cs.id[1] == 0) {
+                                    cs.id = channel_id_from_name(op.channel_name);
+                                }
+                                try {
+                                    cs.mls = fb::crypto::MlsGroup::create(
+                                        std::span<const std::uint8_t, 32>(
+                                            impl_->identity->public_key().data(), 32),
+                                        std::span<const std::uint8_t, 32>(
+                                            cs.id.data(), 32));
+                                    // Persist the seed BEFORE returning
+                                    // success — if the process dies
+                                    // between create and the first
+                                    // commit, the empty group is still
+                                    // restorable.
+                                    persist_mls_seed(cs);
+                                } catch (const std::exception& e) {
+                                    emit errorOccurred(QString(
+                                        "MLS create failed: %1 — falling back to "
+                                        "SenderKeys for #%2").arg(e.what())
+                                        .arg(QString::fromStdString(op.channel_name)));
+                                    cs.crypto =
+                                        fb::store::SqliteStore::ChannelCrypto::kSenderKeys;
+                                }
+                            }
+                            subscribe_now();
+                            persist_chan_meta(op.channel_name, cs);
+                            persist_chan_session(op.channel_name, cs);
+                            emit log(QString("created local channel #%1 (%2, no peers yet)")
+                                         .arg(QString::fromStdString(op.channel_name))
+                                         .arg(op.use_mls ? "MLS" : "SenderKeys"));
+                        } catch (const std::exception& e) {
+                            emit errorOccurred(
+                                QString("create channel failed: %1").arg(e.what()));
+                        }
+                    } else if (op.kind == PendingChannelOp::Kind::kJoin) {
+                        try {
+                            auto dist_blob = read_file_bytes(op.dist_path);
+                            cs.own_dist = std::move(dist_blob);
+                            // Stage the dist for installation when the first
+                            // inbound channel envelope arrives (we still
+                            // don't know the *sender* pubkey here — Phase 1
+                            // simplification: every channel msg carries
+                            // sender_pubkey in the envelope so we install
+                            // lazily per-sender on first sight).
+                            emit log(QString("joined channel #%1 from %2")
+                                         .arg(QString::fromStdString(op.channel_name))
+                                         .arg(QString::fromStdString(op.dist_path)));
+                            subscribe_now();
+                            persist_chan_meta(op.channel_name, cs);
+                            persist_chan_session(op.channel_name, cs);
+                        } catch (const std::exception& e) {
+                            emit errorOccurred(
+                                QString("join channel failed: %1").arg(e.what()));
+                        }
+                    } else if (op.kind == PendingChannelOp::Kind::kSend) {
+                        if (cs.own_dist.empty()) {
+                            emit errorOccurred(
+                                QString("cannot send to #%1: not created/joined yet")
+                                    .arg(QString::fromStdString(op.channel_name)));
+                            continue;
+                        }
+                        try {
+                            std::vector<std::uint8_t> pt(op.text.begin(), op.text.end());
+                            std::vector<std::uint8_t> envid(16);
+                            randombytes_buf(envid.data(), envid.size());
+                            const auto now_ms = static_cast<std::uint64_t>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count());
+                            const auto env_aad = envelope_aad_bytes(
+                                std::span<const std::uint8_t>(envid.data(), envid.size()),
+                                now_ms);
+                            // Branch on per-channel cipher: MLS channels
+                            // route the plaintext through MlsGroup::
+                            // application_encrypt; SenderKeys channels
+                            // keep using the existing GroupSession.
+                            // env_aad isn't bound by mls::Session::protect
+                            // (mlspp computes its own internal AAD over
+                            // the MLSCiphertext header) — for MLS we
+                            // leave Envelope.aad empty so receivers don't
+                            // mismatch; for SenderKeys it's bound as
+                            // before.
+                            std::vector<std::uint8_t> inner;
+                            const bool use_mls =
+                                cs.crypto == fb::store::SqliteStore::ChannelCrypto::kMls
+                                && cs.mls;
+                            if (use_mls) {
+                                inner = cs.mls->application_encrypt(
+                                    std::span<const std::uint8_t>(pt.data(), pt.size()));
+                            } else {
+                                inner = cs.session->encrypt(
+                                    std::span<const std::uint8_t>(pt.data(), pt.size()),
+                                    std::span<const std::uint8_t>(env_aad.data(),
+                                                                    env_aad.size()));
+                            }
+                            fb::proto::Frame f;
+                            auto* env = f.mutable_envelope();
+                            env->set_envelope_id(std::string(envid.begin(), envid.end()));
+                            env->set_timestamp_ms(now_ms);
+                            // Skip Envelope.aad for MLS — mls::Session
+                            // covers its own AAD internally; populating
+                            // Envelope.aad would make receivers reject
+                            // the message at the cross-check.
+                            if (!use_mls) {
+                                env->set_aad(std::string(env_aad.begin(), env_aad.end()));
+                            }
+                            env->set_channel_group_id(std::string(
+                                reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
+                            env->set_sender_pubkey(std::string(
+                                reinterpret_cast<const char*>(
+                                    impl_->identity->public_key().data()),
+                                impl_->identity->public_key().size()));
+                            env->set_ciphertext(std::string(inner.begin(), inner.end()));
+                            env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
+                            env->set_protocol_version(fb::config::kProtocolVersion);
+                            blocking_send(impl_->conn, serialize(f));
+                            // Persist channel state so the advanced send-chain
+                            // survives a restart (own_next_index, own_chain_key).
+                            persist_chan_session(op.channel_name, cs);
+                            // Persist sent channel message for history replay.
+                            if (impl_->store) {
+                                const auto now_ms = static_cast<std::uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count());
+                                impl_->store->chan_append_inbox(
+                                    std::span<const std::uint8_t>(cs.id.data(), cs.id.size()),
+                                    std::span<const std::uint8_t>(
+                                        impl_->identity->public_key().data(), 32),
+                                    std::span<const std::uint8_t>(pt.data(), pt.size()),
+                                    now_ms);
+                            }
+                            emit log(QString("sent %1B to #%2")
+                                         .arg(pt.size())
+                                         .arg(QString::fromStdString(op.channel_name)));
+                        } catch (const std::exception& e) {
+                            emit errorOccurred(
+                                QString("channel send failed: %1").arg(e.what()));
+                        }
+                    } else if (op.kind == PendingChannelOp::Kind::kLeave) {
+                        // ChannelUnsubscribe over the wire so the server stops
+                        // fanning out for us, then drop everything on disk.
+                        if (cs.subscribed) {
+                            fb::proto::Frame uf;
+                            uf.mutable_chan_unsubscribe()->set_channel_group_id(
+                                std::string(reinterpret_cast<const char*>(cs.id.data()),
+                                            cs.id.size()));
+                            blocking_send(impl_->conn, serialize(uf));
+                        }
+                        if (impl_->store) {
+                            impl_->store->chan_delete(
+                                op.channel_name,
+                                std::span<const std::uint8_t>(cs.id.data(), cs.id.size()));
+                        }
+                        impl_->chan_id_to_name.erase(std::string(
+                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
+                        impl_->channels.erase(op.channel_name);
+                        emit log(QString("left #%1 (sidebar entry, sessions, persisted state "
+                                         "all cleared)")
+                                     .arg(QString::fromStdString(op.channel_name)));
+                    } else if (op.kind == PendingChannelOp::Kind::kRoomJoin) {
+                        // Group-call signaling: announce ourselves to the
+                        // room. Server replies with RoomRoster broadcasts
+                        // (handled in the read loop) on every membership
+                        // change. The room_id IS the channel_group_id —
+                        // ensure the channel exists before joining.
+                        if (cs.id[0] == 0 && cs.id[1] == 0) {
+                            cs.id = channel_id_from_name(op.channel_name);
+                        }
+                        fb::proto::Frame jf;
+                        auto* rj = jf.mutable_room_join();
+                        rj->set_room_id(std::string(
+                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
+                        rj->set_want_audio(true);
+                        rj->set_want_video(op.want_video);
+                        blocking_send(impl_->conn, serialize(jf));
+                        emit log(QString("joined call on #%1 (video=%2)")
+                                     .arg(QString::fromStdString(op.channel_name))
+                                     .arg(op.want_video ? "yes" : "no"));
+                    } else if (op.kind == PendingChannelOp::Kind::kRoomLeave) {
+                        if (cs.id[0] == 0 && cs.id[1] == 0) {
+                            cs.id = channel_id_from_name(op.channel_name);
+                        }
+                        fb::proto::Frame lf;
+                        lf.mutable_room_leave()->set_room_id(std::string(
+                            reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
+                        blocking_send(impl_->conn, serialize(lf));
+                        emit log(QString("left call on #%1")
+                                     .arg(QString::fromStdString(op.channel_name)));
+                    } else if (op.kind == PendingChannelOp::Kind::kInvite) {
+                        // Route based on the channel's per-channel cipher.
+                        // For MLS channels we send an MlsInviteRequest
+                        // (the four-step in-band handshake from step D);
+                        // for SenderKeys channels we keep the existing
+                        // channel-key DM-distribution flow.
+                        if (cs.crypto ==
+                            fb::store::SqliteStore::ChannelCrypto::kMls) {
+                            // Build + enqueue MlsInviteRequest payload.
+                            // Channel id derived from name to match
+                            // create_local_channel's id derivation.
+                            if (cs.id[0] == 0 && cs.id[1] == 0) {
+                                cs.id = channel_id_from_name(op.channel_name);
+                            }
+                            auto invite_payload =
+                                pack_mls_invite_request_payload(
+                                    std::span<const std::uint8_t>(
+                                        cs.id.data(), cs.id.size()),
+                                    op.channel_name);
+                            PendingSend ps;
+                            ps.peer = op.peer;
+                            ps.pre_packed_payload = std::move(invite_payload);
+                            {
+                                std::lock_guard lk(impl_->mu);
+                                impl_->queue.push_back(std::move(ps));
+                            }
+                            impl_->cv.notify_all();
+                            emit log(QString("MLS invite-request queued: "
+                                              "%1 → #%2")
+                                         .arg(QString::fromStdString(op.peer))
+                                         .arg(QString::fromStdString(op.channel_name)));
+                            continue;
+                        }
+                        // SenderKeys path (default): in-band invite — ensure
+                        // we have a chain, then queue a DM to `peer`
+                        // carrying the channel-key payload.
+                        if (cs.own_dist.empty()) {
+                            try {
+                                cs.own_dist = cs.session->create_own_send_chain();
+                                emit log(QString("created channel #%1 for invite")
+                                             .arg(QString::fromStdString(op.channel_name)));
+                            } catch (const std::exception& e) {
+                                emit errorOccurred(
+                                    QString("channel create-for-invite failed: %1")
+                                        .arg(e.what()));
+                                continue;
+                            }
+                        }
+                        subscribe_now();
+                        // Queue a DM with the channel-key payload. We piggy-
+                        // back on the existing send_to_peer pipeline (which
+                        // packs DmPayload{text}) by pushing a *raw* DM here
+                        // with a sentinel — actually simpler: enqueue
+                        // directly via the same path with a special marker.
+                        // The cleanest path is to inline it: build the
+                        // ratchet message and send right here, since we
+                        // already have access to sessions[peer].
+                        auto& peer_sess = impl_->sessions[op.peer];
+                        if (!peer_sess.rat) {
+                            // Trigger prekey fetch like normal send-to-peer
+                            // would; then re-queue the invite for retry.
+                            fb::proto::Frame f;
+                            f.mutable_key_fetch()->set_username(op.peer);
+                            blocking_send(impl_->conn, serialize(f));
+                            emit log(QString("fetching prekey for %1 to deliver invite")
+                                         .arg(QString::fromStdString(op.peer)));
+                            std::lock_guard lk(impl_->mu);
+                            impl_->pending_fetch_targets.push_back(op.peer);
+                            impl_->chan_queue.push_front(std::move(op));
+                            break;
+                        }
+                        auto pt = pack_channel_key_payload(
+                            std::span<const std::uint8_t>(cs.id.data(), cs.id.size()),
+                            op.channel_name,
+                            std::span<const std::uint8_t>(cs.own_dist.data(),
+                                                           cs.own_dist.size()));
+                        std::vector<std::uint8_t> envid(16);
+                        randombytes_buf(envid.data(), envid.size());
+                        const auto now_ms = static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count());
+                        const auto env_aad = envelope_aad_bytes(
+                            std::span<const std::uint8_t>(envid.data(), envid.size()),
+                            now_ms);
+                        auto inner = peer_sess.rat->encrypt(
+                            std::span<const std::uint8_t>(pt.data(), pt.size()),
+                            std::span<const std::uint8_t>(env_aad.data(),
+                                                            env_aad.size()));
+                        fb::proto::Frame f;
+                        auto* env = f.mutable_envelope();
+                        env->set_envelope_id(std::string(envid.begin(), envid.end()));
+                        env->set_timestamp_ms(now_ms);
+                        env->set_aad(std::string(env_aad.begin(), env_aad.end()));
+                        env->set_user_pubkey(std::string(
+                            reinterpret_cast<const char*>(peer_sess.peer_pub.data()),
+                            peer_sess.peer_pub.size()));
+                        env->set_sender_pubkey(std::string(
+                            reinterpret_cast<const char*>(
+                                impl_->identity->public_key().data()),
+                            impl_->identity->public_key().size()));
+                        env->set_ciphertext(std::string(inner.begin(), inner.end()));
+                        env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
+                        env->set_protocol_version(fb::config::kProtocolVersion);
+                        blocking_send(impl_->conn, serialize(f));
+                        // Persist channel meta (own_dist may be brand-new).
+                        persist_chan_meta(op.channel_name, cs);
+                        persist_chan_session(op.channel_name, cs);
+                        emit log(QString("invited %1 to #%2")
+                                     .arg(QString::fromStdString(op.peer))
+                                     .arg(QString::fromStdString(op.channel_name)));
+                    }
+                }
+
+                // 1a. Drain pending media-signal sends.
+                {
+                    std::deque<PendingMediaSignal> ms;
+                    {
+                        std::lock_guard lk(impl_->mu);
+                        ms.swap(impl_->media_queue);
+                    }
+                    for (auto& sig : ms) {
+                        // Find the per-peer ratchet session by pubkey.
+                        Impl::Session* sess = nullptr;
+                        for (auto& [name, s] : impl_->sessions) {
+                            if (s.peer_pub == sig.peer_pub) { sess = &s; break; }
+                        }
+                        if (!sess || !sess->rat) {
+                            fb::crypto::PubKey want{};
+                            std::memcpy(want.data(), sig.peer_pub.data(), 32);
+                            const QString want_fp = QString::fromStdString(
+                                fb::crypto::Identity::fingerprint(want));
+                            emit log(QString("media signal dropped — no session "
+                                             "for peer (kind=%1 want_fp=%2 sessions=%3)")
+                                         .arg(sig.kind).arg(want_fp)
+                                         .arg(impl_->sessions.size()));
+                            continue;
+                        }
+                        auto pt = pack_media_signal_payload(
+                            std::span<const std::uint8_t, 16>(sig.call_id.data(), 16),
+                            sig.kind,
+                            std::span<const std::uint8_t>(sig.payload.data(), sig.payload.size()),
+                            sig.epoch);
+                        std::vector<std::uint8_t> envid(16);
+                        randombytes_buf(envid.data(), envid.size());
+                        const auto now_ms = static_cast<std::uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count());
+                        const auto env_aad = envelope_aad_bytes(
+                            std::span<const std::uint8_t>(envid.data(), envid.size()),
+                            now_ms);
+                        auto inner = sess->rat->encrypt(
+                            std::span<const std::uint8_t>(pt.data(), pt.size()),
+                            std::span<const std::uint8_t>(env_aad.data(),
+                                                            env_aad.size()));
+                        fb::proto::Frame f;
+                        auto* env = f.mutable_envelope();
+                        env->set_envelope_id(std::string(envid.begin(), envid.end()));
+                        env->set_timestamp_ms(now_ms);
+                        env->set_aad(std::string(env_aad.begin(), env_aad.end()));
+                        env->set_user_pubkey(std::string(
+                            reinterpret_cast<const char*>(sig.peer_pub.data()),
+                            sig.peer_pub.size()));
+                        env->set_sender_pubkey(std::string(
+                            reinterpret_cast<const char*>(impl_->identity->public_key().data()),
+                            impl_->identity->public_key().size()));
+                        env->set_ciphertext(std::string(inner.begin(), inner.end()));
+                        env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
+                        env->set_protocol_version(fb::config::kProtocolVersion);
+                        blocking_send(impl_->conn, serialize(f));
+                    }
+                }
+
+                // 1. Drain pending sends.
+                std::deque<PendingSend> to_send;
+                {
+                    std::lock_guard lk(impl_->mu);
+                    to_send.swap(impl_->queue);
+                }
+                for (auto& s : to_send) {
+                    // If the target looks like a fingerprint ("XXXXX-XXXXX")
+                    // — which is what the UI puts in the field when the user
+                    // replies to a peer whose username hasn't resolved yet —
+                    // try to find an existing session whose peer_pub matches
+                    // the fingerprint, and rebind this send to that session's
+                    // original key. Without this, key_fetch goes out for the
+                    // fingerprint-as-username, the server returns not-found,
+                    // and the failsafe fires "no such user" even though we
+                    // already have a working ratchet for the actual peer.
+                    if (s.peer.size() == 11 && s.peer[5] == '-' &&
+                        !impl_->sessions.count(s.peer)) {
+                        for (const auto& [name, sess_existing] : impl_->sessions) {
+                            if (!sess_existing.rat) continue;
+                            fb::crypto::PubKey pk{};
+                            std::memcpy(pk.data(), sess_existing.peer_pub.data(), 32);
+                            if (fb::crypto::Identity::fingerprint(pk) == s.peer) {
+                                emit log(QString("rebinding reply: fp %1 -> session '%2'")
+                                             .arg(QString::fromStdString(s.peer))
+                                             .arg(QString::fromStdString(name)));
+                                s.peer = name;
+                                break;
+                            }
+                        }
+                    }
+                    auto& sess = impl_->sessions[s.peer];
+                    if (!sess.rat) {
+                        // Need to fetch peer bundle first.
+                        fb::proto::Frame f;
+                        f.mutable_key_fetch()->set_username(s.peer);
+                        blocking_send(impl_->conn, serialize(f));
+                        emit log(QString("fetching prekey for %1")
+                                     .arg(QString::fromStdString(s.peer)));
+                        // Re-enqueue; we'll handle the response in the read
+                        // loop and re-try.
+                        std::lock_guard lk(impl_->mu);
+                        impl_->pending_fetch_targets.push_back(s.peer);
+                        impl_->queue.push_front(std::move(s));
+                        break;
+                    }
+                    // Wrap as DmPayload{text} so receivers can disambiguate
+                    // text from channel-key invites — UNLESS the caller
+                    // already supplied a pre-packed payload (the MLS
+                    // handshake sends use this to ride the same ratchet
+                    // without needing a parallel queue).
+                    auto pt = s.has_pre_packed()
+                        ? std::move(s.pre_packed_payload)
+                        : pack_text_payload(s.text);
+                    std::vector<std::uint8_t> envid(16);
+                    randombytes_buf(envid.data(), envid.size());
+                    const auto now_ms = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count());
+                    const auto env_aad = envelope_aad_bytes(
+                        std::span<const std::uint8_t>(envid.data(), envid.size()),
+                        now_ms);
+                    auto inner = sess.rat->encrypt(
+                        std::span<const std::uint8_t>(pt.data(), pt.size()),
+                        std::span<const std::uint8_t>(env_aad.data(),
+                                                        env_aad.size()));
+                    fb::proto::Frame f;
+                    auto* env = f.mutable_envelope();
+                    env->set_envelope_id(std::string(envid.begin(), envid.end()));
+                    env->set_timestamp_ms(now_ms);
+                    env->set_aad(std::string(env_aad.begin(), env_aad.end()));
+                    env->set_user_pubkey(std::string(
+                        reinterpret_cast<const char*>(sess.peer_pub.data()),
+                        sess.peer_pub.size()));
+                    env->set_sender_pubkey(std::string(
+                        reinterpret_cast<const char*>(impl_->identity->public_key().data()),
+                        impl_->identity->public_key().size()));
+                    env->set_ciphertext(std::string(inner.begin(), inner.end()));
+                    env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
+                    env->set_protocol_version(fb::config::kProtocolVersion);
+                    blocking_send(impl_->conn, serialize(f));
+                    if (impl_->store && !s.text.empty()) {
+                        // Persist the original text bytes (not the wrapped
+                        // DmPayload blob) so on-disk history is human-
+                        // readable. Skip pre-packed sends entirely —
+                        // those are protocol-internal MLS handshake
+                        // messages, not user chat.
+                        std::vector<std::uint8_t> raw_text(s.text.begin(), s.text.end());
+                        impl_->store->append_outbox(
+                            std::span<const std::uint8_t>(envid.data(), envid.size()),
+                            std::span<const std::uint8_t>(sess.peer_pub.data(),
+                                                          sess.peer_pub.size()),
+                            std::span<const std::uint8_t>(raw_text.data(), raw_text.size()),
+                            now_ms);
+                        // Remember the username we used to send to this pubkey
+                        // so the sidebar's DM list survives a restart.
+                        impl_->store->cache_peer_name(
+                            std::span<const std::uint8_t>(sess.peer_pub.data(),
+                                                          sess.peer_pub.size()),
+                            s.peer);
+                    }
+                    emit log(QString("sent %1B to %2%3")
+                                 .arg(static_cast<qulonglong>(
+                                     s.text.empty() ? pt.size() : s.text.size()))
+                                 .arg(QString::fromStdString(s.peer))
+                                 .arg(s.text.empty() ? " (mls protocol msg)" : ""));
+                }
+
+                // 2. Read with short timeout. Conn::read_some
+                // unifies plain TCP and TLS — 0 means timeout or
+                // peer-closed; >0 means bytes available.
+                {
+                    auto n = conn_read_with_timeout(impl_->conn,
+                        std::span<std::uint8_t>(rxbuf.data(), rxbuf.size()),
+                        100);
+                if (n > 0) {
+                    impl_->dec.feed(std::span<const std::uint8_t>(
+                        rxbuf.data(), n));
+                    std::vector<std::uint8_t> frame;
+                    while (impl_->dec.try_pop(frame) ==
+                           fb::net::FrameDecoder::Status::kFrameReady) {
+                        fb::proto::Frame f;
+                        if (!f.ParseFromArray(frame.data(),
+                                              static_cast<int>(frame.size()))) {
+                            continue;
+                        }
+                        if (f.body_case() == fb::proto::Frame::kControl) {
+                            const auto& cm = f.control();
+                            if (cm.code() == fb::proto::ControlMessage::USERNAME_TAKEN) {
+                                emit errorOccurred(
+                                    QString("This username is already registered to a "
+                                            "different identity on the server. Sign out "
+                                            "and pick a different name (or restore the "
+                                            "original identity from its recovery code)."));
+                                impl_->stop_requested = true;
+                            }
+                            continue;
+                        }
+                        if (f.body_case() == fb::proto::Frame::kPeer) {
+                            // Inbound overlay envelope from another
+                            // peer (server forwarded by recipient
+                            // pubkey). Dispatch by kind to the right
+                            // overlay object.
+                            const auto& pe = f.peer();
+                            fb::p2p::PeerInfo from{};
+                            if (pe.sender_pubkey().size() == 32) {
+                                from.id = fb::p2p::node_id_from_pubkey(
+                                    std::span<const std::uint8_t>(
+                                        reinterpret_cast<const std::uint8_t*>(
+                                            pe.sender_pubkey().data()),
+                                        32));
+                                from.pubkey.assign(
+                                    pe.sender_pubkey().begin(),
+                                    pe.sender_pubkey().end());
+                                // Touch the routing table — every
+                                // sender we hear from is a viable
+                                // peer for our DHT lookups.
+                                if (impl_->dht) impl_->dht->observe(from);
+                            }
+                            auto payload = std::span<const std::uint8_t>(
+                                reinterpret_cast<const std::uint8_t*>(
+                                    pe.payload().data()),
+                                pe.payload().size());
+                            switch (pe.kind()) {
+                                case fb::proto::PeerEnvelope::DHT:
+                                    if (impl_->dht) {
+                                        impl_->dht->on_message(from, payload);
+                                    }
+                                    break;
+                                case fb::proto::PeerEnvelope::GOSSIP:
+                                    if (impl_->username_gossip) {
+                                        impl_->username_gossip->on_message(
+                                            from, payload);
+                                    }
+                                    break;
+                                case fb::proto::PeerEnvelope::DM: {
+                                    fb::proto::Envelope inner;
+                                    if (!inner.ParseFromArray(
+                                            payload.data(),
+                                            static_cast<int>(payload.size()))) {
+                                        break;
+                                    }
+                                    // Server-relayed direct-P2P DM:
+                                    // same dispatch path as
+                                    // Frame.envelope. All DmPayload
+                                    // kinds handled.
+                                    dispatch_envelope(inner);
+                                    break;
+                                }
+                                case fb::proto::PeerEnvelope::OFFLINE_DEPOSIT: {
+                                    if (!impl_->offline_store) break;
+                                    const auto& rec = pe.recipient_pubkey();
+                                    if (rec.size() != 32) break;
+                                    impl_->offline_store->deposit(
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                rec.data()), 32),
+                                        payload);
+                                    break;
+                                }
+                                case fb::proto::PeerEnvelope::OFFLINE_FETCH: {
+                                    if (!impl_->offline_store) break;
+                                    if (from.pubkey.size() != 32) break;
+                                    auto blobs = impl_->offline_store
+                                        ->fetch_and_clear(
+                                            std::span<const std::uint8_t>(
+                                                from.pubkey.data(),
+                                                from.pubkey.size()));
+                                    for (const auto& b : blobs) {
+                                        wrap_peer_send(
+                                            fb::proto::PeerEnvelope::OFFLINE_DELIVERY,
+                                            from,
+                                            std::span<const std::uint8_t>(
+                                                b.data(), b.size()));
+                                    }
+                                    break;
+                                }
+                                case fb::proto::PeerEnvelope::OFFLINE_DELIVERY: {
+                                    fb::proto::Envelope inner;
+                                    if (!inner.ParseFromArray(
+                                            payload.data(),
+                                            static_cast<int>(payload.size()))) {
+                                        break;
+                                    }
+                                    if ((dispatch_envelope(inner), true)) {
+                                        emit log("DM (offline-relay) "
+                                                  "decrypted");
+                                    }
+                                    break;
+                                }
+                                default:
+                                    break;
+                            }
+                            continue;
+                        }
+                        if (f.body_case() == fb::proto::Frame::kRoomRoster) {
+                            const auto& rr = f.room_roster();
+                            if (rr.room_id().size() != 32) continue;
+                            // Resolve the room_id back to a channel name —
+                            // it's the channel's group_id verbatim.
+                            std::array<std::uint8_t, 32> rid{};
+                            std::memcpy(rid.data(), rr.room_id().data(), 32);
+                            auto nit = impl_->chan_id_to_name.find(
+                                std::string(rr.room_id().begin(), rr.room_id().end()));
+                            QString chan_name;
+                            if (nit != impl_->chan_id_to_name.end()) {
+                                chan_name = QString::fromStdString(nit->second);
+                            }
+                            QStringList fps;
+                            for (const auto& p : rr.participants()) {
+                                if (p.identity_pubkey().size() != 32) continue;
+                                fb::crypto::PubKey k{};
+                                std::memcpy(k.data(), p.identity_pubkey().data(), 32);
+                                fps << QString::fromStdString(
+                                    fb::crypto::Identity::fingerprint(k));
+                            }
+                            emit log(QString("room roster for #%1: %2 participant(s)")
+                                         .arg(chan_name.isEmpty() ? "<unknown>" : chan_name)
+                                         .arg(fps.size()));
+                            emit channelCallRoster(chan_name, fps);
+
+                            // Mesh-dial: build the set of OTHER participants
+                            // in the room, diff against who we've already
+                            // dialed/accepted, and dispatch start_call_to_pub
+                            // on the Qt main thread for each new peer where
+                            // we're on the higher side of the pubkey
+                            // tiebreak (the lower side waits for our OFFER).
+                            // Departed peers get their MediaCall hung up.
+                            std::set<std::string> roster_peer_keys;
+                            std::vector<std::array<std::uint8_t, 32>> to_dial;
+                            const std::string room_id_str(rr.room_id().begin(),
+                                                           rr.room_id().end());
+                            const auto& my_pub = impl_->identity->public_key();
+                            for (const auto& p : rr.participants()) {
+                                if (p.identity_pubkey().size() != 32) continue;
+                                if (std::equal(my_pub.begin(), my_pub.end(),
+                                               p.identity_pubkey().begin())) {
+                                    continue;   // skip self
+                                }
+                                roster_peer_keys.insert(std::string(
+                                    p.identity_pubkey().begin(),
+                                    p.identity_pubkey().end()));
+                            }
+                            auto& meshed = impl_->room_mesh_peers[room_id_str];
+                            // Hang up calls for peers that left.
+                            std::vector<std::string> to_drop;
+                            for (const auto& peer_key : meshed) {
+                                if (!roster_peer_keys.count(peer_key)) {
+                                    to_drop.push_back(peer_key);
+                                }
+                            }
+                            for (const auto& peer_key : to_drop) {
+                                meshed.erase(peer_key);
+                                MediaCall* call = nullptr;
+                                {
+                                    auto it = impl_->calls_by_peer.find(peer_key);
+                                    if (it != impl_->calls_by_peer.end()) {
+                                        call = it->second.call;
+                                    }
+                                }
+                                if (call) {
+                                    QMetaObject::invokeMethod(call, [call]() {
+                                        call->hangup();
+                                    }, Qt::QueuedConnection);
+                                }
+                            }
+                            // Dial new peers (only on the higher-pubkey side).
+                            for (const auto& peer_key : roster_peer_keys) {
+                                if (meshed.count(peer_key)) continue;
+                                std::array<std::uint8_t, 32> peer_pub_arr{};
+                                std::memcpy(peer_pub_arr.data(),
+                                            peer_key.data(), 32);
+                                const bool i_dial = std::lexicographical_compare(
+                                    peer_pub_arr.begin(), peer_pub_arr.end(),
+                                    my_pub.begin(), my_pub.end());
+                                meshed.insert(peer_key);   // claim it either way
+                                if (!i_dial) continue;     // wait for inbound
+                                fb::crypto::PubKey arr{};
+                                std::memcpy(arr.data(), peer_pub_arr.data(), 32);
+                                const QString fp_label = QString::fromStdString(
+                                    fb::crypto::Identity::fingerprint(arr));
+                                // Decide here whether we have a usable session
+                                // for this peer or need to bootstrap one. If
+                                // bootstrap, queue the username_lookup right
+                                // now — the response handler will follow
+                                // through with key_fetch and ultimately
+                                // re-dispatch start_call_to_pub.
+                                bool have_session = false;
+                                for (const auto& [_, s] : impl_->sessions) {
+                                    if (s.rat && s.peer_pub == peer_pub_arr) {
+                                        have_session = true;
+                                        break;
+                                    }
+                                }
+                                if (have_session) {
+                                    to_dial.push_back(peer_pub_arr);
+                                    emit log(QString("mesh-dial: room #%1 → %2")
+                                                 .arg(chan_name).arg(fp_label));
+                                } else {
+                                    Impl::PendingMeshDial pd;
+                                    pd.room_id    = room_id_str;
+                                    pd.with_video = false;
+                                    pd.label      = fp_label;
+                                    impl_->pending_mesh_dials[peer_key] = pd;
+                                    fb::proto::Frame qf;
+                                    qf.mutable_username_lookup()->set_pubkey(
+                                        std::string(peer_key.begin(), peer_key.end()));
+                                    blocking_send(impl_->conn, serialize(qf));
+                                    emit log(QString("mesh-bootstrap: %1 has no "
+                                                      "session yet, resolving "
+                                                      "username for key fetch")
+                                                 .arg(fp_label));
+                                }
+                            }
+                            // Dispatch dials on the main thread.
+                            for (const auto& peer_pub_arr : to_dial) {
+                                std::array<std::uint8_t, 32> pub_copy = peer_pub_arr;
+                                fb::crypto::PubKey arr{};
+                                std::memcpy(arr.data(), pub_copy.data(), 32);
+                                const QString label = QString::fromStdString(
+                                    fb::crypto::Identity::fingerprint(arr));
+                                std::string room_copy = room_id_str;
+                                QMetaObject::invokeMethod(this,
+                                    [this, pub_copy, label, room_copy]() {
+                                        if (!start_call_to_pub(
+                                                pub_copy, label,
+                                                /*with_video=*/false, room_copy)) {
+                                            emit log(QString(
+                                                "mesh-dial: already calling %1")
+                                                .arg(label));
+                                        }
+                                    }, Qt::QueuedConnection);
+                            }
+                            continue;
+                        }
+                        if (f.body_case() == fb::proto::Frame::kUsernameResp) {
+                            const auto& r = f.username_resp();
+                            if (r.found() && r.pubkey().size() == 32 &&
+                                !r.username().empty()) {
+                                std::vector<std::uint8_t> pk(r.pubkey().begin(),
+                                                              r.pubkey().end());
+                                if (impl_->store) {
+                                    impl_->store->cache_peer_name(
+                                        std::span<const std::uint8_t>(pk.data(), pk.size()),
+                                        r.username());
+                                }
+                                fb::crypto::PubKey arr{};
+                                std::memcpy(arr.data(), pk.data(), 32);
+                                emit peerUsernameResolved(
+                                    QString::fromStdString(
+                                        fb::crypto::Identity::fingerprint(arr)),
+                                    QString::fromStdString(r.username()));
+                                // Mesh-bootstrap step 2: if we asked who this
+                                // peer is because we want to mesh-dial them,
+                                // follow through with a key_fetch now that we
+                                // have a username. The kKeyFetchResp success
+                                // path will retry start_call_to_pub once the
+                                // session is up.
+                                const std::string peer_pub_str(r.pubkey().begin(),
+                                                                r.pubkey().end());
+                                if (impl_->pending_mesh_dials.count(peer_pub_str)) {
+                                    fb::proto::Frame kf;
+                                    kf.mutable_key_fetch()->set_username(r.username());
+                                    blocking_send(impl_->conn, serialize(kf));
+                                    impl_->pending_fetch_targets.push_back(r.username());
+                                    impl_->mesh_bootstrap_pending[r.username()] =
+                                        peer_pub_str;
+                                    emit log(QString("mesh-bootstrap: fetching "
+                                                      "prekey for %1")
+                                                 .arg(QString::fromStdString(
+                                                     r.username())));
+                                }
+                            } else if (r.pubkey().size() == 32) {
+                                // username_lookup returned NOT_FOUND for a
+                                // peer we wanted to dial. Drop the pending
+                                // bootstrap so we don't leak state.
+                                const std::string peer_pub_str(r.pubkey().begin(),
+                                                                r.pubkey().end());
+                                if (impl_->pending_mesh_dials.erase(peer_pub_str)) {
+                                    emit log("mesh-bootstrap: server doesn't "
+                                              "know this peer — giving up");
+                                }
+                            }
+                            continue;
+                        }
+                        if (f.body_case() == fb::proto::Frame::kKeyFetchResp) {
+                            const auto& r = f.key_fetch_resp();
+                            // Pull the username this fetch was for off the
+                            // FIFO. Both DM-send and channel-invite paths
+                            // record their fetches here, so this works
+                            // whichever path triggered the lookup.
+                            std::string fetched_for;
+                            {
+                                std::lock_guard lk(impl_->mu);
+                                if (!impl_->pending_fetch_targets.empty()) {
+                                    fetched_for = impl_->pending_fetch_targets.front();
+                                    impl_->pending_fetch_targets.pop_front();
+                                }
+                            }
+                            if (fetched_for.empty()) {
+                                emit log("key_fetch_resp without an in-flight fetch — "
+                                          "ignoring");
+                                continue;
+                            }
+                            if (!r.found() || r.bundle().identity_pubkey().size() != 32 ||
+                                r.bundle().signed_prekey().size() != 32) {
+                                // Failsafe — drop every queued op (DM or
+                                // invite) targeting this nonexistent peer
+                                // so we don't loop firing key_fetch forever,
+                                // then surface a single error to the UI.
+                                std::size_t dm_dropped = 0, inv_dropped = 0;
+                                {
+                                    std::lock_guard lk(impl_->mu);
+                                    auto qend = std::remove_if(
+                                        impl_->queue.begin(), impl_->queue.end(),
+                                        [&](const PendingSend& s){
+                                            return s.peer == fetched_for;
+                                        });
+                                    dm_dropped = static_cast<std::size_t>(
+                                        std::distance(qend, impl_->queue.end()));
+                                    impl_->queue.erase(qend, impl_->queue.end());
+                                    auto cend = std::remove_if(
+                                        impl_->chan_queue.begin(), impl_->chan_queue.end(),
+                                        [&](const PendingChannelOp& o){
+                                            return o.kind == PendingChannelOp::Kind::kInvite
+                                                && o.peer == fetched_for;
+                                        });
+                                    inv_dropped = static_cast<std::size_t>(
+                                        std::distance(cend, impl_->chan_queue.end()));
+                                    impl_->chan_queue.erase(cend, impl_->chan_queue.end());
+                                }
+                                emit errorOccurred(QString(
+                                    "no such user: '%1' is not registered on "
+                                    "this server (or hasn't connected yet) — "
+                                    "%2 message(s) and %3 invite(s) dropped")
+                                    .arg(QString::fromStdString(fetched_for))
+                                    .arg(dm_dropped).arg(inv_dropped));
+                                // Mesh-bootstrap cleanup: if this failed
+                                // fetch was a mesh-dial bootstrap, drop the
+                                // pending dial state so we don't leak it.
+                                auto bit = impl_->mesh_bootstrap_pending.find(fetched_for);
+                                if (bit != impl_->mesh_bootstrap_pending.end()) {
+                                    impl_->pending_mesh_dials.erase(bit->second);
+                                    impl_->mesh_bootstrap_pending.erase(bit);
+                                }
+                                continue;
+                            }
+                            // Successful fetch: bind a session keyed by the
+                            // username we asked for. The queue's front entry
+                            // (DM or invite) will pick this session up on
+                            // the next worker pass.
+                            auto& sess = impl_->sessions[fetched_for];
+                            std::memcpy(sess.peer_pub.data(),
+                                        r.bundle().identity_pubkey().data(), 32);
+                            std::memcpy(sess.peer_x.data(), r.bundle().signed_prekey().data(),
+                                        32);
+                            auto shared = derive_shared_secret(
+                                impl_->x25519,
+                                std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32));
+                            sess.rat.emplace(fb::crypto::DoubleRatchet::init_alice(
+                                std::span<const std::uint8_t, 32>(shared.data(), shared.size()),
+                                std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32)));
+                            sess.initialized_as_alice = true;
+                            emit log(QString("ratchet ready for %1")
+                                         .arg(QString::fromStdString(fetched_for)));
+                            // Mesh-bootstrap step 3: if this fetch was for a
+                            // mesh-dial we deferred, the session is now ready
+                            // — retry start_call_to_pub on the main thread
+                            // so the call actually fires. Without this the
+                            // call slot in calls_by_peer never gets created
+                            // even though the ratchet exists.
+                            auto bit = impl_->mesh_bootstrap_pending.find(fetched_for);
+                            if (bit != impl_->mesh_bootstrap_pending.end()) {
+                                const std::string peer_pub_str = bit->second;
+                                impl_->mesh_bootstrap_pending.erase(bit);
+                                auto dit = impl_->pending_mesh_dials.find(peer_pub_str);
+                                if (dit != impl_->pending_mesh_dials.end()) {
+                                    std::array<std::uint8_t, 32> peer_pub_arr{};
+                                    std::memcpy(peer_pub_arr.data(),
+                                                peer_pub_str.data(), 32);
+                                    QString label = dit->second.label;
+                                    bool with_video = dit->second.with_video;
+                                    std::string room_id = dit->second.room_id;
+                                    impl_->pending_mesh_dials.erase(dit);
+                                    emit log(QString("mesh-bootstrap: session ready, "
+                                                      "retrying dial to %1").arg(label));
+                                    QMetaObject::invokeMethod(this,
+                                        [this, peer_pub_arr, label, with_video,
+                                         room_id]() {
+                                            start_call_to_pub(peer_pub_arr, label,
+                                                              with_video, room_id);
+                                        }, Qt::QueuedConnection);
+                                }
+                            }
+                            // Notify so the queue is re-processed on the
+                            // next loop iteration immediately.
+                            impl_->cv.notify_all();
+                        } else if (f.body_case() == fb::proto::Frame::kEnvelope) {
+                            dispatch_envelope(f.envelope());
+                            continue;
                         }
                     }
                 }
