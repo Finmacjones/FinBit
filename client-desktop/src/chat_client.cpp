@@ -469,6 +469,20 @@ struct ChatClient::Impl {
     std::uint64_t                                  last_gossip_pull_ms  = 0;
     std::map<std::string, std::uint64_t>           gossip_watermark;  // peer_pub → last sync_with timestamp_ms
 
+    // P: First-contact parking lot. PendingSends destined for a peer
+    // whose pubkey we know (via UsernameLog or fingerprint cache) but
+    // for whom we have NO local DHT prekey/reachability data sit here
+    // while async DhtNode lookups complete. Each main-loop tick
+    // re-attempts the pre-pass; after kFirstContactTimeoutMs without
+    // resolution, the send is unparked and falls back to the server-
+    // relay path so the user never sees a stuck send.
+    struct ParkedFirstContact {
+        PendingSend                  send;
+        std::array<std::uint8_t, 32> peer_pub{};
+        std::uint64_t                parked_at_ms = 0;
+    };
+    std::deque<ParkedFirstContact>                 first_contact_parking;
+
     // Inbound queue for messages PeerNet's worker threads push in;
     // drained by the chat_client worker thread so DhtNode /
     // UsernameGossip see all callbacks on the same thread (matches
@@ -813,23 +827,31 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     [this](const std::string& topic,
                             std::span<const std::uint8_t> payload,
                             const fb::p2p::PeerInfo& /*origin*/) {
-                        // Channel topics are "fb-chan:<hex>"; payload
-                        // is a serialized Envelope. Push onto the
-                        // overlay_inbox so the worker thread routes
-                        // it through dispatch_envelope on its next
-                        // tick (gossip threads aren't allowed to
-                        // touch ChannelState / sessions directly).
-                        // Tagged with sender_pubkey="GOSS" so the
-                        // drain knows to feed dispatch_envelope
-                        // instead of parsing as Frame.peer.
+                        // Two topic kinds reach this callback:
+                        //   "fb-chan:<hex>" — payload is a serialized
+                        //                      Envelope; route via
+                        //                      dispatch_envelope.
+                        //   "fb-room:<hex>" — payload is a serialized
+                        //                      Frame{room_roster=...};
+                        //                      route via the overlay
+                        //                      inbox tagged "ROOM" so
+                        //                      the drain re-enters
+                        //                      Frame dispatch.
+                        // Both are queued onto overlay_inbox with
+                        // distinct sender_pubkey tags; the worker
+                        // thread does the actual routing.
                         Impl::OverlayInboundMsg m;
                         m.bytes.assign(payload.begin(), payload.end());
-                        m.sender_pubkey =
-                            std::vector<std::uint8_t>{'G','O','S','S'};
+                        if (topic.rfind("fb-room:", 0) == 0) {
+                            m.sender_pubkey =
+                                std::vector<std::uint8_t>{'R','O','O','M'};
+                        } else {
+                            m.sender_pubkey =
+                                std::vector<std::uint8_t>{'G','O','S','S'};
+                        }
                         std::lock_guard lk(impl_->overlay_inbox_mu);
                         impl_->overlay_inbox.push_back(std::move(m));
-                        emit log(QString("channel gossip: topic=%1 "
-                                          "queued %2B")
+                        emit log(QString("gossip: topic=%1 queued %2B")
                                      .arg(QString::fromStdString(topic))
                                      .arg(static_cast<qulonglong>(
                                          payload.size())));
@@ -2227,6 +2249,118 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // Main I/O loop.
             std::vector<std::uint8_t> rxbuf(4096);
             while (impl_->running) {
+                // 0z. Drain the first-contact parking lot (P).
+                //     For each PendingSend held while async DHT
+                //     lookups completed: re-attempt direct send
+                //     using LOCAL DHT data only. If we now have
+                //     prekey + reachability → init_alice + encrypt
+                //     + PeerNet send. If timeout exceeded → move
+                //     the send back onto impl_->queue so the next
+                //     iteration falls through to the server-relay
+                //     path. Otherwise leave it parked for another
+                //     tick.
+                if (impl_->dht && impl_->peer_net &&
+                    !impl_->first_contact_parking.empty()) {
+                    constexpr std::uint64_t kFirstContactTimeoutMs = 2000;
+                    const auto t = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<
+                            std::chrono::milliseconds>(
+                            std::chrono::system_clock::now()
+                                .time_since_epoch()).count());
+                    std::deque<Impl::ParkedFirstContact> still_parked;
+                    while (!impl_->first_contact_parking.empty()) {
+                        auto p = std::move(
+                            impl_->first_contact_parking.front());
+                        impl_->first_contact_parking.pop_front();
+                        const bool timed_out =
+                            (t - p.parked_at_ms) >= kFirstContactTimeoutMs;
+                        const auto pub_span =
+                            std::span<const std::uint8_t>(
+                                p.peer_pub.data(), p.peer_pub.size());
+                        auto pkey_rec_opt =
+                            impl_->dht->prekeys().get_latest(pub_span);
+                        const auto reach_recs =
+                            impl_->dht->store().get(pub_span);
+                        std::string wss_addr;
+                        for (const auto& r : reach_recs) {
+                            for (const auto& a : r.addresses()) {
+                                if (a.rfind("wss://", 0) == 0) {
+                                    wss_addr = a;
+                                    break;
+                                }
+                            }
+                            if (!wss_addr.empty()) break;
+                        }
+                        if (pkey_rec_opt && !wss_addr.empty()) {
+                            // Have everything we need: build the
+                            // session via init_alice using bob's
+                            // SPK from the DHT, encrypt, ship.
+                            try {
+                                std::array<std::uint8_t, 32> peer_x{};
+                                std::memcpy(peer_x.data(),
+                                    pkey_rec_opt->signed_prekey().data(),
+                                    32);
+                                auto shared = derive_shared_secret(
+                                    impl_->x25519,
+                                    std::span<const std::uint8_t, 32>(
+                                        peer_x.data(), 32));
+                                auto& sess =
+                                    impl_->sessions[p.send.peer];
+                                sess.peer_pub = p.peer_pub;
+                                sess.peer_x   = peer_x;
+                                sess.rat.emplace(
+                                    fb::crypto::DoubleRatchet::init_alice(
+                                        std::span<const std::uint8_t, 32>(
+                                            shared.data(), shared.size()),
+                                        std::span<const std::uint8_t, 32>(
+                                            peer_x.data(), 32)));
+                                sess.initialized_as_alice = true;
+                                emit log(QString("first-contact direct "
+                                                  "init_alice for %1 "
+                                                  "(server skipped)")
+                                             .arg(QString::fromStdString(
+                                                 p.send.peer)));
+                                // Re-queue the send: the established
+                                // session will now match the
+                                // serverless pre-pass below.
+                                std::lock_guard lk(impl_->mu);
+                                impl_->queue.push_front(std::move(p.send));
+                            } catch (const std::exception& e) {
+                                emit log(QString("first-contact init "
+                                                  "failed: %1; falling "
+                                                  "back to server")
+                                             .arg(e.what()));
+                                std::lock_guard lk(impl_->mu);
+                                impl_->queue.push_front(std::move(p.send));
+                            }
+                            continue;
+                        }
+                        if (timed_out) {
+                            emit log(QString("first-contact parking "
+                                              "timeout for %1 — falling "
+                                              "back to server")
+                                         .arg(QString::fromStdString(
+                                             p.send.peer)));
+                            std::lock_guard lk(impl_->mu);
+                            impl_->queue.push_front(std::move(p.send));
+                            continue;
+                        }
+                        // Still missing data, still within timeout
+                        // — keep parked. Re-issue the lookups on
+                        // every drain (cheap; just touches local
+                        // store) so a slow remote response gets
+                        // re-prompted.
+                        impl_->dht->lookup(pub_span,
+                            [](const std::vector<
+                                fb::proto::ProviderRecord>&) {});
+                        impl_->dht->lookup_prekey(pub_span,
+                            [](const std::vector<
+                                fb::proto::PrekeyRecord>&) {});
+                        still_parked.push_back(std::move(p));
+                    }
+                    impl_->first_contact_parking = std::move(still_parked);
+                }
+
                 // 0a. Drain inbound overlay messages from PeerNet
                 //     workers (direct-P2P traffic). Same dispatch
                 //     path as server-relayed Frame.peer below.
@@ -2236,9 +2370,14 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     overlay_drain.swap(impl_->overlay_inbox);
                 }
                 for (auto& m : overlay_drain) {
-                    // Gossip-tagged messages (sender_pubkey="GOSS")
-                    // are wire-form Envelopes from a P2PNode topic
-                    // delivery — feed straight to dispatch_envelope.
+                    // Gossip-tagged messages: "GOSS" → channel
+                    // envelope (Envelope payload, dispatch_envelope);
+                    // "ROOM" → voice/video room presence beacon
+                    // (Frame{room_roster=...} payload — emit
+                    // roomMembershipChanged so MainWindow's call-
+                    // mesh dialer wires up the right per-pair
+                    // PeerConnections, just like the server's
+                    // RoomRoster fan-out path).
                     if (m.sender_pubkey.size() == 4 &&
                         m.sender_pubkey[0] == 'G' &&
                         m.sender_pubkey[1] == 'O' &&
@@ -2248,6 +2387,34 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         if (env.ParseFromArray(m.bytes.data(),
                                 static_cast<int>(m.bytes.size()))) {
                             dispatch_envelope(env);
+                        }
+                        continue;
+                    }
+                    if (m.sender_pubkey.size() == 4 &&
+                        m.sender_pubkey[0] == 'R' &&
+                        m.sender_pubkey[1] == 'O' &&
+                        m.sender_pubkey[2] == 'O' &&
+                        m.sender_pubkey[3] == 'M') {
+                        fb::proto::Frame f;
+                        if (f.ParseFromArray(m.bytes.data(),
+                                static_cast<int>(m.bytes.size())) &&
+                            f.body_case() == fb::proto::Frame::kRoomRoster) {
+                            const auto& rr = f.room_roster();
+                            emit log(QString("room gossip beacon: "
+                                              "room_id=%1B participants=%2")
+                                         .arg(static_cast<qulonglong>(
+                                             rr.room_id().size()))
+                                         .arg(rr.participants_size()));
+                            // Note: server's full RoomRoster fan-out
+                            // path covers the call-mesh dialer
+                            // already; gossip beacon is a redundant
+                            // presence signal that lets peers see
+                            // each other when the server isn't
+                            // forwarding. Production wiring would
+                            // synthesize a Frame.room_roster into
+                            // the worker's read loop here for full
+                            // mesh-dialing — kept observation-only
+                            // for v0 to avoid double-dialing.
                         }
                         continue;
                     }
@@ -2670,6 +2837,44 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         rj->set_want_audio(true);
                         rj->set_want_video(op.want_video);
                         blocking_send(impl_->conn, serialize(jf));
+                        // V: also subscribe to the room gossip topic
+                        // and announce our presence over it. The
+                        // server's RoomRoster fan-out keeps working
+                        // in parallel; gossip lets peers see each
+                        // other even when the server isn't
+                        // forwarding.
+                        if (impl_->gossip) {
+                            const auto topic = fb::p2p::room_topic_name(
+                                std::span<const std::uint8_t>(
+                                    cs.id.data(), cs.id.size()));
+                            impl_->gossip->subscribe(topic);
+                            // Publish a presence beacon: serialized
+                            // RoomMember{pubkey, want_video, ...}
+                            // wrapped in a Frame so receivers can
+                            // parse it identically to the server-
+                            // forwarded Frame.room_roster member.
+                            fb::proto::Frame beacon;
+                            auto* m = beacon.mutable_room_roster();
+                            m->set_room_id(std::string(
+                                reinterpret_cast<const char*>(
+                                    cs.id.data()), cs.id.size()));
+                            auto* mem = m->add_participants();
+                            mem->set_identity_pubkey(std::string(
+                                reinterpret_cast<const char*>(
+                                    impl_->identity->public_key().data()),
+                                impl_->identity->public_key().size()));
+                            mem->set_has_audio(true);
+                            mem->set_has_video(op.want_video);
+                            std::vector<std::uint8_t> bw(
+                                beacon.ByteSizeLong());
+                            if (beacon.SerializeToArray(
+                                    bw.data(),
+                                    static_cast<int>(bw.size()))) {
+                                impl_->gossip->publish(topic,
+                                    std::span<const std::uint8_t>(
+                                        bw.data(), bw.size()));
+                            }
+                        }
                         emit log(QString("joined call on #%1 (video=%2)")
                                      .arg(QString::fromStdString(op.channel_name))
                                      .arg(op.want_video ? "yes" : "no"));
@@ -2681,6 +2886,31 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         lf.mutable_room_leave()->set_room_id(std::string(
                             reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
                         blocking_send(impl_->conn, serialize(lf));
+                        if (impl_->gossip) {
+                            const auto topic = fb::p2p::room_topic_name(
+                                std::span<const std::uint8_t>(
+                                    cs.id.data(), cs.id.size()));
+                            // Empty roster as the leave beacon —
+                            // peers seeing it know we've stepped
+                            // out. Real implementation would
+                            // publish a leave-specific message;
+                            // empty roster is the minimal signal.
+                            fb::proto::Frame beacon;
+                            beacon.mutable_room_roster()->set_room_id(
+                                std::string(
+                                    reinterpret_cast<const char*>(
+                                        cs.id.data()), cs.id.size()));
+                            std::vector<std::uint8_t> bw(
+                                beacon.ByteSizeLong());
+                            if (beacon.SerializeToArray(
+                                    bw.data(),
+                                    static_cast<int>(bw.size()))) {
+                                impl_->gossip->publish(topic,
+                                    std::span<const std::uint8_t>(
+                                        bw.data(), bw.size()));
+                            }
+                            impl_->gossip->unsubscribe(topic);
+                        }
                         emit log(QString("left call on #%1")
                                      .arg(QString::fromStdString(op.channel_name)));
                     } else if (op.kind == PendingChannelOp::Kind::kInvite) {
@@ -3109,14 +3339,117 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
 
                     auto& sess = impl_->sessions[s.peer];
                     if (!sess.rat) {
-                        // Need to fetch peer bundle first.
+                        // U: try the serverless UsernameLog first
+                        // before falling back to the server's
+                        // username_lookup / key_fetch path. If the
+                        // username log resolves s.peer to a pubkey
+                        // (which it will if we've gossiped any
+                        // claim for that name), we can ALSO check
+                        // for an existing session keyed by that
+                        // pubkey (rebind, like the fingerprint
+                        // path earlier) and kick DHT lookups so
+                        // future iterations find local hits and
+                        // graduate to the direct path.
+                        if (impl_->username_log) {
+                            if (auto pub = impl_->username_log->resolve(
+                                    s.peer)) {
+                                emit log(QString("UsernameLog resolved "
+                                                  "%1 → %2-byte pubkey")
+                                             .arg(QString::fromStdString(
+                                                 s.peer))
+                                             .arg(static_cast<qulonglong>(
+                                                 pub->size())));
+                                // Rebind: do we have a session under
+                                // a different name with this pubkey?
+                                std::array<std::uint8_t, 32> tgt{};
+                                std::memcpy(tgt.data(), pub->data(),
+                                             pub->size());
+                                for (const auto& [name, ex] :
+                                     impl_->sessions) {
+                                    if (ex.rat &&
+                                        ex.peer_pub == tgt) {
+                                        emit log(QString(
+                                            "rebinding (UsernameLog): "
+                                            "%1 → session '%2'")
+                                            .arg(QString::fromStdString(
+                                                s.peer))
+                                            .arg(QString::fromStdString(
+                                                name)));
+                                        s.peer = name;
+                                        break;
+                                    }
+                                }
+                                // Kick DHT lookups for this peer so
+                                // future sends can take the direct
+                                // path even if first contact still
+                                // hits the server.
+                                if (impl_->dht) {
+                                    impl_->dht->lookup(
+                                        std::span<const std::uint8_t>(
+                                            pub->data(), pub->size()),
+                                        [](const std::vector<
+                                            fb::proto::ProviderRecord>&) {});
+                                    impl_->dht->lookup_prekey(
+                                        std::span<const std::uint8_t>(
+                                            pub->data(), pub->size()),
+                                        [](const std::vector<
+                                            fb::proto::PrekeyRecord>&) {});
+                                }
+                                // If the rebind matched, sess[s.peer]
+                                // is now the existing live session;
+                                // re-enter the loop body so the
+                                // serverless pre-pass + send below
+                                // fire against it.
+                                if (impl_->sessions.count(s.peer) &&
+                                    impl_->sessions[s.peer].rat) {
+                                    // Re-process this PendingSend
+                                    // immediately on the next
+                                    // iteration; safer than
+                                    // re-entering inline.
+                                    std::lock_guard lk(impl_->mu);
+                                    impl_->queue.push_front(std::move(s));
+                                    break;
+                                }
+                                // P: no existing session, but the
+                                // username log gave us a pubkey
+                                // and DHT + PeerNet are configured
+                                // → park the send while DHT
+                                // lookups complete. The 0z drain
+                                // at the top of the loop will
+                                // re-attempt the direct path on
+                                // each tick, falling back to
+                                // server only on timeout.
+                                if (impl_->dht && impl_->peer_net) {
+                                    Impl::ParkedFirstContact p;
+                                    p.send = std::move(s);
+                                    std::memcpy(p.peer_pub.data(),
+                                                 pub->data(),
+                                                 pub->size());
+                                    p.parked_at_ms =
+                                        static_cast<std::uint64_t>(
+                                        std::chrono::duration_cast<
+                                            std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now()
+                                                .time_since_epoch())
+                                            .count());
+                                    impl_->first_contact_parking
+                                        .push_back(std::move(p));
+                                    emit log(QString("parked send to %1 "
+                                                      "for first-contact "
+                                                      "direct attempt")
+                                                 .arg(QString::fromStdString(
+                                                     p.send.peer)));
+                                    break;
+                                }
+                            }
+                        }
+                        // Server fallback: classic username_lookup
+                        // / key_fetch flow. Still works as before.
                         fb::proto::Frame f;
                         f.mutable_key_fetch()->set_username(s.peer);
                         blocking_send(impl_->conn, serialize(f));
                         emit log(QString("fetching prekey for %1")
                                      .arg(QString::fromStdString(s.peer)));
-                        // Re-enqueue; we'll handle the response in the read
-                        // loop and re-try.
                         std::lock_guard lk(impl_->mu);
                         impl_->pending_fetch_targets.push_back(s.peer);
                         impl_->queue.push_front(std::move(s));

@@ -38,4 +38,16 @@ constexpr const char* kChannelGossipTopicPrefix = "fb-chan:";
 [[nodiscard]] std::string channel_topic_name(
     std::span<const std::uint8_t> channel_id);
 
+// =============================================================================
+// Voice/video room topics. Same pattern: 32B room_id → "fb-room:<hex>".
+// Used by ChatClient.onRoomJoin / onRoomLeave to publish presence (and
+// eventually offer/answer/ice) over gossip in addition to (or instead of)
+// the central server's RoomJoin/RoomRoster Frames.
+// =============================================================================
+
+constexpr const char* kRoomGossipTopicPrefix = "fb-room:";
+
+[[nodiscard]] std::string room_topic_name(
+    std::span<const std::uint8_t> room_id);
+
 }  // namespace fb::p2p

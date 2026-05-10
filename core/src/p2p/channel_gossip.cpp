@@ -5,19 +5,34 @@
 
 namespace fb::p2p {
 
+namespace {
+std::string hex_topic(std::string_view prefix,
+                      std::span<const std::uint8_t> id) {
+    static const char hex[] = "0123456789abcdef";
+    std::string out(prefix);
+    out.reserve(out.size() + 64);
+    for (auto b : id) {
+        out.push_back(hex[(b >> 4) & 0x0f]);
+        out.push_back(hex[b & 0x0f]);
+    }
+    return out;
+}
+}  // namespace
+
 std::string channel_topic_name(std::span<const std::uint8_t> channel_id) {
     if (channel_id.size() != 32) {
         throw std::invalid_argument(
             "channel_topic_name: channel_id must be exactly 32 bytes");
     }
-    static const char hex[] = "0123456789abcdef";
-    std::string out = kChannelGossipTopicPrefix;
-    out.reserve(out.size() + 64);
-    for (auto b : channel_id) {
-        out.push_back(hex[(b >> 4) & 0x0f]);
-        out.push_back(hex[b & 0x0f]);
+    return hex_topic(kChannelGossipTopicPrefix, channel_id);
+}
+
+std::string room_topic_name(std::span<const std::uint8_t> room_id) {
+    if (room_id.size() != 32) {
+        throw std::invalid_argument(
+            "room_topic_name: room_id must be exactly 32 bytes");
     }
-    return out;
+    return hex_topic(kRoomGossipTopicPrefix, room_id);
 }
 
 }  // namespace fb::p2p

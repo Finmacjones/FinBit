@@ -83,6 +83,17 @@ TEST(ChannelGossip, TopicNameIsDeterministicAndHexEncoded) {
     EXPECT_EQ(t.substr(70, 2), "1f");
 }
 
+TEST(RoomGossip, TopicNameDeterministicAndDistinctFromChannel) {
+    std::vector<std::uint8_t> id(32, 0xaa);
+    auto chan = fb::p2p::channel_topic_name(
+        std::span<const std::uint8_t>(id.data(), id.size()));
+    auto room = fb::p2p::room_topic_name(
+        std::span<const std::uint8_t>(id.data(), id.size()));
+    EXPECT_EQ(chan, "fb-chan:" + std::string(64, 'a'));
+    EXPECT_EQ(room, "fb-room:" + std::string(64, 'a'));
+    EXPECT_NE(chan, room);   // distinct prefixes prevent crosstalk
+}
+
 TEST(ChannelGossip, RejectsWrongChannelIdSize) {
     std::vector<std::uint8_t> short_id(31, 0);
     EXPECT_THROW(
