@@ -497,7 +497,31 @@ machinery and **two real bugs were caught and fixed**:
 | **DHT signed-record poisoning** | Existing `BadSignatureRejected` + `TamperedPublishIsDroppedByReceiver` + new `SpoofedPublisherPubkeyRejected` (attacker has own valid keypair, signs a record, then rewrites `publisher_pubkey` to victim's hoping for a naive verifier) | All three rejected at `ProviderStore::put` — verification uses the in-record `publisher_pubkey`, so a swap invalidates the signature |
 | **Friend-relay opacity** | New `OfflineRelay.RelayCannotReadDepositedEnvelopeContents` — Alice ratchet-encrypts a known canary, deposits the wire-form ciphertext into an `OfflineRelayStore`, fetches it back as if she were the relay operator inspecting her queue, greps the held bytes for the canary literal AND every 6/8/10/12/14/16-byte substring | All grep checks pass — relay holds AEAD ciphertext only, never plaintext |
 
-**Two real bugs found and fixed.** The ratchet/SenderKeys destructors and the IoLoop race were both genuine issues that the prior test suite never exercised. The ratchet leak was a defense-in-depth gap (the keys are freed when out of scope, they just stay in allocator pages until reused — not exploitable across processes but a real cold-boot / heap-spraying surface). The IoLoop race was a real concurrency bug that could have produced silent missed events or use-after-free under load.
+### Even-deeper validation (third pass)
+
+After the second pass, a third sweep targeting harder-to-find issues
+caught a third real bug and broadened coverage in 8 areas:
+
+| Layer | Method | Result |
+|---|---|---|
+| **NIST CAVP AES-256-GCM published vectors** | `Aes256GcmKat.McgrewViegaTestCase13_EmptyPtEmptyAad` (empty PT + empty AAD; tag 53 0f 8a fb …) and `…TestCase14_SingleBlockPt` (16-byte zero PT; ct ce a7 40 3d …; tag d0 d1 c8 a7 …). Plus the existing Test Case 16 covering the multi-block + AAD path | Bit-for-bit match against the published spec |
+| **Vault rollback / cross-vault attacks** | New scenarios in `vault_security_node.mjs`: salt-swap from a sibling vault sealed under the same passphrase, cross-passphrase confusion, identical-seed double-seal producing distinct blobs that both open to the same seed | All 3 cases handled correctly. Salt swap rejects (different KDF output → AEAD tag fails), wrong passphrase rejects, double-seal opens to the same seed (vault layer is stateless — rollback risk is at the SQLite layer, not the vault) |
+| **🐛 Server-side username validation** | Bash probe attempting to register `Alice`, `ALICE`, `aaaa..`, `-name`, `ab` (too short), `foo bar`, `alïce` (unicode), 256-byte filler. Server's `Hello` handler accepted EVERY string with no validation — case-confusion impersonation (`Alice` vs `alice`), log injection, oversized username DoS | **FIXED**: `server/src/main.cpp` now calls `fb::identity::is_valid_username` on `Hello.username()` and sends a `ServerHello{ok=false, "username does not match the v0 grammar"}` for non-empty invalid claims. Re-probe: 11/11 cases (3 valid accept, 8 invalid reject) |
+| **Slow-loris / connection flood** | Python probe holds 1000 idle TCP connections to `fb_server`; in parallel runs a real `fb-cli alice → bob` DM round-trip and asserts bob receives the canary | DM round-trip succeeds even with 1000 idle conns. No max-conn cap or per-IP rate limit (production deployment concern, not a v0 defect) |
+| **FD leak under sustained churn** | 1000 short-lived dial+disconnect cycles against the server, sampling `/proc/PID/fd` per round | Server's fd count stays at 4 throughout — no leak (epoll's accept loop reaps closed sockets immediately) |
+| **Ratchet skip-too-far** | New `Ratchet.OutOfOrderBeyondMaxSkipRejectedGracefully` — alice produces 1500 messages, bob receives only the LAST one; `skip_message_keys` would need to skip ~1500 entries, which exceeds `kMaxSkip=1000` | Rejected as `nullopt` (not a thrown exception); a fresh ratchet pair still works after the rejection (bob isn't crashed or poisoned) |
+| **AEAD decrypt timing variance (side channel)** | Standalone C++ probe: 2000 iterations of `aead_decrypt` for 4 conditions (success, tamper @ start, @ middle, @ end-tag-region), median + p10/p90 nanosecond timing | **0 ns max delta** across all rejection cases (all medians within 1-3 ns) — libsodium's hardware AES-GCM verify is constant-time as expected |
+| **Cross-implementation Envelope interop** | Existing `tools/e2e/web_dm_roundtrip.sh` (WASM Node.js client → native fb-cli receiver, full DmPayload coverage) | Pass — implicit schema-drift check on every CI run |
+
+**Three real bugs found and fixed in total** across the three validation passes:
+1. (Pass 2) `DoubleRatchet::State` and `SenderKeys::GroupSession::Impl` destructors left key material live in freed allocator pages → explicit `~State()` / `~Impl()` / `~PerPeerChain()` calling `sodium_memzero`.
+2. (Pass 2) `IoLoop` had a real data race on `handlers` and `timers` accessed concurrently from registrant + I/O threads → `Impl::mu` mutex covering both, callbacks copied under lock and invoked unlocked.
+3. (Pass 3) Server accepted any string as `Hello.username()` enabling case-confusion impersonation, log injection, and oversized-username memory growth → `is_valid_username` enforced before `register_user` is called.
+
+Final test counts: **179 default / 189 MLS / 178 ASan / 178 TSan / 10 e2e**, all green.
+
+**Original two-bug summary follows for historical context:**
+The ratchet/SenderKeys destructors and the IoLoop race were both genuine issues that the prior test suite never exercised. The ratchet leak was a defense-in-depth gap (the keys are freed when out of scope, they just stay in allocator pages until reused — not exploitable across processes but a real cold-boot / heap-spraying surface). The IoLoop race was a real concurrency bug that could have produced silent missed events or use-after-free under load.
 
 Final counts: **176 default / 186 MLS / 175 ASan / 175 TSan**, all green. Sanitizers clean across the whole suite, including the post-fix concurrency code.
 

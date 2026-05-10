@@ -143,4 +143,55 @@ console.log("OK empty-passphrase seal refused");
     console.log(`   1M-guess attack ≈ ${(1e6 / guessesPerSec / 3600).toFixed(1)} core-hours`);
 }
 
+// 9. Salt-swap from another vault sealed under the same passphrase.
+//    Attacker who has read access to two vaults from the same user
+//    (different vaultA + vaultB, both sealed with the SAME passphrase)
+//    swaps vaultB's salt into vaultA. The KDF now produces a different
+//    key (different salt → different Argon2id output), so decrypt fails
+//    cleanly. No info leaked beyond "this isn't a valid vault."
+{
+    const seedA = new Uint8Array(32); seedA.fill(0xa1);
+    const seedB = new Uint8Array(32); seedB.fill(0xb2);
+    const a = M.seal_seed_with_params(PASSPHRASE, seedA, OPS_INT, MEM_INT);
+    const b = M.seal_seed_with_params(PASSPHRASE, seedB, OPS_INT, MEM_INT);
+    // Splice b's salt (offset 1..16 in v2) into a.
+    const spliced = new Uint8Array(a);
+    spliced.set(new Uint8Array(b).slice(1, 17), 1);
+    const r = tryOpen(PASSPHRASE, spliced);
+    assert.equal(r, null, "salt-swap from another vault must not decrypt");
+}
+console.log("OK salt-swap from sibling vault rejected");
+
+// 10. Cross-passphrase confusion: attacker with read access to vault A
+//     tries to open it with passphrase belonging to vault B. AAD-bound
+//     v2 params don't help here — the defense is just that AEAD with a
+//     wrong key fails its tag. Verifies the obvious property holds.
+{
+    const seedA = new Uint8Array(32); seedA.fill(0xc7);
+    const a = M.seal_seed_with_params(PASSPHRASE, seedA, OPS_INT, MEM_INT);
+    const r = tryOpen("DIFFERENT-PASSPHRASE-ENTIRELY", a);
+    assert.equal(r, null, "wrong passphrase must reject");
+}
+console.log("OK wrong passphrase rejected");
+
+// 11. Old-snapshot rollback: same vault sealed twice with the SAME seed
+//     and SAME passphrase produces two different blobs (fresh salt +
+//     nonce per seal). Both should open; that means a backup-rollback
+//     attacker who substitutes an older snapshot of the SAME vault gets
+//     no advantage — they reveal the same seed. The harm of rollback
+//     is at the SQLite layer (older messages), not the vault layer.
+{
+    const seed1 = new Uint8Array(32); seed1.fill(0xd9);
+    const blob_old = M.seal_seed_with_params(PASSPHRASE, seed1, OPS_INT, MEM_INT);
+    const blob_new = M.seal_seed_with_params(PASSPHRASE, seed1, OPS_INT, MEM_INT);
+    assert.notDeepEqual(new Uint8Array(blob_old), new Uint8Array(blob_new),
+        "two seals of the same seed must differ (fresh salt+nonce)");
+    const opened_old = tryOpen(PASSPHRASE, blob_old);
+    const opened_new = tryOpen(PASSPHRASE, blob_new);
+    assert.deepEqual(new Uint8Array(opened_old), seed1);
+    assert.deepEqual(new Uint8Array(opened_new), seed1);
+}
+console.log("OK old-snapshot rollback opens to the same seed (vault layer is " +
+            "stateless — rollback risk is on SQLite, not the vault)");
+
 console.log("PASS: vault security smoke (v2 format, AAD-bound params).");

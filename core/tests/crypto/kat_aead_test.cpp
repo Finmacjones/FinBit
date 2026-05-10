@@ -66,6 +66,71 @@ std::span<const std::uint8_t> as_span(const std::array<std::uint8_t, N>& a) {
 
 }  // namespace
 
+// NIST/McGrew Test Case 13: empty plaintext, empty AAD, 256-bit
+// all-zero key, all-zero IV. Catches the boundary case where a naive
+// implementation might not authenticate the empty plaintext correctly,
+// or might mis-handle the GHASH initial block.
+TEST(Aes256GcmKat, McgrewViegaTestCase13_EmptyPtEmptyAad) {
+    if (!fb::crypto::aes256gcm_hw_available()) GTEST_SKIP();
+    fb::crypto::AeadKey key{};
+    fb::crypto::AeadNonce nonce{};
+    // key + nonce already zero-initialised.
+
+    constexpr std::array<std::uint8_t, 16> kExpectedTag13 = {
+        0x53, 0x0f, 0x8a, 0xfb, 0xc7, 0x45, 0x36, 0xb9,
+        0xa9, 0x63, 0xb4, 0xf1, 0xc4, 0xcb, 0x73, 0x8b,
+    };
+    const auto out = fb::crypto::aead_encrypt(
+        fb::crypto::AeadAlg::kAes256Gcm, key, nonce,
+        std::span<const std::uint8_t>(),  // empty plaintext
+        std::span<const std::uint8_t>()); // empty AAD
+    ASSERT_EQ(out.size(), kExpectedTag13.size())
+        << "expected tag-only output for empty plaintext";
+    EXPECT_TRUE(std::equal(kExpectedTag13.begin(), kExpectedTag13.end(),
+                            out.begin()))
+        << "tag mismatch against NIST/McGrew Test Case 13";
+
+    auto rt = fb::crypto::aead_decrypt(
+        fb::crypto::AeadAlg::kAes256Gcm, key, nonce, out,
+        std::span<const std::uint8_t>());
+    ASSERT_TRUE(rt.has_value());
+    EXPECT_EQ(rt->size(), 0u);
+}
+
+// NIST/McGrew Test Case 14: 16-byte all-zero plaintext, empty AAD,
+// 256-bit all-zero key, all-zero IV. Catches a single-block-PT bug
+// distinct from Case 13.
+TEST(Aes256GcmKat, McgrewViegaTestCase14_SingleBlockPt) {
+    if (!fb::crypto::aes256gcm_hw_available()) GTEST_SKIP();
+    fb::crypto::AeadKey key{};
+    fb::crypto::AeadNonce nonce{};
+
+    constexpr std::array<std::uint8_t, 16> kPt14{};   // 16 zero bytes
+    constexpr std::array<std::uint8_t, 16> kCt14 = {
+        0xce, 0xa7, 0x40, 0x3d, 0x4d, 0x60, 0x6b, 0x6e,
+        0x07, 0x4e, 0xc5, 0xd3, 0xba, 0xf3, 0x9d, 0x18,
+    };
+    constexpr std::array<std::uint8_t, 16> kTag14 = {
+        0xd0, 0xd1, 0xc8, 0xa7, 0x99, 0x99, 0x6b, 0xf0,
+        0x26, 0x5b, 0x98, 0xb5, 0xd4, 0x8a, 0xb9, 0x19,
+    };
+
+    const auto out = fb::crypto::aead_encrypt(
+        fb::crypto::AeadAlg::kAes256Gcm, key, nonce,
+        std::span<const std::uint8_t>(kPt14.data(), kPt14.size()),
+        std::span<const std::uint8_t>());
+    ASSERT_EQ(out.size(), kCt14.size() + kTag14.size());
+    EXPECT_TRUE(std::equal(kCt14.begin(), kCt14.end(), out.begin()));
+    EXPECT_TRUE(std::equal(kTag14.begin(), kTag14.end(),
+                            out.begin() + kCt14.size()));
+
+    auto rt = fb::crypto::aead_decrypt(
+        fb::crypto::AeadAlg::kAes256Gcm, key, nonce, out,
+        std::span<const std::uint8_t>());
+    ASSERT_TRUE(rt.has_value());
+    EXPECT_TRUE(std::equal(kPt14.begin(), kPt14.end(), rt->begin()));
+}
+
 TEST(Aes256GcmKat, McgrewViegaTestCase16_HardwareAvailable) {
     // The test vector is meaningless on machines without AES-NI / ARMv8 crypto,
     // and libsodium will refuse to encrypt. Skip explicitly so CI on bare ARM

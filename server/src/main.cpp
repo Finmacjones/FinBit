@@ -48,6 +48,7 @@
 #include "fb/net/io_loop.hpp"
 #include "fb/net/tcp.hpp"
 #include "fb/net/websocket.hpp"
+#include "fb/identity/username_log.hpp"
 #include "fb/ratelimit/token_bucket.hpp"
 
 #include "directory.hpp"
@@ -426,6 +427,30 @@ int main(int argc, char** argv) {
                 }
                 c.claimed_user_pub.assign(h.identity_pubkey().begin(),
                                           h.identity_pubkey().end());
+                // Server-side username validation. Without this an
+                // attacker could register "Alice" alongside "alice"
+                // (case-confusion impersonation), inject control
+                // chars into server logs, register usernames over
+                // 32 bytes (memory growth in the directory map),
+                // or exploit any future code path that assumes the
+                // server-bound username matches the strict ASCII
+                // grammar enforced everywhere else (vault path,
+                // username_log claim format). Empty username is
+                // allowed (anonymous Hello — register_user is then
+                // skipped) but ANY non-empty value must pass the
+                // canonical grammar.
+                if (!h.username().empty() &&
+                    !fb::identity::is_valid_username(h.username())) {
+                    std::fprintf(stderr,
+                        "[server] fd=%d rejecting Hello: invalid username "
+                        "(len=%zu)\n",
+                        c.sock.fd(), h.username().size());
+                    send_server_hello(loop, c, false,
+                        "username does not match the v0 grammar "
+                        "([a-z0-9._-], 3..32 bytes, no edge dots/dashes)");
+                    c.wants_close = true;
+                    return;
+                }
                 c.claimed_username = h.username();
                 // Issue a 32-byte random challenge. The connection becomes
                 // authenticated only after HelloAck delivers a valid Ed25519
