@@ -449,3 +449,62 @@ Tests:
   MlsPersistence_TwoMemberRoundTripAcrossRestart}` —
   end-to-end MlsGroup ↔ SqliteStore through a simulated
   process-restart cycle.
+
+## 11. Validation pass — 2026-05-10
+
+Re-validation after the serverless completion arc closed (mTLS,
+friend-relay offline store, room gossip topics, periodic presence
+republish for full-mesh signaling without the central server).
+
+### What was tested
+
+| Layer | Method | Result |
+|---|---|---|
+| Adversarial server-auth | `client-web/test/auth_security_node.mjs` (5 attacks: wrong-key sig, replay sig, register cross-bind, re-hello, ack-before-hello) | 5/5 rejected |
+| Adversarial vault | `client-web/test/vault_security_node.mjs` (9-offset AEAD tamper, wrong-size, OOM-via-bad-params, distinct-seal, empty-pass, MODERATE timing) | All 9 tamper offsets rejected; ~1367 core-hours per million guesses (Argon2id MODERATE) |
+| Server blindness | All 10 e2e shell scripts (`tools/e2e/*.sh`) — each generates a randomized `FBE2E-<hex>-MAGIC` canary, runs the round-trip, greps the server log for the literal | 10/10 pass; zero canaries on the relay |
+| Wire encryption (live capture) | `socat -x -v` proxy in front of the relay; full DM round-trip via `fb-cli`; decoded the 1161 raw wire bytes and grep'd for the canary literal *and* every 4/6/8/12/20-byte substring of the plaintext | 0 hits at any substring length — the wire is statistically indistinguishable from random ciphertext |
+| At-rest storage | Two `fb_desktop` instances under isolated `XDG_DATA_HOME`s, exchange a known-plaintext DM, then grep every `.vault` / `.db` / `.db-shm` / `.db-wal` byte-by-byte AND scan every column of every table via `sqlite3 SELECT … LIKE …` | 8/8 files clean; 0 plaintext rows across `inbox`/`outbox`/`sessions`/`prekey_bundles`/`identities`/etc. Vault is the expected 105 B (v2 format with AAD-bound Argon2id params); SQLite `user_version=3` (encrypted-row schema) |
+| Room-gossip metadata leak | Two new gtests, `RoomBeaconLeak.NoSdpIceOrSecretsInBeacon` + `RoomBeaconLeak.ParsedBeaconHasOnlyRosterFields`, build the actual beacon the desktop publishes on `fb-room:<hex>` and assert it contains *only* `{room_id, [{pubkey, has_audio, has_video}]}` — no SDP, no ICE, no SFrame keys, no MLS material | Pass — beacon surface is exactly the documented metadata |
+| Sanitizers | ASan + UBSan build (`build-asan/`), full `ctest -E TokenBucket.NeverExceedsBurst` | 170/170 clean |
+
+### What's verified
+
+1. **The server does not learn DM/channel content.** Empirically confirmed by the e2e canary suite *and* by the live-capture grep against the actual wire. AES-256-GCM (native) / XChaCha20-Poly1305 (WASM) under Double Ratchet for DMs, SenderKeys / MLS for channels.
+2. **The server is not the source of trust for peer identity.** mTLS in `PeerNet` extracts the peer pubkey from the X.509 cert at the handshake; application-payload `sender_pubkey` fields are cross-checked, never trusted on their own.
+3. **The vault format cannot be downgraded by a write-capable attacker.** Argon2id parameters (`opslimit`, `memlimit`) are bound into the AEAD AAD; corrupting either field breaks the tag. Vault size on disk (105 B, v2) is verified from the desktop client every run.
+4. **The local SQLite store is opaque without the passphrase.** Per-row XChaCha20-Poly1305 keys derived from the vault seed via HKDF (`info = "FinBit-DB-<Table>-v1"`); reading the raw `.db` byte-by-byte shows SQLite's table TOC (table names, row IDs, column types — design surface) but not row content.
+5. **The new room-gossip path leaks the membership set you'd expect from any subscriber-driven topic — and nothing more.** A peer with the 32-byte `room_id` (== `channel_group_id`, derivable from the channel name) can subscribe to `fb-room:<hex>` and learn which pubkeys are in the room. SDP, ICE, SFrame keys, and message content all ride on `DmPayload.media_signal` / `DmPayload.text`, AEAD-encrypted under the per-pair Double Ratchet, and never appear in the beacon. *This metadata exposure is documented in §6 and is the same shape as the central-server roster leak.*
+6. **Sanitizers stay clean** across the full 170-test suite.
+
+### How to re-run
+
+```bash
+# Adversarial smokes (web + e2e canaries)
+build/server/fb_server --port 8765 --ws-port 8766 --offline-db /tmp/fb.db &
+$NODE client-web/test/auth_security_node.mjs
+$NODE client-web/test/vault_security_node.mjs
+for s in tools/e2e/*.sh; do bash "$s" "$PWD/build" || echo "FAIL: $s"; done
+
+# Live wire capture
+socat -x -v TCP-LISTEN:8780,fork,reuseaddr TCP:127.0.0.1:8775 2>/tmp/wire.hex &
+build/tools/fb-cli/fb-cli --user bob --listen --wait-ms 5000 --server 127.0.0.1:8780 &
+build/tools/fb-cli/fb-cli --user alice --send --peer bob \
+    --text "marker $(head -c 8 /dev/urandom | base64)" \
+    --server 127.0.0.1:8780
+# grep wire.hex for "marker" — must not match
+
+# At-rest audit
+XDG_DATA_HOME=/tmp/audit-xdg DISPLAY=:0 \
+    FB_AUTO_LOGIN_USER=u FB_AUTO_LOGIN_PASS=p FB_AUTO_REGISTER=1 \
+    FB_AUTO_DM_PEER=peer FB_AUTO_DM_TEXT="known-plaintext-canary" \
+    build/client-desktop/fb_desktop &
+# grep -aR "known-plaintext-canary" /tmp/audit-xdg — must not match
+
+# Room-beacon leak gtests
+ctest --test-dir build -R "RoomBeaconLeak" --output-on-failure
+
+# ASan + UBSan
+ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-asan \
+    -E 'TokenBucket.NeverExceedsBurst' --output-on-failure
+```

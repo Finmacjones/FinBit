@@ -28,6 +28,7 @@ add_executable(fb_core_tests
     p2p/peer_net_test.cpp
     p2p/offline_relay_test.cpp
     p2p/channel_gossip_test.cpp
+    p2p/room_beacon_leak_test.cpp
 )
 
 target_link_libraries(fb_core_tests
