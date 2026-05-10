@@ -57,22 +57,27 @@ constexpr std::uint64_t kDefaultProviderTtlMs = 60 * 60 * 1000;
 
 // Signing-bytes layout — see provider_records.cpp for full description.
 // Pinned canonical form so verifiers don't depend on protobuf
-// serialization quirks.
+// serialization quirks. The offline_relays vector is appended to the
+// canonical bytes after the nonce; an empty vector takes 0 length-
+// prefix bytes and is treated as "no relays".
 [[nodiscard]] std::vector<std::uint8_t> canonical_signing_bytes(
     std::span<const std::uint8_t> publisher_pubkey,
     const std::vector<std::string>& addresses,
     std::uint64_t published_at_ms,
     std::uint64_t ttl_ms,
-    std::span<const std::uint8_t> nonce);
+    std::span<const std::uint8_t> nonce,
+    const std::vector<std::vector<std::uint8_t>>& offline_relays = {});
 
 // Build + sign a record. Throws std::invalid_argument on bad sizes /
-// over-long addresses / empty address list.
+// over-long addresses / empty address list. Each offline_relays entry
+// must be 32B (Ed25519 pubkey); empty list = no relays declared.
 [[nodiscard]] fb::proto::ProviderRecord build_record(
     std::span<const std::uint8_t> sig_pub,
     std::span<const std::uint8_t> sig_priv,
     const std::vector<std::string>& addresses,
     std::uint64_t published_at_ms,
-    std::uint64_t ttl_ms = kDefaultProviderTtlMs);
+    std::uint64_t ttl_ms = kDefaultProviderTtlMs,
+    const std::vector<std::vector<std::uint8_t>>& offline_relays = {});
 
 class ProviderStore {
 public:

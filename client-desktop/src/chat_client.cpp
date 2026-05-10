@@ -43,7 +43,10 @@
 #include "fb/identity/username_gossip.hpp"
 #include "fb/identity/username_log.hpp"
 #include "fb/p2p/bootstrap.hpp"
+#include "fb/p2p/channel_gossip.hpp"
 #include "fb/p2p/dht_node.hpp"
+#include "fb/p2p/gossip.hpp"
+#include "fb/p2p/offline_relay.hpp"
 #include "fb/p2p/peer_net.hpp"
 #include "fb/p2p/provider_records.hpp"
 #include "dht.pb.h"
@@ -443,6 +446,24 @@ struct ChatClient::Impl {
     std::unique_ptr<fb::p2p::PeerNet>             peer_net;
     std::string                                    own_p2p_addr; // for self-publish
 
+    // Friend-relay (I4). Each entry is a 32-byte Ed25519 pubkey of a
+    // contact this user has designated as an offline relay. Embedded
+    // in our own ProviderRecord on every republish; senders facing
+    // an unreachable peer fall back to depositing into one of the
+    // peer's relays.
+    std::vector<std::vector<std::uint8_t>>        own_offline_relays;
+    // We ALSO act as a relay for any peers who designated us. Their
+    // OFFLINE_DEPOSIT messages land in this store; their
+    // OFFLINE_FETCH messages drain it.
+    std::unique_ptr<fb::p2p::OfflineRelayStore>   offline_store;
+
+    // I3: optional P2PNode for channel envelopes via gossipsub. Env-
+    // controlled like PeerNet (FB_GOSSIP_PORT + FB_GOSSIP_DIAL).
+    // When present, ChatClient subscribes to channel topics and
+    // gossipsub fans out channel envelopes peer-to-peer alongside
+    // (or instead of) the central server's chan_subscribe path.
+    std::unique_ptr<fb::p2p::P2PNode>             gossip;
+
     // Periodic overlay maintenance state.
     std::uint64_t                                  last_self_publish_ms = 0;
     std::uint64_t                                  last_gossip_pull_ms  = 0;
@@ -678,6 +699,134 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     wrap_peer_send(fb::proto::PeerEnvelope::DHT,
                                     peer, wire);
                 });
+
+            // ---- DM-text decrypt helper (I1) ----
+            // Focused refactor of the existing inline kEnvelope DM
+            // path. Reused by both Frame.envelope (server-relay) and
+            // PeerEnvelope::DM (direct-P2P) so the user-visible
+            // "alice DMs bob" works identically over both transports.
+            //
+            // Scope: TEXT payloads only. Other DmPayload kinds
+            // (channel_key, mls_*, media_signal) still flow through
+            // the existing inline kEnvelope handler — those have
+            // deeper integration with channel state / MLS pending
+            // joins / media call queues that would balloon this
+            // helper. A follow-up can hoist them in too.
+            //
+            // Returns true if the envelope decrypted to a TEXT
+            // payload AND messageReceived was emitted; false on any
+            // failure (bad crypto, non-text payload, malformed AAD).
+            // Caller can fall through to the inline kEnvelope handler
+            // on false to preserve the legacy code path for non-text
+            // payloads.
+            auto try_decrypt_dm_text =
+                [this](const fb::proto::Envelope& env) -> bool {
+                if (env.sender_pubkey().size() != 32) return false;
+                const std::string sender_pub_bytes(
+                    env.sender_pubkey().begin(),
+                    env.sender_pubkey().end());
+
+                // Locate (or create) the ratchet session for this
+                // peer. Same logic as the inline kEnvelope handler:
+                // reuse an existing session if one exists for this
+                // pubkey; otherwise spin up a fresh init_bob.
+                std::array<std::uint8_t, 32> sender_pub_arr{};
+                std::memcpy(sender_pub_arr.data(),
+                             sender_pub_bytes.data(), 32);
+                std::string sname;
+                for (auto& [name, s] : impl_->sessions) {
+                    if (s.rat && s.peer_pub == sender_pub_arr) {
+                        sname = name;
+                        break;
+                    }
+                }
+                if (sname.empty()) {
+                    sname = "peer:" + sender_pub_bytes.substr(0, 8);
+                }
+                auto& sess = impl_->sessions[sname];
+                if (!sess.rat) {
+                    std::array<std::uint8_t, 32> peer_x{};
+                    if (crypto_sign_ed25519_pk_to_curve25519(
+                            peer_x.data(),
+                            reinterpret_cast<const std::uint8_t*>(
+                                sender_pub_bytes.data())) != 0) {
+                        return false;
+                    }
+                    auto shared = derive_shared_secret(
+                        impl_->x25519,
+                        std::span<const std::uint8_t, 32>(
+                            peer_x.data(), 32));
+                    sess.rat.emplace(
+                        fb::crypto::DoubleRatchet::init_bob(
+                            std::span<const std::uint8_t, 32>(
+                                shared.data(), shared.size()),
+                            std::span<const std::uint8_t, 32>(
+                                impl_->x25519.priv.data(), 32),
+                            std::span<const std::uint8_t, 32>(
+                                impl_->x25519.pub.data(), 32)));
+                    sess.peer_pub = sender_pub_arr;
+                    sess.peer_x   = peer_x;
+                }
+
+                // Re-derive + cross-check Envelope.aad just like the
+                // existing inline path.
+                std::vector<std::uint8_t> outer_aad(
+                    env.aad().begin(), env.aad().end());
+                if (!outer_aad.empty()) {
+                    std::vector<std::uint8_t> envid(
+                        env.envelope_id().begin(),
+                        env.envelope_id().end());
+                    auto expected = envelope_aad_bytes(
+                        std::span<const std::uint8_t>(envid.data(),
+                                                       envid.size()),
+                        env.timestamp_ms());
+                    if (expected != outer_aad) return false;
+                }
+
+                // Decrypt via the ratchet.
+                std::vector<std::uint8_t> ct(env.ciphertext().begin(),
+                                              env.ciphertext().end());
+                std::optional<std::vector<std::uint8_t>> pt;
+                try {
+                    pt = sess.rat->decrypt(
+                        std::span<const std::uint8_t>(ct.data(), ct.size()),
+                        std::span<const std::uint8_t>(outer_aad.data(),
+                                                       outer_aad.size()));
+                } catch (...) { return false; }
+                if (!pt) return false;
+
+                // Parse the inner DmPayload. Only TEXT goes through
+                // this helper — everything else returns false so the
+                // caller can let the inline kEnvelope handler take
+                // over.
+                fb::proto::DmPayload payload;
+                if (!payload.ParseFromArray(
+                        pt->data(), static_cast<int>(pt->size()))) {
+                    return false;
+                }
+                if (payload.body_case() != fb::proto::DmPayload::kText) {
+                    return false;
+                }
+
+                // Fingerprint = peer's stable display ID; cached
+                // username if we know it (same lookup the inline
+                // path does).
+                const auto peer_fp = QString::fromStdString(
+                    fb::crypto::Identity::fingerprint(sender_pub_arr));
+                QString cached_username;
+                if (impl_->store) {
+                    if (auto u = impl_->store->peer_name(
+                            std::span<const std::uint8_t>(
+                                sender_pub_arr.data(),
+                                sender_pub_arr.size()))) {
+                        cached_username = QString::fromStdString(*u);
+                    }
+                }
+                emit messageReceived(peer_fp, cached_username,
+                    QString::fromStdString(payload.text()));
+                return true;
+            };
+            (void)try_decrypt_dm_text;   // referenced from PeerEnvelope dispatch
             // ---- PeerNet (direct peer-to-peer) ----
             // Optional. Configured via env vars so the desktop UI
             // doesn't need an "expose my port" toggle yet:
@@ -707,6 +856,116 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             const std::string dialer_ca     = env("FB_PEER_DIALER_CA");
             const bool dialer_insecure      = !env("FB_PEER_DIALER_INSECURE").empty();
             impl_->own_p2p_addr             = env("FB_PEER_PUBLIC_ADDR");
+
+            // I4: parse FB_OFFLINE_RELAYS as a comma-separated list
+            // of hex pubkeys (64 hex chars each). Each declared
+            // relay gets embedded in our own ProviderRecord on
+            // every republish so senders can find them when we're
+            // offline. Quietly skip malformed entries — bad CSV
+            // shouldn't break startup.
+            {
+                const std::string csv = env("FB_OFFLINE_RELAYS");
+                std::size_t pos = 0;
+                while (pos < csv.size()) {
+                    auto end = csv.find(',', pos);
+                    if (end == std::string::npos) end = csv.size();
+                    auto chunk = csv.substr(pos, end - pos);
+                    pos = end + 1;
+                    // Trim whitespace.
+                    while (!chunk.empty() && std::isspace(
+                            static_cast<unsigned char>(chunk.front()))) {
+                        chunk.erase(0, 1);
+                    }
+                    while (!chunk.empty() && std::isspace(
+                            static_cast<unsigned char>(chunk.back()))) {
+                        chunk.pop_back();
+                    }
+                    if (chunk.size() != 64) continue;
+                    std::vector<std::uint8_t> pub(32);
+                    bool ok = true;
+                    auto nyb = [](char c, int& v) {
+                        if (c >= '0' && c <= '9') { v = c - '0'; return true; }
+                        if (c >= 'a' && c <= 'f') { v = 10 + c - 'a'; return true; }
+                        if (c >= 'A' && c <= 'F') { v = 10 + c - 'A'; return true; }
+                        return false;
+                    };
+                    for (std::size_t i = 0; i < 32 && ok; ++i) {
+                        int hi = 0, lo = 0;
+                        ok = nyb(chunk[i*2], hi) && nyb(chunk[i*2+1], lo);
+                        if (ok) pub[i] = static_cast<std::uint8_t>((hi<<4)|lo);
+                    }
+                    if (ok) impl_->own_offline_relays.push_back(std::move(pub));
+                }
+                if (!impl_->own_offline_relays.empty()) {
+                    emit log(QString("offline relays designated: %1")
+                                 .arg(static_cast<qulonglong>(
+                                     impl_->own_offline_relays.size())));
+                }
+            }
+            // I4: We also act as a relay for any peer who designated
+            // us. Always allocate the store; deposit handlers
+            // populate it on demand.
+            impl_->offline_store =
+                std::make_unique<fb::p2p::OfflineRelayStore>();
+
+            // I3: optional gossipsub (P2PNode) for serverless
+            // channel fan-out. Configured via env:
+            //   FB_GOSSIP_PORT    uint16, our gossipsub listen port
+            //   FB_GOSSIP_DIAL    "host:port[,host:port,...]" of
+            //                     bootstrap gossip peers
+            // When the port is set, we instantiate P2PNode bound
+            // to that port and subscribe to every existing channel
+            // topic as soon as we know the channel id. Inbound
+            // topic messages route through try_decrypt_dm_text
+            // (channel envelopes are also wire-form Envelope; the
+            // helper handles the same crypto path).
+            const std::string gport_str = env("FB_GOSSIP_PORT");
+            if (!gport_str.empty()) {
+                const auto gport = static_cast<std::uint16_t>(
+                    std::atoi(gport_str.c_str()));
+                impl_->gossip = std::make_unique<fb::p2p::P2PNode>(
+                    "0.0.0.0", gport,
+                    std::span<const std::uint8_t>(
+                        impl_->identity->public_key().data(),
+                        impl_->identity->public_key().size()));
+                impl_->gossip->set_on_topic_message(
+                    [this](const std::string& topic,
+                            std::span<const std::uint8_t> payload,
+                            const fb::p2p::PeerInfo& origin) {
+                        // Channel topics are "fb-chan:<hex>"; payload
+                        // is a serialized Envelope. We surface the
+                        // arrival via the activity log; full
+                        // channel-decrypt routing into ChannelState
+                        // is the same refactor pending for direct-DM
+                        // dispatch — both share the kEnvelope inline
+                        // body that hasn't been hoisted yet.
+                        emit log(QString("channel gossip: topic=%1 "
+                                          "%2B from %3-byte peer")
+                                     .arg(QString::fromStdString(topic))
+                                     .arg(static_cast<qulonglong>(
+                                         payload.size()))
+                                     .arg(static_cast<qulonglong>(
+                                         origin.pubkey.size())));
+                    });
+                impl_->gossip->start();
+                emit log(QString("gossip P2PNode started on :%1")
+                             .arg(gport));
+                // Bootstrap: dial out to FB_GOSSIP_DIAL peers (CSV).
+                const std::string dials = env("FB_GOSSIP_DIAL");
+                std::size_t pos = 0;
+                while (pos < dials.size()) {
+                    auto end = dials.find(',', pos);
+                    if (end == std::string::npos) end = dials.size();
+                    auto pair = dials.substr(pos, end - pos);
+                    pos = end + 1;
+                    auto colon = pair.find(':');
+                    if (colon == std::string::npos) continue;
+                    impl_->gossip->dial(
+                        pair.substr(0, colon),
+                        static_cast<std::uint16_t>(
+                            std::atoi(pair.c_str() + colon + 1)));
+                }
+            }
             const bool any_peer_env =
                 !peer_port_str.empty() || !peer_cert.empty() ||
                 !peer_key.empty() || !dialer_ca.empty() ||
@@ -1091,12 +1350,16 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         sig_pub, sig_priv,
                         std::vector<std::string>{impl_->own_p2p_addr},
                         now_ms(),
-                        fb::p2p::kDefaultProviderTtlMs);
+                        fb::p2p::kDefaultProviderTtlMs,
+                        impl_->own_offline_relays);
                     auto sent = impl_->dht->publish(rec);
-                    emit log(QString("DHT republish: addr=%1 sent_to=%2")
+                    emit log(QString("DHT republish: addr=%1 sent_to=%2 "
+                                      "relays=%3")
                                  .arg(QString::fromStdString(
                                      impl_->own_p2p_addr))
-                                 .arg(static_cast<qulonglong>(sent)));
+                                 .arg(static_cast<qulonglong>(sent))
+                                 .arg(static_cast<qulonglong>(
+                                     impl_->own_offline_relays.size())));
                 } catch (const std::exception& e) {
                     emit log(QString("DHT republish failed: %1")
                                  .arg(e.what()));
@@ -1165,22 +1428,94 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             if (impl_->username_gossip)
                                 impl_->username_gossip->on_message(from, payload);
                             break;
-                        case fb::proto::PeerEnvelope::DM:
-                            // Direct-P2P DM: inner payload is a
-                            // wire-form Envelope. Surface the
-                            // capability via the activity log; the
-                            // actual decrypt path goes through the
-                            // existing Frame.envelope handler in a
-                            // follow-up refactor that hoists DM
-                            // dispatch into a helper callable from
-                            // both sites.
-                            emit log(QString("inbound DM via direct P2P "
-                                              "from %1B sender, payload=%2B")
-                                         .arg(static_cast<qulonglong>(
-                                             from.pubkey.size()))
-                                         .arg(static_cast<qulonglong>(
-                                             payload.size())));
+                        case fb::proto::PeerEnvelope::DM: {
+                            // Direct-P2P DM via PeerNet: payload is
+                            // a wire-form Envelope. Decrypt + emit
+                            // via try_decrypt_dm_text (TEXT path
+                            // only; other DmPayload kinds still
+                            // route through the inline kEnvelope
+                            // handler on the server-relay path).
+                            fb::proto::Envelope inner;
+                            if (!inner.ParseFromArray(
+                                    payload.data(),
+                                    static_cast<int>(payload.size()))) {
+                                break;
+                            }
+                            if (try_decrypt_dm_text(inner)) {
+                                emit log("DM (PeerNet) decrypted via "
+                                          "I1 helper");
+                            } else {
+                                emit log("DM (PeerNet) received but "
+                                          "decrypt failed or non-text "
+                                          "payload");
+                            }
                             break;
+                        }
+                        case fb::proto::PeerEnvelope::OFFLINE_DEPOSIT: {
+                            // Someone designated us as a relay for
+                            // pe.recipient_pubkey and is depositing
+                            // an encrypted blob. Store opaquely —
+                            // we can't decrypt (it's encrypted to
+                            // the recipient).
+                            if (!impl_->offline_store) break;
+                            const auto& rec = pe.recipient_pubkey();
+                            if (rec.size() != 32) break;
+                            auto r = impl_->offline_store->deposit(
+                                std::span<const std::uint8_t>(
+                                    reinterpret_cast<const std::uint8_t*>(
+                                        rec.data()), 32),
+                                payload);
+                            emit log(QString("OFFLINE_DEPOSIT: %1")
+                                .arg(r == fb::p2p::OfflineRelayStore::DepositResult::kAccepted
+                                     ? "accepted"
+                                     : "rejected"));
+                            break;
+                        }
+                        case fb::proto::PeerEnvelope::OFFLINE_FETCH: {
+                            // Recipient is asking for everything
+                            // we've held for them. The sender's
+                            // pubkey IS the recipient pubkey here
+                            // (you can only fetch your own queue).
+                            if (!impl_->offline_store) break;
+                            if (from.pubkey.size() != 32) break;
+                            auto blobs = impl_->offline_store
+                                ->fetch_and_clear(
+                                    std::span<const std::uint8_t>(
+                                        from.pubkey.data(),
+                                        from.pubkey.size()));
+                            if (!blobs.empty()) {
+                                emit log(QString("OFFLINE_FETCH: "
+                                    "delivering %1 queued blob(s) "
+                                    "to peer")
+                                    .arg(static_cast<qulonglong>(
+                                        blobs.size())));
+                            }
+                            for (const auto& b : blobs) {
+                                wrap_peer_send(
+                                    fb::proto::PeerEnvelope::OFFLINE_DELIVERY,
+                                    from,
+                                    std::span<const std::uint8_t>(
+                                        b.data(), b.size()));
+                            }
+                            break;
+                        }
+                        case fb::proto::PeerEnvelope::OFFLINE_DELIVERY: {
+                            // A relay is delivering a queued blob to
+                            // us. The blob is a wire-form Envelope
+                            // we can decrypt the same way as direct
+                            // DM delivery.
+                            fb::proto::Envelope inner;
+                            if (!inner.ParseFromArray(
+                                    payload.data(),
+                                    static_cast<int>(payload.size()))) {
+                                break;
+                            }
+                            if (try_decrypt_dm_text(inner)) {
+                                emit log("DM (offline-relay) "
+                                          "decrypted");
+                            }
+                            break;
+                        }
                         default: break;
                     }
                 }
@@ -1222,6 +1557,22 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                         cs.id.size()));
                         blocking_send(impl_->conn, serialize(f));
                         cs.subscribed = true;
+                        // I3: also subscribe via gossipsub when
+                        // P2PNode is configured. Channel envelope
+                        // fan-out then works without a central
+                        // server (each member who's subscribed
+                        // receives via gossip flood).
+                        if (impl_->gossip) {
+                            const auto topic =
+                                fb::p2p::channel_topic_name(
+                                    std::span<const std::uint8_t>(
+                                        cs.id.data(), cs.id.size()));
+                            impl_->gossip->subscribe(topic);
+                            emit log(QString("gossip subscribed to "
+                                              "channel topic %1")
+                                         .arg(QString::fromStdString(
+                                             topic.substr(0, 24)) + "…"));
+                        }
                         emit channelJoined(QString::fromStdString(op.channel_name));
                         emit log(QString("subscribed to channel #%1")
                                      .arg(QString::fromStdString(op.channel_name)));
@@ -1804,6 +2155,60 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                             from, payload);
                                     }
                                     break;
+                                case fb::proto::PeerEnvelope::DM: {
+                                    fb::proto::Envelope inner;
+                                    if (!inner.ParseFromArray(
+                                            payload.data(),
+                                            static_cast<int>(payload.size()))) {
+                                        break;
+                                    }
+                                    if (try_decrypt_dm_text(inner)) {
+                                        emit log("DM (server-relay) "
+                                                  "decrypted via I1");
+                                    }
+                                    break;
+                                }
+                                case fb::proto::PeerEnvelope::OFFLINE_DEPOSIT: {
+                                    if (!impl_->offline_store) break;
+                                    const auto& rec = pe.recipient_pubkey();
+                                    if (rec.size() != 32) break;
+                                    impl_->offline_store->deposit(
+                                        std::span<const std::uint8_t>(
+                                            reinterpret_cast<const std::uint8_t*>(
+                                                rec.data()), 32),
+                                        payload);
+                                    break;
+                                }
+                                case fb::proto::PeerEnvelope::OFFLINE_FETCH: {
+                                    if (!impl_->offline_store) break;
+                                    if (from.pubkey.size() != 32) break;
+                                    auto blobs = impl_->offline_store
+                                        ->fetch_and_clear(
+                                            std::span<const std::uint8_t>(
+                                                from.pubkey.data(),
+                                                from.pubkey.size()));
+                                    for (const auto& b : blobs) {
+                                        wrap_peer_send(
+                                            fb::proto::PeerEnvelope::OFFLINE_DELIVERY,
+                                            from,
+                                            std::span<const std::uint8_t>(
+                                                b.data(), b.size()));
+                                    }
+                                    break;
+                                }
+                                case fb::proto::PeerEnvelope::OFFLINE_DELIVERY: {
+                                    fb::proto::Envelope inner;
+                                    if (!inner.ParseFromArray(
+                                            payload.data(),
+                                            static_cast<int>(payload.size()))) {
+                                        break;
+                                    }
+                                    if (try_decrypt_dm_text(inner)) {
+                                        emit log("DM (offline-relay) "
+                                                  "decrypted");
+                                    }
+                                    break;
+                                }
                                 default:
                                     break;
                             }

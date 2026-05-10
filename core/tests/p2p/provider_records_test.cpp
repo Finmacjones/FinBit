@@ -199,6 +199,42 @@ TEST(ProviderStore, ExpiredRecordsSkippedByGetAndPruned) {
     EXPECT_EQ(store.size(), 1u);
 }
 
+// I4: offline_relays field round-trips through build_record + put +
+// get + verify. Distinct relay lists produce different canonical
+// signing bytes (so a peer can't lie about a relay set without
+// invalidating the signature).
+TEST(ProviderStore, OfflineRelaysRoundTripAndAreSigned) {
+    auto kp = gen_kp();
+    std::vector<std::uint8_t> relay_a(32, 0xa1);
+    std::vector<std::uint8_t> relay_b(32, 0xb2);
+    std::vector<std::vector<std::uint8_t>> relays{ relay_a, relay_b };
+
+    auto rec = fb::p2p::build_record(
+        as_span(kp.pub), as_span(kp.sec),
+        std::vector<std::string>{ "wss://1.2.3.4:443" },
+        kT0, kTtl, relays);
+    fb::p2p::ProviderStore store;
+    EXPECT_EQ(store.put(rec, kNow),
+              fb::p2p::ProviderStore::PutResult::kAccepted);
+
+    auto got = store.get(as_span(kp.pub), kNow);
+    ASSERT_EQ(got.size(), 1u);
+    ASSERT_EQ(got[0].offline_relays_size(), 2);
+    EXPECT_EQ(got[0].offline_relays(0),
+              std::string(relay_a.begin(), relay_a.end()));
+    EXPECT_EQ(got[0].offline_relays(1),
+              std::string(relay_b.begin(), relay_b.end()));
+
+    // Now mutate: change one relay byte and re-verify the same
+    // record (without re-signing). Should be rejected.
+    auto tampered = rec;
+    auto* mut = tampered.mutable_offline_relays(0);
+    if (!mut->empty()) (*mut)[0] = 0xff;
+    fb::p2p::ProviderStore store2;
+    EXPECT_EQ(store2.put(tampered, kNow),
+              fb::p2p::ProviderStore::PutResult::kRejectedSig);
+}
+
 TEST(ProviderStore, MultiHomedRecordsCoexist) {
     // Same publisher publishes TWO different records (e.g., one over WSS
     // and one over QUIC) with different nonces. Both should live under

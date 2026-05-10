@@ -55,6 +55,19 @@ message ProviderRecord {
     // Ed25519 signature over canonical_signing_bytes(...) — see
     // provider_records.hpp.
     bytes  signature = 6;
+
+    // Offline-relay friend pubkeys. When this peer is unreachable,
+    // senders deposit encrypted DMs into one or more of these relays
+    // via PeerEnvelope{kind=OFFLINE_DEPOSIT}. Each entry is a 32-byte
+    // Ed25519 pubkey of a contact this peer has designated as a
+    // willing relay. Empty = "I have no relays, only direct delivery
+    // works for me".
+    //
+    // The relays themselves see the metadata "alice deposited a blob
+    // for bob at time T" but NOT message content (the inner Envelope
+    // is AEAD-encrypted to bob). See OfflineRelayStore for the threat
+    // model.
+    repeated bytes offline_relays = 7;
 }
 
 // Prekey bundle published into the DHT so peers can start a Double

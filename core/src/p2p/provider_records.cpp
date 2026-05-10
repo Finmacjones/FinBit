@@ -48,7 +48,8 @@ std::vector<std::uint8_t> canonical_signing_bytes(
     const std::vector<std::string>& addresses,
     std::uint64_t published_at_ms,
     std::uint64_t ttl_ms,
-    std::span<const std::uint8_t> nonce) {
+    std::span<const std::uint8_t> nonce,
+    const std::vector<std::vector<std::uint8_t>>& offline_relays) {
     if (publisher_pubkey.size() != 32) {
         throw std::invalid_argument(
             "ProviderRecord: publisher_pubkey must be 32 bytes (Ed25519)");
@@ -81,6 +82,18 @@ std::vector<std::uint8_t> canonical_signing_bytes(
     append_be64(out, ttl_ms);
     out.push_back(16);
     out.insert(out.end(), nonce.begin(), nonce.end());
+    // I4: offline_relays appended after the nonce. Each entry MUST
+    // be exactly 32 bytes (Ed25519 pubkey). Empty list serializes as
+    // a single 0 length-prefix so old records (no relays) and new
+    // records (relays present) have unambiguous canonical bytes.
+    append_be16(out, static_cast<std::uint16_t>(offline_relays.size()));
+    for (const auto& r : offline_relays) {
+        if (r.size() != 32) {
+            throw std::invalid_argument(
+                "ProviderRecord: offline_relays entry must be 32B");
+        }
+        out.insert(out.end(), r.begin(), r.end());
+    }
     return out;
 }
 
@@ -89,7 +102,8 @@ fb::proto::ProviderRecord build_record(
     std::span<const std::uint8_t> sig_priv,
     const std::vector<std::string>& addresses,
     std::uint64_t published_at_ms,
-    std::uint64_t ttl_ms) {
+    std::uint64_t ttl_ms,
+    const std::vector<std::vector<std::uint8_t>>& offline_relays) {
     if (sig_pub.size() != crypto_sign_PUBLICKEYBYTES) {
         throw std::invalid_argument(
             "build_record: sig_pub must be 32 bytes");
@@ -108,6 +122,13 @@ fb::proto::ProviderRecord build_record(
     for (const auto& a : addresses) out.add_addresses(a);
     out.set_published_at_ms(published_at_ms);
     out.set_ttl_ms(ttl_ms);
+    for (const auto& r : offline_relays) {
+        if (r.size() != 32) {
+            throw std::invalid_argument(
+                "build_record: offline_relays entry must be 32B");
+        }
+        out.add_offline_relays(std::string(r.begin(), r.end()));
+    }
 
     std::array<std::uint8_t, 16> nonce{};
     randombytes_buf(nonce.data(), nonce.size());
@@ -115,7 +136,8 @@ fb::proto::ProviderRecord build_record(
 
     auto signing_bytes = canonical_signing_bytes(
         sig_pub, addresses, published_at_ms, ttl_ms,
-        std::span<const std::uint8_t>(nonce.data(), nonce.size()));
+        std::span<const std::uint8_t>(nonce.data(), nonce.size()),
+        offline_relays);
     std::array<std::uint8_t, crypto_sign_BYTES> sig{};
     unsigned long long sig_len = 0;
     if (crypto_sign_detached(sig.data(), &sig_len,
@@ -149,8 +171,14 @@ bool verify_record_signature(const fb::proto::ProviderRecord& r) {
     auto nonce = std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(r.nonce().data()),
         r.nonce().size());
+    std::vector<std::vector<std::uint8_t>> relays;
+    relays.reserve(r.offline_relays().size());
+    for (const auto& rel : r.offline_relays()) {
+        if (rel.size() != 32) return false;
+        relays.emplace_back(rel.begin(), rel.end());
+    }
     auto signing_bytes = canonical_signing_bytes(
-        pub, addrs, r.published_at_ms(), r.ttl_ms(), nonce);
+        pub, addrs, r.published_at_ms(), r.ttl_ms(), nonce, relays);
     return 0 == crypto_sign_verify_detached(
         reinterpret_cast<const unsigned char*>(r.signature().data()),
         signing_bytes.data(), signing_bytes.size(),
