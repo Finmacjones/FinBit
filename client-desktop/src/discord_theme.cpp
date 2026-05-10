@@ -84,6 +84,11 @@ QPushButton#secondaryBtn { background: #4f545c; color: #ffffff; }
 QPushButton#secondaryBtn:hover { background: #5d6269; }
 QPushButton#dangerBtn { background: #ed4245; }
 QPushButton#dangerBtn:hover { background: #c33d3f; }
+/* Borderless inline link buttons (e.g. "I have a recovery code"). */
+QPushButton#linkBtn { background: transparent; color: #5865f2; padding: 4px 8px;
+                       font-weight: 500; text-decoration: underline; }
+QPushButton#linkBtn:hover  { color: #4752c4; background: transparent; }
+QPushButton#linkBtn:pressed { color: #3c45a5; background: transparent; }
 
 /* Login modal banner across the top */
 QGroupBox#loginGroup { background: #2f3136; border: 1px solid #202225;

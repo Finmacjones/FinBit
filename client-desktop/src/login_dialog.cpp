@@ -87,8 +87,8 @@ LoginDialog::LoginDialog(QWidget* parent) : QDialog(parent) {
 
         auto* links = new QHBoxLayout;
         auto* toRecover = new QPushButton("I have a recovery code", w);
+        toRecover->setObjectName("linkBtn");
         toRecover->setFlat(true);
-        toRecover->setStyleSheet("color:#5865f2; text-decoration:underline;");
         connect(toRecover, &QPushButton::clicked, this, &LoginDialog::onRecoverPane);
         links->addStretch();
         links->addWidget(toRecover);
@@ -115,12 +115,12 @@ LoginDialog::LoginDialog(QWidget* parent) : QDialog(parent) {
 
         auto* links = new QHBoxLayout;
         auto* toCreate = new QPushButton("Create new identity", w);
+        toCreate->setObjectName("linkBtn");
         toCreate->setFlat(true);
-        toCreate->setStyleSheet("color:#5865f2; text-decoration:underline;");
         connect(toCreate, &QPushButton::clicked, this, &LoginDialog::onCreatePane);
         auto* toRecover = new QPushButton("Recover from code", w);
+        toRecover->setObjectName("linkBtn");
         toRecover->setFlat(true);
-        toRecover->setStyleSheet("color:#5865f2; text-decoration:underline;");
         connect(toRecover, &QPushButton::clicked, this, &LoginDialog::onRecoverPane);
         links->addStretch();
         links->addWidget(toCreate);
@@ -153,8 +153,8 @@ LoginDialog::LoginDialog(QWidget* parent) : QDialog(parent) {
         form->addRow("", recover_btn_);
 
         auto* back = new QPushButton("Back", w);
+        back->setObjectName("linkBtn");
         back->setFlat(true);
-        back->setStyleSheet("color:#5865f2; text-decoration:underline;");
         connect(back, &QPushButton::clicked, this, [this] {
             show_pane(list_vault_usernames().isEmpty() ? kPaneCreate : kPaneSignIn);
         });
