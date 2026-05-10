@@ -15,11 +15,19 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 | Login dialog | <img src="docs/screenshots/desktop-login.png" width="320"/> | (similar — `client-web/ui/login_ui.js`) |
 | Main UI | <img src="docs/screenshots/desktop-main.png" width="640"/> | Discord-style HTML/CSS/JS in `client-web/ui/` |
 
+> Screenshots are from an early build. The current connect bar adds a
+> `TLS / (insecure) / CA…` trio for direct `wss://` to a relay (no
+> reverse proxy needed), the channel-create dialog has an "MLS
+> encryption?" checkbox, and the activity log surfaces serverless
+> overlay events (`peer-net listening`, `dht published`, `gossip
+> joined fb-chan:…`) once the env-driven P2P stack is enabled.
+
 ## What's real today
 
 - **DMs** — Signal Double Ratchet over libsodium, AES-256-GCM (native) /
-  XChaCha20-Poly1305 (WASM, no AES-NI). Server only ever sees ciphertext.
-  146 native tests + 7 web smokes pass.
+  XChaCha20-Poly1305 (WASM, no AES-NI). Server only ever sees ciphertext —
+  and in serverless mode it sees nothing at all (see "Serverless overlay"
+  below). 167 native tests + 9 web smokes + 10 end-to-end shell demos pass.
 - **Channels** — Two interoperable group-crypto paths:
   - **SenderKeys** (default) — per-(group, sender) symmetric chains with
     replay rejection, out-of-order delivery, post-eviction key
@@ -33,7 +41,7 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
     UI checkbox in the channel-create dialog. Surviving restart via
     an operation-replay persistence layer above `mls::State` (the
     only acknowledged limitation in the v0 MLS path is now closed —
-    156 MLS-build tests pass including end-to-end alice/bob
+    177 MLS-build tests pass including end-to-end alice/bob
     restoration after process restart). See
     `docs/security-audit.md §10` for the design.
 - **Login** — Argon2id-protected identity vault on disk. v2 format binds
@@ -86,29 +94,65 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
     SNI, X509 hostname binding, and a select-driven non-blocking
     handshake that handles WANT_READ / WANT_WRITE in both
     directions.
-- **Serverless overlay** — full peer-to-peer username + reachability
-  layer that survives the central server going away:
+- **Serverless overlay** — full peer-to-peer username + reachability +
+  *delivery* layer that survives the central server going away:
   - **Username log** — append-only signed claim log binding usernames
     to Ed25519 pubkeys. Same shape as Nostr / Sigstore-Rekor: signed
     events, no consensus, deterministic conflict resolution
     (smallest valid timestamp wins). Eventually consistent through
     gossip — late-arriving older claims flip the resolved owner
-    without breaking any rule.
-  - **DHT provider records** — signed `(pubkey → addresses + ttl)`
-    bindings keyed by publisher pubkey. `DhtNode::publish()` sends
-    to the K closest peers in the routing table; `lookup()` queries
-    them and aggregates deduped responses. Wire format keyed by
+    without breaking any rule. Used by the desktop send path: when
+    you address a peer by username, we resolve it locally first
+    before considering server-side `username_lookup`.
+  - **DHT provider records + prekey bundles** — signed
+    `(pubkey → addresses + ttl)` and `(pubkey → SPK + OPK)` bindings
+    keyed by publisher pubkey. `DhtNode::publish()` sends to the K
+    closest peers in the routing table; `lookup()` queries them and
+    aggregates deduped responses. Wire format keyed by
     `node_id_from_pubkey = SHA-256(pubkey)[0..20]` (Kademlia
-    convention).
-  - **PeerEnvelope transport** — overlay traffic rides on either
-    (a) the central server's relay (`Frame.peer` with opaque
-    payload; server forwards by recipient pubkey, never parses the
-    contents) or (b) **direct TLS peer-to-peer** via `PeerNet`
-    (each node optionally runs a TLS listener; outbound dials go
-    through a connection pool). Wire format is the same on both
-    paths so the receiver-side dispatch is unchanged. ChatClient
-    prefers direct-P2P when the peer.addr is a dialable
-    `wss://...`; falls back to server-relay otherwise.
+    convention). The send path issues an **async DHT prekey lookup**
+    in parallel with the legacy `KeyFetchRequest` — whichever
+    returns first (with a valid Ed25519 signature) drives
+    `init_alice`.
+  - **Mutual-TLS peer auth** — `PeerNet` serves an X.509 cert whose
+    subject pubkey *is* the node's identity Ed25519 (pure-EdDSA via
+    `X509_sign(..., nullptr)`). Both sides extract the peer's
+    `sender_pubkey` from the SSL-handshake cert, not from the
+    application payload — a peer cannot impersonate another for
+    DHT routing-table updates or PeerEnvelope dispatch.
+  - **PeerEnvelope transport (3-way fallback)** — overlay traffic
+    rides on:
+    1. **Direct TLS peer-to-peer** via `PeerNet` (each node
+       optionally runs a TLS listener; outbound dials go through
+       a connection pool). Preferred when the peer's
+       `FB_PEER_PUBLIC_ADDR` is dialable.
+    2. **Friend-relay offline store** — a third peer accepts
+       `OFFLINE_DEPOSIT(envelope)` for a recipient it knows; the
+       recipient `OFFLINE_FETCH`es on next start and the relay
+       hands back stored `OFFLINE_DELIVERY` frames. Pure peer
+       cooperation, no central server in the loop.
+    3. **Central server** as a last-resort opaque relay (`Frame.peer`,
+       payload never parsed by the server).
+    Wire format is the same on every path; the receiver dispatches
+    through one hoisted `dispatch_envelope` lambda regardless of
+    which transport delivered the bytes. Kinds covered: `DHT`,
+    `GOSSIP`, `DM` (full `DmPayload` coverage including
+    `key_fetch_*`), `OFFLINE_DEPOSIT/FETCH/DELIVERY`.
+  - **First-contact parking lot** — when you DM a peer for whom we
+    just resolved a fresh pubkey from the username log, the send
+    is parked (≤2 s) while `DhtNode::lookup` races to fetch the
+    SPK. If the prekey arrives in time we run `init_alice`
+    locally; on timeout we fall through to the server-side
+    `KeyFetchRequest`.
+  - **Channel + room gossip topics** — channels publish on
+    `fb-chan:<hex32>` and voice rooms publish on `fb-room:<hex32>`
+    (separate prefixes prevent crosstalk, see `RoomGossip.TopicNameDeterministicAndDistinctFromChannel`).
+    Receivers tag observed payloads with `GOSS` / `ROOM` sentinels
+    in an overlay inbox so the worker loop can demultiplex them
+    back through `dispatch_envelope`.
+  - **Cert-pinned wss:// URLs** — `wss://host:port#hexfingerprint`
+    pins the relay's TLS cert by SHA-256 fingerprint, so even an
+    operator-rotated cert can't silently replace itself.
   - **Bootstrap loader** — `~/.finbit/bootstrap.txt` (or
     `$FB_BOOTSTRAP_FILE` / XDG / `/etc/finbit/`) seeds the routing
     table on startup. One peer per line: `<hex-pubkey-32>  <addr>`
@@ -133,8 +177,8 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 | SFU mode for >6-participant calls | mediasoup or Janus integration; full-mesh works for small rooms today |
 | Android client | NDK not installed in this dev env (Kotlin/Compose scaffold ready) |
 | iOS client | not started |
-| Mutual-TLS for peer authentication | `PeerNet` currently lets the sender self-stamp their `sender_pubkey`. Signed records (DHT + username log) make it a routing hint not a trust claim, but a stricter binding (peer cert pinned to the identity Ed25519) would prevent peers from impersonating each other for routing-table updates. |
-| Desktop UI for `PeerNet` config | currently env-var driven (`FB_PEER_LISTEN_PORT/CERT/KEY`, `FB_PEER_DIALER_*`, `FB_PEER_PUBLIC_ADDR`). A "Network…" preferences panel is a small follow-up. |
+| Desktop UI for `PeerNet` config | currently env-var driven (`FB_PEER_LISTEN_PORT/CERT/KEY`, `FB_PEER_DIALER_*`, `FB_PEER_PUBLIC_ADDR`, `FB_GOSSIP_PORT`, `FB_OFFLINE_RELAYS`). A "Network…" preferences panel is a small follow-up — the underlying P2P + DHT + offline-relay stack is fully wired and tested. |
+| WebRTC SDP/ICE over gossip | direct DM and friend-relay offline store cover *signaling* envelopes; full mesh-dialer signaling over the channel-gossip topic still rides the central server's `RoomRoster` Frame today. |
 
 The full architectural plan (Phases 0–5, libwebrtc story, federation) lives
 in `docs/architecture.md`. The wire protocol is in `docs/protocol-spec.md`.
@@ -172,7 +216,7 @@ sudo apt install cmake build-essential libsodium-dev libsqlite3-dev \
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # 146 native tests
+ctest --test-dir build --output-on-failure   # 167 native tests
 ```
 
 For the MLS opt-in path:
@@ -181,7 +225,7 @@ For the MLS opt-in path:
 scripts/fetch-mlspp.sh                       # vendor + apply patches
 cmake -S . -B build-mls -DFB_FEATURE_MLS=ON
 cmake --build build-mls -j
-ctest --test-dir build-mls --output-on-failure   # 156 native tests
+ctest --test-dir build-mls --output-on-failure   # 177 native tests
 ```
 
 ### 3. Run a local relay
@@ -278,8 +322,8 @@ fb.example.com {
 ### Native tests
 
 ```bash
-ctest --test-dir build --output-on-failure       # 146 tests, default
-ctest --test-dir build-mls --output-on-failure   # 156 tests, FB_FEATURE_MLS=ON
+ctest --test-dir build --output-on-failure       # 167 tests, default
+ctest --test-dir build-mls --output-on-failure   # 177 tests, FB_FEATURE_MLS=ON
 ```
 
 The default build covers crypto KAT, ratchet behaviour (including
@@ -291,11 +335,12 @@ round-trip, **DhtNode publish/lookup over an in-process bridge**,
 across two loopback instances** (skipped when `openssl(1)` isn't on
 PATH), bootstrap-file parser, plus the rest.
 
-The MLS build adds 10 more tests — `MlsFacade` for the wrapper layer
-(create / two-member add / three-member multi-broadcast / persistence
-seed + log replay), the matching `TmpDb.MlsGroup*` SQLite-table
-round-trips, and `MlsPersistTmpDb` integration tests that simulate a
-process restart and assert byte-equivalent post-restore behaviour.
+The MLS build adds 10 more tests on top of that — `MlsFacade` for the
+wrapper layer (create / two-member add / three-member multi-broadcast /
+persistence seed + log replay), the matching `TmpDb.MlsGroup*`
+SQLite-table round-trips, and `MlsPersistTmpDb` integration tests that
+simulate a process restart and assert byte-equivalent post-restore
+behaviour.
 
 ASan + UBSan are clean against the same suite (one pre-existing
 timing-sensitive `TokenBucket.NeverExceedsBurst` excluded — not a
@@ -428,14 +473,23 @@ subsystem.
   ("Create with MLS encryption?"). Operation-replay persistence
   layer keeps MLS channels usable across restarts (closed §10
   gap; see `docs/security-audit.md`).
-- **What's still NOT protected:** metadata against the server (it
-  sees who talks to whom and when, who's in which voice room — just
-  not what they're saying). The serverless overlay (`PeerNet` direct
-  P2P + DHT + username log gossip) is the way out: when both peers
-  have dialable addresses (`FB_PEER_PUBLIC_ADDR`), DHT/gossip
-  traffic skips the central server entirely. The central server
-  remains an optional fallback for unreachable peers, never sees
-  envelope contents.
+- **Mutual-TLS for peer auth.** `PeerNet` serves an X.509 cert whose
+  subject pubkey *is* the node's identity Ed25519 (pure-EdDSA via
+  `X509_sign(..., nullptr)`). Each side extracts the peer's
+  `sender_pubkey` from the SSL handshake — application-payload
+  `sender_pubkey` fields are cross-checked, never trusted on their
+  own. A peer cannot impersonate another for DHT routing-table
+  updates or PeerEnvelope dispatch.
+- **What's still NOT protected:** metadata against the central
+  server *when it's used*. The serverless overlay (`PeerNet` direct
+  P2P + DHT + username log gossip + friend-relay offline store) is
+  the way out: when both peers have dialable addresses
+  (`FB_PEER_PUBLIC_ADDR`), or when a mutual friend is reachable for
+  offline deposit, traffic skips the central server entirely —
+  including DM `Frame.envelope` payloads, channel envelopes (via
+  `fb-chan:` gossip), and voice-room presence (via `fb-room:`
+  gossip). The central server remains an optional fallback for
+  unreachable peers and never sees envelope contents.
 
 Full threat model: `docs/threat-model.md`. Layer-by-layer audit of the
 implementation: `docs/security-audit.md`.
