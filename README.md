@@ -26,7 +26,7 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 - **DMs** — Signal Double Ratchet over libsodium, AES-256-GCM (native) /
   XChaCha20-Poly1305 (WASM, no AES-NI). Server only ever sees ciphertext —
   and in serverless mode it sees nothing at all (see "Serverless overlay"
-  below). 167 native tests + 9 web smokes + 10 end-to-end shell demos pass.
+  below). 169 native tests + 9 web smokes + 10 end-to-end shell demos pass.
 - **Channels** — Two interoperable group-crypto paths:
   - **SenderKeys** (default) — per-(group, sender) symmetric chains with
     replay rejection, out-of-order delivery, post-eviction key
@@ -40,7 +40,7 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
     UI checkbox in the channel-create dialog. Surviving restart via
     an operation-replay persistence layer above `mls::State` (the
     only acknowledged limitation in the v0 MLS path is now closed —
-    177 MLS-build tests pass including end-to-end alice/bob
+    179 MLS-build tests pass including end-to-end alice/bob
     restoration after process restart). See
     `docs/security-audit.md §10` for the design.
 - **Login** — Argon2id-protected identity vault on disk. v2 format binds
@@ -148,7 +148,13 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
     (separate prefixes prevent crosstalk, see `RoomGossip.TopicNameDeterministicAndDistinctFromChannel`).
     Receivers tag observed payloads with `GOSS` / `ROOM` sentinels
     in an overlay inbox so the worker loop can demultiplex them
-    back through `dispatch_envelope`.
+    back through `dispatch_envelope`. Voice rooms re-fire a
+    presence beacon every 25 s so peers joining mid-call still
+    see existing participants; the union of beacons is fed into
+    the same `apply_room_roster` mesh-dial path the server's
+    `Frame.room_roster` uses, so a two-peer room negotiates over
+    gossip end-to-end (`RoomGossip.TwoNodeBeaconUnionMatchesServerRoster`,
+    `RoomGossip.LateJoinerSeesPeriodicRepublish`).
   - **Cert-pinned wss:// URLs** — `wss://host:port#hexfingerprint`
     pins the relay's TLS cert by SHA-256 fingerprint, so even an
     operator-rotated cert can't silently replace itself.
@@ -177,7 +183,7 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 | Android client | NDK not installed in this dev env (Kotlin/Compose scaffold ready) |
 | iOS client | not started |
 | Desktop UI for `PeerNet` config | currently env-var driven (`FB_PEER_LISTEN_PORT/CERT/KEY`, `FB_PEER_DIALER_*`, `FB_PEER_PUBLIC_ADDR`, `FB_GOSSIP_PORT`, `FB_OFFLINE_RELAYS`). A "Network…" preferences panel is a small follow-up — the underlying P2P + DHT + offline-relay stack is fully wired and tested. |
-| WebRTC SDP/ICE over gossip | direct DM and friend-relay offline store cover *signaling* envelopes; full mesh-dialer signaling over the channel-gossip topic still rides the central server's `RoomRoster` Frame today. |
+| WebRTC SDP/ICE over gossip | done — `fb-room:<hex>` gossip carries periodic presence beacons (every 25 s) that feed the same `apply_room_roster` mesh-dial path the central server's `RoomRoster` Frame uses; SDP/ICE itself rides on `DmPayload.media_signal` which already prefers direct PeerNet. The gate is closed for two-peer rooms with gossip enabled — a full SFU is the remaining capacity story. |
 
 The full architectural plan (Phases 0–5, libwebrtc story, federation) lives
 in `docs/architecture.md`. The wire protocol is in `docs/protocol-spec.md`.
@@ -215,7 +221,7 @@ sudo apt install cmake build-essential libsodium-dev libsqlite3-dev \
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # 167 native tests
+ctest --test-dir build --output-on-failure   # 169 native tests
 ```
 
 For the MLS opt-in path:
@@ -224,7 +230,7 @@ For the MLS opt-in path:
 scripts/fetch-mlspp.sh                       # vendor + apply patches
 cmake -S . -B build-mls -DFB_FEATURE_MLS=ON
 cmake --build build-mls -j
-ctest --test-dir build-mls --output-on-failure   # 177 native tests
+ctest --test-dir build-mls --output-on-failure   # 179 native tests
 ```
 
 ### 3. Run a local relay
@@ -321,8 +327,8 @@ fb.example.com {
 ### Native tests
 
 ```bash
-ctest --test-dir build --output-on-failure       # 167 tests, default
-ctest --test-dir build-mls --output-on-failure   # 177 tests, FB_FEATURE_MLS=ON
+ctest --test-dir build --output-on-failure       # 169 tests, default
+ctest --test-dir build-mls --output-on-failure   # 179 tests, FB_FEATURE_MLS=ON
 ```
 
 The default build covers crypto KAT, ratchet behaviour (including

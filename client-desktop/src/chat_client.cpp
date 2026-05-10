@@ -527,6 +527,20 @@ struct ChatClient::Impl {
     // their MediaCall torn down.
     std::map<std::string /*room_id*/, std::set<std::string /*peer_pub*/>> room_mesh_peers;
 
+    // Serverless room signaling. `room_gossip_known` accumulates peer
+    // pubkeys we've seen in `fb-room:<hex>` presence beacons (a single
+    // beacon advertises one participant — the publisher — so the union
+    // across beacons is the gossip-derived roster). `active_voice_rooms`
+    // is the set of rooms we're currently in, driving the periodic
+    // re-publish so late joiners discover us. Both maps are touched
+    // only from the worker thread.
+    std::map<std::string /*room_id*/,
+             std::map<std::string /*peer_pub*/,
+                      std::pair<bool /*has_audio*/, bool /*has_video*/>>>
+        room_gossip_known;
+    std::map<std::string /*room_id*/, bool /*want_video*/> active_voice_rooms;
+    std::uint64_t last_room_republish_ms = 0;
+
     // Lazy session bootstrap for mesh-dial. When the roster surfaces a
     // peer we've never DM'd, we can't immediately encrypt outbound media
     // signals — there's no ratchet session for them yet. The worker
@@ -1240,6 +1254,11 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 30 * 60 * 1000;   // 30 min (TTL is 1h by default)
             constexpr std::uint64_t kGossipPullIntervalMs =
                 5 * 60 * 1000;    // 5 min per peer
+            // Room presence beacons rebroadcast every 25 s so peers
+            // joining a room mid-call still see existing participants.
+            // Cheap (one Frame{room_roster} per active room per cycle)
+            // and bounded — no per-peer pairing.
+            constexpr std::uint64_t kRoomPresenceRepublishMs = 25 * 1000;
             auto now_ms = []() {
                 return static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1333,6 +1352,179 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 if (pulled > 0) {
                     emit log(QString("gossip pull: %1 peer(s)")
                                  .arg(static_cast<qulonglong>(pulled)));
+                }
+            };
+
+            // Re-fire a presence beacon on `fb-room:<hex>` for every
+            // room we're currently in. Lets a peer who joined the
+            // room AFTER us discover us (the original join-time
+            // beacon fired before they were subscribed). The beacon
+            // payload mirrors the kRoomJoin one — Frame{room_roster
+            // = {participants=[self]}}.
+            auto republish_room_presence = [&]() {
+                if (!impl_->gossip || !impl_->identity) return;
+                if (impl_->active_voice_rooms.empty()) return;
+                const auto& my_pub = impl_->identity->public_key();
+                std::size_t fired = 0;
+                for (const auto& [room_id_str, want_video]
+                        : impl_->active_voice_rooms) {
+                    if (room_id_str.size() != 32) continue;
+                    const auto topic = fb::p2p::room_topic_name(
+                        std::span<const std::uint8_t>(
+                            reinterpret_cast<const std::uint8_t*>(
+                                room_id_str.data()),
+                            room_id_str.size()));
+                    fb::proto::Frame beacon;
+                    auto* m = beacon.mutable_room_roster();
+                    m->set_room_id(room_id_str);
+                    auto* mem = m->add_participants();
+                    mem->set_identity_pubkey(std::string(
+                        reinterpret_cast<const char*>(my_pub.data()),
+                        my_pub.size()));
+                    mem->set_has_audio(true);
+                    mem->set_has_video(want_video);
+                    std::vector<std::uint8_t> bw(beacon.ByteSizeLong());
+                    if (beacon.SerializeToArray(bw.data(),
+                            static_cast<int>(bw.size()))) {
+                        impl_->gossip->publish(topic,
+                            std::span<const std::uint8_t>(
+                                bw.data(), bw.size()));
+                        ++fired;
+                    }
+                }
+                if (fired > 0) {
+                    emit log(QString("room presence republish: %1 room(s)")
+                                 .arg(static_cast<qulonglong>(fired)));
+                }
+            };
+
+            // Mesh-dial body lifted out of the worker loop so the
+            // server-side Frame.room_roster handler AND the gossip
+            // ROOM-beacon handler both call into one place. Hangs up
+            // peers no longer in the roster, glare-tiebreaks the new
+            // ones (lower-pubkey side dials), and queues bootstrap
+            // (username_lookup → key_fetch → start_call_to_pub) for
+            // peers we don't yet have a Double Ratchet session with.
+            // The `meshed` set already de-duplicates so it's safe to
+            // call this lambda from both transports for the same
+            // room — a redundant trigger is a no-op.
+            auto apply_room_roster = [&](const fb::proto::RoomRoster& rr) {
+                if (rr.room_id().size() != 32) return;
+                std::array<std::uint8_t, 32> rid{};
+                std::memcpy(rid.data(), rr.room_id().data(), 32);
+                auto nit = impl_->chan_id_to_name.find(
+                    std::string(rr.room_id().begin(), rr.room_id().end()));
+                QString chan_name;
+                if (nit != impl_->chan_id_to_name.end()) {
+                    chan_name = QString::fromStdString(nit->second);
+                }
+                QStringList fps;
+                for (const auto& p : rr.participants()) {
+                    if (p.identity_pubkey().size() != 32) continue;
+                    fb::crypto::PubKey k{};
+                    std::memcpy(k.data(), p.identity_pubkey().data(), 32);
+                    fps << QString::fromStdString(
+                        fb::crypto::Identity::fingerprint(k));
+                }
+                emit log(QString("room roster for #%1: %2 participant(s)")
+                             .arg(chan_name.isEmpty() ? "<unknown>" : chan_name)
+                             .arg(fps.size()));
+                emit channelCallRoster(chan_name, fps);
+
+                std::set<std::string> roster_peer_keys;
+                std::vector<std::array<std::uint8_t, 32>> to_dial;
+                const std::string room_id_str(rr.room_id().begin(),
+                                               rr.room_id().end());
+                const auto& my_pub = impl_->identity->public_key();
+                for (const auto& p : rr.participants()) {
+                    if (p.identity_pubkey().size() != 32) continue;
+                    if (std::equal(my_pub.begin(), my_pub.end(),
+                                   p.identity_pubkey().begin())) {
+                        continue;
+                    }
+                    roster_peer_keys.insert(std::string(
+                        p.identity_pubkey().begin(),
+                        p.identity_pubkey().end()));
+                }
+                auto& meshed = impl_->room_mesh_peers[room_id_str];
+                std::vector<std::string> to_drop;
+                for (const auto& peer_key : meshed) {
+                    if (!roster_peer_keys.count(peer_key)) {
+                        to_drop.push_back(peer_key);
+                    }
+                }
+                for (const auto& peer_key : to_drop) {
+                    meshed.erase(peer_key);
+                    MediaCall* call = nullptr;
+                    {
+                        auto it = impl_->calls_by_peer.find(peer_key);
+                        if (it != impl_->calls_by_peer.end()) {
+                            call = it->second.call;
+                        }
+                    }
+                    if (call) {
+                        QMetaObject::invokeMethod(call, [call]() {
+                            call->hangup();
+                        }, Qt::QueuedConnection);
+                    }
+                }
+                for (const auto& peer_key : roster_peer_keys) {
+                    if (meshed.count(peer_key)) continue;
+                    std::array<std::uint8_t, 32> peer_pub_arr{};
+                    std::memcpy(peer_pub_arr.data(), peer_key.data(), 32);
+                    const bool i_dial = std::lexicographical_compare(
+                        peer_pub_arr.begin(), peer_pub_arr.end(),
+                        my_pub.begin(), my_pub.end());
+                    meshed.insert(peer_key);
+                    if (!i_dial) continue;
+                    fb::crypto::PubKey arr{};
+                    std::memcpy(arr.data(), peer_pub_arr.data(), 32);
+                    const QString fp_label = QString::fromStdString(
+                        fb::crypto::Identity::fingerprint(arr));
+                    bool have_session = false;
+                    for (const auto& [_, s] : impl_->sessions) {
+                        if (s.rat && s.peer_pub == peer_pub_arr) {
+                            have_session = true;
+                            break;
+                        }
+                    }
+                    if (have_session) {
+                        to_dial.push_back(peer_pub_arr);
+                        emit log(QString("mesh-dial: room #%1 → %2")
+                                     .arg(chan_name).arg(fp_label));
+                    } else {
+                        Impl::PendingMeshDial pd;
+                        pd.room_id    = room_id_str;
+                        pd.with_video = false;
+                        pd.label      = fp_label;
+                        impl_->pending_mesh_dials[peer_key] = pd;
+                        fb::proto::Frame qf;
+                        qf.mutable_username_lookup()->set_pubkey(
+                            std::string(peer_key.begin(), peer_key.end()));
+                        blocking_send(impl_->conn, serialize(qf));
+                        emit log(QString("mesh-bootstrap: %1 has no "
+                                          "session yet, resolving "
+                                          "username for key fetch")
+                                     .arg(fp_label));
+                    }
+                }
+                for (const auto& peer_pub_arr : to_dial) {
+                    std::array<std::uint8_t, 32> pub_copy = peer_pub_arr;
+                    fb::crypto::PubKey arr{};
+                    std::memcpy(arr.data(), pub_copy.data(), 32);
+                    const QString label = QString::fromStdString(
+                        fb::crypto::Identity::fingerprint(arr));
+                    std::string room_copy = room_id_str;
+                    QMetaObject::invokeMethod(this,
+                        [this, pub_copy, label, room_copy]() {
+                            if (!start_call_to_pub(
+                                    pub_copy, label,
+                                    /*with_video=*/false, room_copy)) {
+                                emit log(QString(
+                                    "mesh-dial: already calling %1")
+                                    .arg(label));
+                            }
+                        }, Qt::QueuedConnection);
                 }
             };
 
@@ -2396,26 +2588,72 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         m.sender_pubkey[2] == 'O' &&
                         m.sender_pubkey[3] == 'M') {
                         fb::proto::Frame f;
-                        if (f.ParseFromArray(m.bytes.data(),
-                                static_cast<int>(m.bytes.size())) &&
-                            f.body_case() == fb::proto::Frame::kRoomRoster) {
-                            const auto& rr = f.room_roster();
-                            emit log(QString("room gossip beacon: "
-                                              "room_id=%1B participants=%2")
-                                         .arg(static_cast<qulonglong>(
-                                             rr.room_id().size()))
-                                         .arg(rr.participants_size()));
-                            // Note: server's full RoomRoster fan-out
-                            // path covers the call-mesh dialer
-                            // already; gossip beacon is a redundant
-                            // presence signal that lets peers see
-                            // each other when the server isn't
-                            // forwarding. Production wiring would
-                            // synthesize a Frame.room_roster into
-                            // the worker's read loop here for full
-                            // mesh-dialing — kept observation-only
-                            // for v0 to avoid double-dialing.
+                        if (!f.ParseFromArray(m.bytes.data(),
+                                static_cast<int>(m.bytes.size())) ||
+                            f.body_case() != fb::proto::Frame::kRoomRoster) {
+                            continue;
                         }
+                        const auto& rr = f.room_roster();
+                        if (rr.room_id().size() != 32) continue;
+                        const std::string room_id_str(rr.room_id().begin(),
+                                                       rr.room_id().end());
+                        // Merge each beacon into the per-room gossip
+                        // roster. A beacon usually carries one participant
+                        // (the publisher); the union across beacons forms
+                        // the gossip-derived view of who's in the room.
+                        // An empty-participants beacon is a leave signal —
+                        // we can't tell *who* left from it (publisher
+                        // pubkey is in the SSL handshake, not the
+                        // payload), so empty beacons drop the entire
+                        // gossip roster for the room and rely on the
+                        // next presence cycle to refill it.
+                        auto& known = impl_->room_gossip_known[room_id_str];
+                        if (rr.participants_size() == 0) {
+                            known.clear();
+                        } else {
+                            for (const auto& p : rr.participants()) {
+                                if (p.identity_pubkey().size() != 32) continue;
+                                const std::string pk(
+                                    p.identity_pubkey().begin(),
+                                    p.identity_pubkey().end());
+                                known[pk] = {p.has_audio(), p.has_video()};
+                            }
+                        }
+                        emit log(QString("room gossip beacon: room=%1B "
+                                          "+%2 → %3 known")
+                                     .arg(static_cast<qulonglong>(
+                                         rr.room_id().size()))
+                                     .arg(rr.participants_size())
+                                     .arg(static_cast<qulonglong>(
+                                         known.size())));
+                        // Synthesize a roster from the union (gossip-known
+                        // ∪ self) and feed it through the same mesh-dial
+                        // pipeline the server's RoomRoster takes. The
+                        // dialer's own `meshed` set de-duplicates if the
+                        // server delivers the same roster too, so this
+                        // is safe to call from both transports.
+                        fb::proto::RoomRoster synth;
+                        synth.set_room_id(rr.room_id());
+                        for (const auto& [pk, av] : known) {
+                            auto* mem = synth.add_participants();
+                            mem->set_identity_pubkey(pk);
+                            mem->set_has_audio(av.first);
+                            mem->set_has_video(av.second);
+                        }
+                        // Include self if we're in the room — the server
+                        // path always lists self in the broadcast roster.
+                        if (impl_->active_voice_rooms.count(room_id_str)) {
+                            const auto& my_pub =
+                                impl_->identity->public_key();
+                            auto* mem = synth.add_participants();
+                            mem->set_identity_pubkey(std::string(
+                                reinterpret_cast<const char*>(my_pub.data()),
+                                my_pub.size()));
+                            mem->set_has_audio(true);
+                            mem->set_has_video(
+                                impl_->active_voice_rooms[room_id_str]);
+                        }
+                        apply_room_roster(synth);
                         continue;
                     }
                     fb::proto::Frame f;
@@ -2549,6 +2787,11 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             >= kGossipPullIntervalMs) {
                         impl_->last_gossip_pull_ms = t;
                         gossip_pull_round();
+                    }
+                    if (t - impl_->last_room_republish_ms
+                            >= kRoomPresenceRepublishMs) {
+                        impl_->last_room_republish_ms = t;
+                        republish_room_presence();
                     }
                 }
 
@@ -2843,6 +3086,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         // in parallel; gossip lets peers see each
                         // other even when the server isn't
                         // forwarding.
+                        // Track this room as active so the periodic
+                        // republish_room_presence tick keeps us
+                        // discoverable to late joiners.
+                        impl_->active_voice_rooms[std::string(
+                            reinterpret_cast<const char*>(cs.id.data()),
+                            cs.id.size())] = op.want_video;
                         if (impl_->gossip) {
                             const auto topic = fb::p2p::room_topic_name(
                                 std::span<const std::uint8_t>(
@@ -2886,6 +3135,11 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         lf.mutable_room_leave()->set_room_id(std::string(
                             reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
                         blocking_send(impl_->conn, serialize(lf));
+                        const std::string room_id_str(
+                            reinterpret_cast<const char*>(cs.id.data()),
+                            cs.id.size());
+                        impl_->active_voice_rooms.erase(room_id_str);
+                        impl_->room_gossip_known.erase(room_id_str);
                         if (impl_->gossip) {
                             const auto topic = fb::p2p::room_topic_name(
                                 std::span<const std::uint8_t>(
@@ -3646,143 +3900,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             continue;
                         }
                         if (f.body_case() == fb::proto::Frame::kRoomRoster) {
-                            const auto& rr = f.room_roster();
-                            if (rr.room_id().size() != 32) continue;
-                            // Resolve the room_id back to a channel name —
-                            // it's the channel's group_id verbatim.
-                            std::array<std::uint8_t, 32> rid{};
-                            std::memcpy(rid.data(), rr.room_id().data(), 32);
-                            auto nit = impl_->chan_id_to_name.find(
-                                std::string(rr.room_id().begin(), rr.room_id().end()));
-                            QString chan_name;
-                            if (nit != impl_->chan_id_to_name.end()) {
-                                chan_name = QString::fromStdString(nit->second);
-                            }
-                            QStringList fps;
-                            for (const auto& p : rr.participants()) {
-                                if (p.identity_pubkey().size() != 32) continue;
-                                fb::crypto::PubKey k{};
-                                std::memcpy(k.data(), p.identity_pubkey().data(), 32);
-                                fps << QString::fromStdString(
-                                    fb::crypto::Identity::fingerprint(k));
-                            }
-                            emit log(QString("room roster for #%1: %2 participant(s)")
-                                         .arg(chan_name.isEmpty() ? "<unknown>" : chan_name)
-                                         .arg(fps.size()));
-                            emit channelCallRoster(chan_name, fps);
-
-                            // Mesh-dial: build the set of OTHER participants
-                            // in the room, diff against who we've already
-                            // dialed/accepted, and dispatch start_call_to_pub
-                            // on the Qt main thread for each new peer where
-                            // we're on the higher side of the pubkey
-                            // tiebreak (the lower side waits for our OFFER).
-                            // Departed peers get their MediaCall hung up.
-                            std::set<std::string> roster_peer_keys;
-                            std::vector<std::array<std::uint8_t, 32>> to_dial;
-                            const std::string room_id_str(rr.room_id().begin(),
-                                                           rr.room_id().end());
-                            const auto& my_pub = impl_->identity->public_key();
-                            for (const auto& p : rr.participants()) {
-                                if (p.identity_pubkey().size() != 32) continue;
-                                if (std::equal(my_pub.begin(), my_pub.end(),
-                                               p.identity_pubkey().begin())) {
-                                    continue;   // skip self
-                                }
-                                roster_peer_keys.insert(std::string(
-                                    p.identity_pubkey().begin(),
-                                    p.identity_pubkey().end()));
-                            }
-                            auto& meshed = impl_->room_mesh_peers[room_id_str];
-                            // Hang up calls for peers that left.
-                            std::vector<std::string> to_drop;
-                            for (const auto& peer_key : meshed) {
-                                if (!roster_peer_keys.count(peer_key)) {
-                                    to_drop.push_back(peer_key);
-                                }
-                            }
-                            for (const auto& peer_key : to_drop) {
-                                meshed.erase(peer_key);
-                                MediaCall* call = nullptr;
-                                {
-                                    auto it = impl_->calls_by_peer.find(peer_key);
-                                    if (it != impl_->calls_by_peer.end()) {
-                                        call = it->second.call;
-                                    }
-                                }
-                                if (call) {
-                                    QMetaObject::invokeMethod(call, [call]() {
-                                        call->hangup();
-                                    }, Qt::QueuedConnection);
-                                }
-                            }
-                            // Dial new peers (only on the higher-pubkey side).
-                            for (const auto& peer_key : roster_peer_keys) {
-                                if (meshed.count(peer_key)) continue;
-                                std::array<std::uint8_t, 32> peer_pub_arr{};
-                                std::memcpy(peer_pub_arr.data(),
-                                            peer_key.data(), 32);
-                                const bool i_dial = std::lexicographical_compare(
-                                    peer_pub_arr.begin(), peer_pub_arr.end(),
-                                    my_pub.begin(), my_pub.end());
-                                meshed.insert(peer_key);   // claim it either way
-                                if (!i_dial) continue;     // wait for inbound
-                                fb::crypto::PubKey arr{};
-                                std::memcpy(arr.data(), peer_pub_arr.data(), 32);
-                                const QString fp_label = QString::fromStdString(
-                                    fb::crypto::Identity::fingerprint(arr));
-                                // Decide here whether we have a usable session
-                                // for this peer or need to bootstrap one. If
-                                // bootstrap, queue the username_lookup right
-                                // now — the response handler will follow
-                                // through with key_fetch and ultimately
-                                // re-dispatch start_call_to_pub.
-                                bool have_session = false;
-                                for (const auto& [_, s] : impl_->sessions) {
-                                    if (s.rat && s.peer_pub == peer_pub_arr) {
-                                        have_session = true;
-                                        break;
-                                    }
-                                }
-                                if (have_session) {
-                                    to_dial.push_back(peer_pub_arr);
-                                    emit log(QString("mesh-dial: room #%1 → %2")
-                                                 .arg(chan_name).arg(fp_label));
-                                } else {
-                                    Impl::PendingMeshDial pd;
-                                    pd.room_id    = room_id_str;
-                                    pd.with_video = false;
-                                    pd.label      = fp_label;
-                                    impl_->pending_mesh_dials[peer_key] = pd;
-                                    fb::proto::Frame qf;
-                                    qf.mutable_username_lookup()->set_pubkey(
-                                        std::string(peer_key.begin(), peer_key.end()));
-                                    blocking_send(impl_->conn, serialize(qf));
-                                    emit log(QString("mesh-bootstrap: %1 has no "
-                                                      "session yet, resolving "
-                                                      "username for key fetch")
-                                                 .arg(fp_label));
-                                }
-                            }
-                            // Dispatch dials on the main thread.
-                            for (const auto& peer_pub_arr : to_dial) {
-                                std::array<std::uint8_t, 32> pub_copy = peer_pub_arr;
-                                fb::crypto::PubKey arr{};
-                                std::memcpy(arr.data(), pub_copy.data(), 32);
-                                const QString label = QString::fromStdString(
-                                    fb::crypto::Identity::fingerprint(arr));
-                                std::string room_copy = room_id_str;
-                                QMetaObject::invokeMethod(this,
-                                    [this, pub_copy, label, room_copy]() {
-                                        if (!start_call_to_pub(
-                                                pub_copy, label,
-                                                /*with_video=*/false, room_copy)) {
-                                            emit log(QString(
-                                                "mesh-dial: already calling %1")
-                                                .arg(label));
-                                        }
-                                    }, Qt::QueuedConnection);
-                            }
+                            apply_room_roster(f.room_roster());
                             continue;
                         }
                         if (f.body_case() == fb::proto::Frame::kUsernameResp) {
