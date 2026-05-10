@@ -2888,56 +2888,77 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         }
                     }
 
-                    // I2b: serverless-first DM send. When we already
-                    // have a ratchet session for this peer AND the
-                    // DHT has a fresh wss:// reachability record for
-                    // them AND PeerNet is configured, encrypt + ship
-                    // direct. Falls through to the central-server
-                    // path on any miss (no session yet, no DHT
-                    // entry, no PeerNet).
+                    // A1+A2: serverless DM send. Three modes, in
+                    // priority order:
+                    //   (a) DIRECT — local DHT has a fresh wss://
+                    //       reachability record → encrypt + PeerNet
+                    //       send. Server skipped entirely.
+                    //   (b) RELAY DEPOSIT — local DHT record has
+                    //       offline_relays but no wss:// addresses
+                    //       → encrypt + OFFLINE_DEPOSIT to a relay
+                    //       whose reachability we ALSO know
+                    //       locally. Server skipped.
+                    //   (c) FALLBACK — no local DHT data, OR
+                    //       neither (a) nor (b) worked → fall
+                    //       through to the existing X3DH-via-server
+                    //       path. Always succeeds (server is the
+                    //       last-resort transport).
                     //
-                    // Scope intentionally limited to ESTABLISHED
-                    // sessions — first contact still uses the
-                    // X3DH-via-server flow because the DHT prekey
-                    // lookup is async (callback-based) and rewiring
-                    // the queue to wait on the lookup would balloon
-                    // this commit. After first contact, every
-                    // subsequent DM to the same peer takes the
-                    // direct path. As soon as send_to_peer evolves
-                    // to do a sync prekey lookup against
-                    // DhtNode.prekeys() (the LOCAL store), this
-                    // gates trip on first contact too.
-                    bool sent_direct = false;
+                    // In every case we ALSO kick a DHT lookup for
+                    // this peer's reachability + prekey so future
+                    // sends find local hits (path (a)/(b) instead
+                    // of (c)). The lookup populates the local
+                    // store as remote responses arrive — no
+                    // queue-parking needed for first-contact
+                    // because we're not blocking on it.
+                    bool sent_serverless = false;
                     if (impl_->peer_net && impl_->dht &&
                         impl_->sessions.count(s.peer) &&
                         impl_->sessions[s.peer].rat) {
                         auto& sess_direct = impl_->sessions[s.peer];
-                        const auto records = impl_->dht->store().get(
+                        const auto peer_pub_span =
                             std::span<const std::uint8_t>(
                                 sess_direct.peer_pub.data(),
-                                sess_direct.peer_pub.size()));
+                                sess_direct.peer_pub.size());
+                        const auto records = impl_->dht->store().get(
+                            peer_pub_span);
+
+                        // Pull the first wss:// addr (path a) and
+                        // the first non-empty offline_relays list
+                        // (path b) from any matching record.
                         std::string wss_addr;
+                        std::vector<std::string> relay_pubs;
                         for (const auto& r : records) {
-                            for (const auto& a : r.addresses()) {
-                                if (a.rfind("wss://", 0) == 0) {
-                                    wss_addr = a;
-                                    break;
+                            if (wss_addr.empty()) {
+                                for (const auto& a : r.addresses()) {
+                                    if (a.rfind("wss://", 0) == 0) {
+                                        wss_addr = a;
+                                        break;
+                                    }
                                 }
                             }
-                            if (!wss_addr.empty()) break;
+                            if (relay_pubs.empty() &&
+                                r.offline_relays_size() > 0) {
+                                for (const auto& rp : r.offline_relays()) {
+                                    if (rp.size() == 32) {
+                                        relay_pubs.push_back(rp);
+                                    }
+                                }
+                            }
+                            if (!wss_addr.empty() &&
+                                !relay_pubs.empty()) break;
                         }
-                        if (!wss_addr.empty()) {
+
+                        // Build the inner DmPayload + Envelope once
+                        // — used by both (a) and (b).
+                        auto build_envelope_bytes = [&]()
+                            -> std::optional<std::vector<std::uint8_t>> {
                             try {
-                                // Build the DmPayload. Pre-packed
-                                // payloads (MLS handshakes) ride
-                                // through verbatim; otherwise pack
-                                // the text.
                                 auto inner = s.has_pre_packed()
                                     ? s.pre_packed_payload
                                     : pack_text_payload(s.text);
                                 std::vector<std::uint8_t> envid(16);
-                                randombytes_buf(envid.data(),
-                                                 envid.size());
+                                randombytes_buf(envid.data(), envid.size());
                                 const auto ts = static_cast<std::uint64_t>(
                                     std::chrono::duration_cast<
                                         std::chrono::milliseconds>(
@@ -2945,14 +2966,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                             .time_since_epoch()).count());
                                 auto outer_aad = envelope_aad_bytes(
                                     std::span<const std::uint8_t>(
-                                        envid.data(), envid.size()),
-                                    ts);
+                                        envid.data(), envid.size()), ts);
                                 auto ct = sess_direct.rat->encrypt(
                                     std::span<const std::uint8_t>(
                                         inner.data(), inner.size()),
                                     std::span<const std::uint8_t>(
-                                        outer_aad.data(),
-                                        outer_aad.size()));
+                                        outer_aad.data(), outer_aad.size()));
                                 fb::proto::Envelope env;
                                 env.set_envelope_id(std::string(
                                     envid.begin(), envid.end()));
@@ -2974,36 +2993,119 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     fb::config::kProtocolVersion);
                                 std::vector<std::uint8_t> env_bytes(
                                     env.ByteSizeLong());
-                                if (env.SerializeToArray(
+                                if (!env.SerializeToArray(
                                         env_bytes.data(),
                                         static_cast<int>(env_bytes.size()))) {
-                                    fb::p2p::PeerInfo target{};
-                                    target.addr = wss_addr;
-                                    target.pubkey.assign(
-                                        sess_direct.peer_pub.begin(),
-                                        sess_direct.peer_pub.end());
-                                    wrap_peer_send(
-                                        fb::proto::PeerEnvelope::DM,
-                                        target,
-                                        std::span<const std::uint8_t>(
-                                            env_bytes.data(),
-                                            env_bytes.size()));
-                                    sent_direct = true;
-                                    emit log(QString("DM direct via "
-                                                      "PeerNet to %1 "
-                                                      "(server skipped)")
-                                                 .arg(QString::fromStdString(
-                                                     s.peer)));
+                                    return std::nullopt;
                                 }
-                            } catch (const std::exception& e) {
-                                emit log(QString("direct-DM failed: %1; "
-                                                  "falling back to "
-                                                  "server").arg(e.what()));
-                                sent_direct = false;
+                                return env_bytes;
+                            } catch (...) { return std::nullopt; }
+                        };
+
+                        // (a) Direct path.
+                        if (!wss_addr.empty()) {
+                            if (auto env_bytes = build_envelope_bytes()) {
+                                fb::p2p::PeerInfo target{};
+                                target.addr = wss_addr;
+                                target.pubkey.assign(
+                                    sess_direct.peer_pub.begin(),
+                                    sess_direct.peer_pub.end());
+                                wrap_peer_send(
+                                    fb::proto::PeerEnvelope::DM,
+                                    target,
+                                    std::span<const std::uint8_t>(
+                                        env_bytes->data(),
+                                        env_bytes->size()));
+                                sent_serverless = true;
+                                emit log(QString("DM direct via PeerNet "
+                                                  "to %1 (server skipped)")
+                                             .arg(QString::fromStdString(
+                                                 s.peer)));
                             }
                         }
+                        // (b) Relay-deposit fallback. Only when (a)
+                        // didn't fire AND we know at least one of
+                        // the recipient's relays is reachable
+                        // locally.
+                        if (!sent_serverless && !relay_pubs.empty()) {
+                            for (const auto& rp : relay_pubs) {
+                                auto rp_span = std::span<const std::uint8_t>(
+                                    reinterpret_cast<const std::uint8_t*>(
+                                        rp.data()), rp.size());
+                                const auto relay_recs =
+                                    impl_->dht->store().get(rp_span);
+                                std::string relay_addr;
+                                for (const auto& rr : relay_recs) {
+                                    for (const auto& a : rr.addresses()) {
+                                        if (a.rfind("wss://", 0) == 0) {
+                                            relay_addr = a;
+                                            break;
+                                        }
+                                    }
+                                    if (!relay_addr.empty()) break;
+                                }
+                                if (relay_addr.empty()) {
+                                    // Kick a lookup so future
+                                    // attempts may reach the relay.
+                                    impl_->dht->lookup(rp_span,
+                                        [](const std::vector<
+                                            fb::proto::ProviderRecord>&) {});
+                                    continue;
+                                }
+                                if (auto env_bytes = build_envelope_bytes()) {
+                                    fb::p2p::PeerInfo relay{};
+                                    relay.addr = relay_addr;
+                                    relay.pubkey.assign(rp.begin(), rp.end());
+                                    // OFFLINE_DEPOSIT addresses the
+                                    // ULTIMATE recipient via
+                                    // recipient_pubkey; the relay
+                                    // sees who to hold for but not
+                                    // what's inside.
+                                    fb::proto::Frame f;
+                                    auto* env = f.mutable_peer();
+                                    env->set_kind(
+                                        fb::proto::PeerEnvelope::OFFLINE_DEPOSIT);
+                                    env->set_recipient_pubkey(std::string(
+                                        sess_direct.peer_pub.begin(),
+                                        sess_direct.peer_pub.end()));
+                                    env->set_sender_pubkey(std::string(
+                                        reinterpret_cast<const char*>(
+                                            impl_->identity->public_key().data()),
+                                        impl_->identity->public_key().size()));
+                                    env->set_payload(std::string(
+                                        env_bytes->begin(),
+                                        env_bytes->end()));
+                                    auto wire = serialize(f);
+                                    if (impl_->peer_net->send(relay,
+                                            std::span<const std::uint8_t>(
+                                                wire.data(), wire.size()))) {
+                                        sent_serverless = true;
+                                        emit log(QString("DM deposited "
+                                                          "to relay for %1 "
+                                                          "(peer offline; "
+                                                          "server skipped)")
+                                                     .arg(QString::fromStdString(
+                                                         s.peer)));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Always kick a background lookup so the
+                        // local store catches up — converts (c)
+                        // sends into (a)/(b) on subsequent
+                        // iterations. Cheap: returns immediately
+                        // with whatever's local; remote responses
+                        // populate the store async via on_message.
+                        impl_->dht->lookup(peer_pub_span,
+                            [](const std::vector<
+                                fb::proto::ProviderRecord>&) {});
+                        impl_->dht->lookup_prekey(peer_pub_span,
+                            [](const std::vector<
+                                fb::proto::PrekeyRecord>&) {});
                     }
-                    if (sent_direct) continue;
+                    if (sent_serverless) continue;
 
                     auto& sess = impl_->sessions[s.peer];
                     if (!sess.rat) {

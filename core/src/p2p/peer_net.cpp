@@ -62,10 +62,14 @@ bool parse_wss_addr(const std::string& addr,
     if (addr.size() <= kPrefix.size() ||
         addr.compare(0, kPrefix.size(), kPrefix) != 0) return false;
     auto rest = addr.substr(kPrefix.size());
+    // Strip any fragment (#hexfingerprint) before splitting host/port —
+    // the fragment is metadata for the caller's pin check, not part
+    // of the connect target. parse_pinned_addr exposes it separately.
+    auto hash = rest.find('#');
+    if (hash != std::string::npos) rest = rest.substr(0, hash);
     auto colon = rest.rfind(':');
     if (colon == std::string::npos) return false;
     host = rest.substr(0, colon);
-    // Strip [] from IPv6 literals.
     if (!host.empty() && host.front() == '[' && host.back() == ']') {
         host = host.substr(1, host.size() - 2);
     }
@@ -354,6 +358,18 @@ struct PeerNet::Impl {
         }
     }
 };
+
+PinnedAddr parse_pinned_addr(const std::string& addr) {
+    PinnedAddr out;
+    auto hash = addr.find('#');
+    if (hash == std::string::npos) {
+        out.addr_without_fragment = addr;
+        return out;
+    }
+    out.addr_without_fragment = addr.substr(0, hash);
+    out.pin_fragment_hex      = addr.substr(hash + 1);
+    return out;
+}
 
 PeerNet::PeerNet() : impl_(std::make_unique<Impl>()) { openssl_init(); }
 PeerNet::~PeerNet() = default;

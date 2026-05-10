@@ -93,6 +93,31 @@ bool wait_until(int timeout_ms, Pred&& p) {
 
 }  // namespace
 
+TEST(PeerNet, ParsePinnedAddrSplitsFragment) {
+    // No fragment: addr passes through verbatim, hex empty.
+    {
+        auto p = fb::p2p::parse_pinned_addr("wss://203.0.113.5:443");
+        EXPECT_EQ(p.addr_without_fragment, "wss://203.0.113.5:443");
+        EXPECT_TRUE(p.pin_fragment_hex.empty());
+    }
+    // Fragment present: split.
+    {
+        const std::string fp =
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        auto p = fb::p2p::parse_pinned_addr(
+            "wss://203.0.113.5:443#" + fp);
+        EXPECT_EQ(p.addr_without_fragment, "wss://203.0.113.5:443");
+        EXPECT_EQ(p.pin_fragment_hex, fp);
+    }
+    // IPv6 + fragment.
+    {
+        auto p = fb::p2p::parse_pinned_addr(
+            "wss://[2001:db8::1]:443#deadbeef");
+        EXPECT_EQ(p.addr_without_fragment, "wss://[2001:db8::1]:443");
+        EXPECT_EQ(p.pin_fragment_hex, "deadbeef");
+    }
+}
+
 TEST(PeerNet, ListenerBindsAndReportsPort) {
     auto tmpdir = make_tmpdir();
     if (tmpdir.empty()) GTEST_SKIP() << "could not create tmpdir";

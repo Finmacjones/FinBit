@@ -2,6 +2,29 @@
 #pragma once
 
 // =============================================================================
+// Cert-pinning convention
+// =============================================================================
+//
+// PeerNet's outbound side ALWAYS pins the dialed peer's identity Ed25519
+// pubkey via TlsClientOptions::expected_peer_pubkey when peer.pubkey is
+// populated. The TLS handshake fails (and the connection is dropped before
+// any application bytes flow) if the cert the remote presents doesn't
+// match — see TlsClient::connect's "identity-pin failure" throw site.
+//
+// To make the pin explicit at the URL layer too — useful when an addr is
+// shared out-of-band (QR code, bootstrap file) and you want the recipient
+// to see the binding without separately checking pubkey bytes — addr
+// strings MAY include a fragment of the form
+//
+//     wss://host:port#<lowercase-hex-32-bytes>
+//
+// where the hex section is the SHA-256(...)[0..32] of the identity pubkey,
+// or the pubkey itself. parse_pinned_addr() below splits the fragment
+// from the connect target so the dialer can sanity-check it against
+// peer.pubkey before opening the socket. The fragment is NEVER sent over
+// the wire.
+//
+// =============================================================================
 // PeerNet — direct peer-to-peer TLS transport.
 //
 // This is the pure-P2P transport that complements (and eventually
@@ -44,6 +67,18 @@
 #include <string>
 
 namespace fb::p2p {
+
+// Split "wss://host:port#hexfingerprint" into its connect target and the
+// optional pinned fingerprint. The fragment is treated as raw bytes (not
+// hex-decoded by this function) for caller-side comparison flexibility.
+// Returns the addr without the fragment + the hex fragment string (empty
+// if none). Doesn't validate the fragment shape — callers can require
+// 64-char-hex / specific encoding rules as they like.
+struct PinnedAddr {
+    std::string addr_without_fragment;
+    std::string pin_fragment_hex;   // empty if no '#' was present
+};
+[[nodiscard]] PinnedAddr parse_pinned_addr(const std::string& addr);
 
 struct PeerListenerOptions {
     std::string bind_host = "0.0.0.0";
