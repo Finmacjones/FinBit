@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/net/tls_client.hpp"
 
+#if defined(_WIN32)
+#  error "tls_client.cpp uses POSIX select(). Windows port required: \
+WSAPoll / IOCP, or replace the select-driven SSL_read/SSL_write loop with \
+the OpenSSL BIO-pair pattern that's portable to Win32. \
+Tracked in docs/windows-port-status.md."
+#endif
+
 #include "fb/net/tcp.hpp"
 
 #include <chrono>

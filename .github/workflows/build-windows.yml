@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Windows build workflow.
+#
+# Builds fb_server, fb_server-headers, fb-cli against vcpkg on
+# windows-latest using MSVC. The desktop client (Qt6 + GStreamer)
+# and mesh bridge (POSIX termios) are intentionally OFF for the
+# initial Windows target — they're tracked in
+# docs/windows-port-status.md.
+#
+# Until the POSIX-only files (io_loop.cpp, tcp.cpp, tls_client.cpp,
+# peer_net.cpp, gossip.cpp, server/main.cpp) have Windows backends,
+# this job is EXPECTED TO FAIL at the compile step with an
+# actionable #error pointing at the file that needs porting. That's
+# the whole point of standing the pipeline up first — each PR that
+# ports one of those files turns one #error into a green check.
+#
+# When all the #error guards have been removed, this job produces
+# a finbit-windows-x64.zip artifact on every push to main + on tag.
+
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build fb_server + fb-cli (windows-latest, MSVC, vcpkg)
+    runs-on: windows-latest
+    # Don't fail the wider CI on Windows compile failures while
+    # the porting work is incremental. Each individual run still
+    # surfaces the exact #error so the next porting PR knows what
+    # to tackle. Flip to `false` once docs/windows-port-status.md
+    # lists every file as ported.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false   # mlspp is fetched manually if FB_FEATURE_MLS=ON
+
+      # vcpkg ships preinstalled on windows-latest at C:\vcpkg
+      # (VCPKG_INSTALLATION_ROOT env var). We use that rather than a
+      # custom checkout so the build matches what users get from a
+      # fresh "git clone vcpkg" + bootstrap.
+      - name: locate vcpkg
+        shell: pwsh
+        run: |
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+          echo "vcpkg at: $env:VCPKG_INSTALLATION_ROOT"
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" version
+
+      # Cache the vcpkg "binary cache" between runs — protobuf alone
+      # is ~5 minutes from-scratch.
+      - name: cache vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: configure (win-msvc-release preset)
+        shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+        run: |
+          cmake --preset win-msvc-release `
+            -DFB_BUILD_DESKTOP_CLIENT=OFF `
+            -DFB_BUILD_TESTS=OFF
+
+      - name: build
+        shell: pwsh
+        run: cmake --build --preset win-msvc-release --parallel
+
+      - name: collect binaries
+        if: success()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          Get-ChildItem -Recurse -Path build/win-msvc-release `
+            -Include fb_server.exe, fb-cli.exe `
+            | ForEach-Object { Copy-Item $_.FullName artifacts/ }
+          Copy-Item LICENSE, README.md, CHANGELOG.md, ROADMAP.md `
+            artifacts/ -ErrorAction SilentlyContinue
+          Get-ChildItem artifacts/
+
+      - name: upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finbit-windows-x64-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14

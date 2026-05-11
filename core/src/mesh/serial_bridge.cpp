@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/mesh/bridge.hpp"
 
+#if defined(_WIN32)
+#  error "serial_bridge.cpp uses POSIX termios. Windows port required: \
+CreateFile(\"\\\\.\\COM1\", ...) + DCB / COMMTIMEOUTS instead of termios. \
+The mesh feature is OFF by default in the win-msvc-release preset. \
+Tracked in docs/windows-port-status.md."
+#endif
+
 #include <fcntl.h>
 #include <sys/select.h>
 #include <termios.h>

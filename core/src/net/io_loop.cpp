@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/net/io_loop.hpp"
 
+#if defined(_WIN32)
+#  error "io_loop.cpp uses epoll/timerfd/pipe (Linux-only). Windows port \
+required: replace epoll with WSAPoll or IOCP, timerfd with CreateWaitableTimer, \
+pipe with CreateEvent or socketpair-equivalent. Tracked in docs/windows-port-status.md."
+#endif
+
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/timerfd.h>

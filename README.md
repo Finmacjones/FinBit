@@ -522,6 +522,17 @@ tar xzf finbit-linux-x86_64-v1.0.1.tar.gz
 finbit-linux-x86_64-v1.0.1/bin/fb_server --help
 ```
 
+### Windows builds
+
+A Windows x64 (MSVC) build pipeline runs in CI via
+`.github/workflows/build-windows.yml` against vcpkg on the
+`windows-latest` runner. The job currently builds `fb_server` +
+`fb-cli` (no desktop GUI yet) and is `continue-on-error` while the
+POSIX-only I/O layer is incrementally ported — see
+`docs/windows-port-status.md` for the per-file status and what each
+porting PR should touch. Successful runs upload a
+`finbit-windows-x64-<sha>.zip` artifact.
+
 ### Cutting a new tagged release (maintainers)
 
 ```bash

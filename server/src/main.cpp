@@ -17,6 +17,14 @@
 // they never appear.
 // =============================================================================
 
+#if defined(_WIN32)
+#  error "server/src/main.cpp uses Linux-specific epoll + ifaddrs + POSIX \
+sockets directly. Windows port required: factor the accept loop behind \
+fb::net::IoLoop (already used by the client side) and call \
+GetAdaptersAddresses instead of getifaddrs. Tracked in \
+docs/windows-port-status.md."
+#endif
+
 #include <arpa/inet.h>
 #include <ifaddrs.h>
 #include <net/if.h>      // IFF_UP / IFF_LOOPBACK

@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/p2p/peer_net.hpp"
 
+#if defined(_WIN32)
+#  error "peer_net.cpp uses POSIX sockets + select() (arpa/inet, netinet/in, \
+sys/socket, sys/select). Windows port required: Winsock2 + WSAPoll. \
+Depends on tcp.cpp and tls_client.cpp being ported first. \
+Tracked in docs/windows-port-status.md."
+#endif
+
 #include "fb/crypto/identity_cert.hpp"
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"

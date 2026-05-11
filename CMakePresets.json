@@ -32,16 +32,51 @@
                 "CMAKE_BUILD_TYPE": "RelWithDebInfo",
                 "FB_ENABLE_SANITIZERS": "OFF"
             }
+        },
+        {
+            "name": "win-msvc-release",
+            "displayName": "Windows MSVC Release (vcpkg)",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build/win-msvc-release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+                "VCPKG_TARGET_TRIPLET": "x64-windows",
+                "VCPKG_MANIFEST_FEATURES": "server",
+                "FB_BUILD_DESKTOP_CLIENT": "OFF",
+                "FB_BUILD_SERVER": "ON",
+                "FB_BUILD_TOOLS": "ON",
+                "FB_BUILD_TESTS": "OFF",
+                "FB_ENABLE_SANITIZERS": "OFF"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
         }
     ],
     "buildPresets": [
         { "name": "linux-debug",   "configurePreset": "linux-debug" },
-        { "name": "linux-release", "configurePreset": "linux-release" }
+        { "name": "linux-release", "configurePreset": "linux-release" },
+        {
+            "name": "win-msvc-release",
+            "configurePreset": "win-msvc-release",
+            "configuration": "RelWithDebInfo"
+        }
     ],
     "testPresets": [
         {
             "name": "linux-debug",
             "configurePreset": "linux-debug",
+            "output": { "outputOnFailure": true },
+            "execution": { "noTestsAction": "error", "stopOnFailure": false }
+        },
+        {
+            "name": "win-msvc-release",
+            "configurePreset": "win-msvc-release",
+            "configuration": "RelWithDebInfo",
             "output": { "outputOnFailure": true },
             "execution": { "noTestsAction": "error", "stopOnFailure": false }
         }

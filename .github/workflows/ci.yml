@@ -4,10 +4,11 @@
 #   native-tests-linux : build + ctest on Ubuntu, ALSO uploads release
 #                        binaries (fb_server, fb_desktop, fb-cli) as
 #                        artifacts on every push to main.
-#   build-windows      : DEFERRED — see comment below. The codebase uses
-#                        epoll / POSIX sockets / termios / ifaddrs etc.
-#                        directly; a Windows build needs a multi-day port.
-#                        Stub job included so the gap is visible in CI.
+#   build-windows      : lives in .github/workflows/build-windows.yml,
+#                        runs windows-latest + MSVC + vcpkg. Currently
+#                        continue-on-error while POSIX-only files are
+#                        ported incrementally; see
+#                        docs/windows-port-status.md.
 #
 # Web smokes need a built WASM module (libsodium-wasm + protoc-cpp +
 # emsdk are several minutes of CI time) and are intentionally excluded
@@ -289,17 +290,8 @@ jobs:
           # so users following the tag always land on head-of-main.
           target_commitish: ${{ github.sha }}
 
-  # NOTE: no Windows job today.  The codebase calls epoll / sys/socket /
-  # termios / ifaddrs / sigaction / posix_openpt directly (see
-  # core/src/net/io_loop.cpp, core/src/net/tcp.cpp, core/src/mesh/
-  # serial_bridge.cpp, server/src/main.cpp).  A real Windows build needs
-  # a platform abstraction layer:
-  #
-  #   * fb::net::IoLoop          → swap epoll for WSAPoll / IOCP
-  #   * fb::net::Socket          → WinSock2 (WSAStartup, closesocket,
-  #                                GetLastError instead of errno)
-  #   * SerialBridge             → CreateFile + DCB instead of termios
-  #   * external_addresses()     → GetAdaptersAddresses
-  #   * server signal handlers   → SetConsoleCtrlHandler
-  #
-  # Multi-day port; tracked in docs/ROADMAP.md.
+  # Windows build lives in .github/workflows/build-windows.yml — pipeline
+  # is stood up against vcpkg + MSVC on windows-latest. It currently
+  # `continue-on-error: true` while the POSIX-only files (io_loop, tcp,
+  # tls_client, peer_net, gossip, serial_bridge, server/main) are
+  # incrementally ported. See docs/windows-port-status.md.

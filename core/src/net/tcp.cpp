@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/net/tcp.hpp"
 
+#if defined(_WIN32)
+#  error "tcp.cpp uses POSIX sockets (arpa/inet, netinet/in, sys/socket). \
+Windows port required: replace with Winsock2 (winsock2.h, ws2_32.lib). \
+Tracked in docs/windows-port-status.md."
+#endif
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
