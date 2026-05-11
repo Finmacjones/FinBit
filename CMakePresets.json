@@ -14,7 +14,7 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-                "VCPKG_MANIFEST_FEATURES": "server;mesh;mls",
+                "VCPKG_MANIFEST_FEATURES": "server;mesh;mls;tests",
                 "FB_ENABLE_SANITIZERS": "ON"
             },
             "condition": {

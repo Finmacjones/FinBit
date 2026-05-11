@@ -6,25 +6,16 @@
     "builtin-baseline": "f7423ee180c4b7f40d43402c2feb3859161ef625",
     "dependencies": [
         "libsodium",
-        "asio",
         {
             "name": "protobuf",
             "version>=": "3.21.12"
         },
-        "sqlcipher",
-        "sqlite-orm",
-        "nlohmann-json",
-        "spdlog",
-        "fmt",
-        {
-            "name": "gtest",
-            "features": ["bench"]
-        },
-        "benchmark"
+        "sqlite3",
+        "brotli"
     ],
     "features": {
         "server": {
-            "description": "Build the relay server (uWebSockets)",
+            "description": "Build the relay server (needs OpenSSL for TLS transports)",
             "dependencies": [
                 "openssl",
                 "zlib"
@@ -40,6 +31,18 @@
             "description": "Build with MLS group crypto (mlspp)",
             "dependencies": [
                 "mlspp"
+            ]
+        },
+        "tests": {
+            "description": "Build the gtest suite",
+            "dependencies": [
+                "gtest"
+            ]
+        },
+        "bench": {
+            "description": "Build google-benchmark microbenchmarks",
+            "dependencies": [
+                "benchmark"
             ]
         }
     }
