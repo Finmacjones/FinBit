@@ -376,6 +376,104 @@ TEST(Ratchet, WireFormEnvelopeReplayIsRejected) {
         << "rewriting envelope_id outer AAD must invalidate the AEAD tag";
 }
 
+// Small-subgroup / low-order point attack: a malicious peer presents
+// a public key that lives in the X25519 small subgroup, forcing the
+// ECDH output to be an all-zero point. If our code didn't check the
+// scalarmult return, the attacker would know our shared secret in
+// advance. libsodium's crypto_scalarmult returns -1 in this case,
+// and x25519_dh throws — so the ratchet bootstrap fails closed.
+//
+// This test cannot easily reach x25519_dh directly (it's a static
+// helper), but we can verify the property at the init_alice
+// boundary: passing an all-zero peer DH pub or one of the known
+// low-order points must result in either an exception or a session
+// state where ANY decrypt fails (the message key derives from a
+// known shared secret, so an honest bob would derive the SAME key
+// and "succeed" — but the test is whether *encryption* fails or
+// whether the session enters a guaranteed-broken state).
+//
+// We assert the strongest available property: that no successful
+// session is established when peer_dh_pub is the canonical low-order
+// point published by libsodium / RFC 7748.
+TEST(Ratchet, LowOrderPointPeerDhRejected) {
+    // RFC 7748 §6.1 lists 8 small-order points for X25519. The
+    // simplest is all-zero (0x00 * 32). libsodium's
+    // crypto_scalarmult returns -1 for these.
+    std::array<std::uint8_t, 32> shared_secret{};
+    for (std::size_t i = 0; i < shared_secret.size(); ++i) {
+        shared_secret[i] = static_cast<std::uint8_t>(0xA5 ^ i);
+    }
+    std::array<std::uint8_t, 32> bob_pub_low_order{};
+    // All-zero public key — produces all-zero scalarmult output.
+
+    // init_alice computes x25519_dh(eph, peer_dh_pub) internally for
+    // the very first ratchet step. With a low-order peer pub, this
+    // throws. Wrap and assert.
+    bool threw = false;
+    try {
+        auto alice = fb::crypto::DoubleRatchet::init_alice(
+            shared_secret, bob_pub_low_order);
+        // If we got here, the ratchet accepted the low-order key.
+        // Try to encrypt — if THAT throws or the resulting bytes
+        // round-trip with a low-order bob (which would also produce
+        // the same broken DH), we still consider the test failed
+        // because no successful real session is possible.
+        // The libsodium-backed code throws; this branch should be
+        // unreachable.
+        (void)alice;
+    } catch (const std::runtime_error& e) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw)
+        << "init_alice with low-order peer DH must throw "
+           "(libsodium crypto_scalarmult contract)";
+}
+
+// Compromised-relay threat model: an active MITM (the server itself,
+// or a hostile proxy) tries to rewrite envelope fields to confuse
+// the receiver. The inner ratchet AEAD with envelope_id+timestamp
+// bound into the AAD must catch each rewrite. This matrix-tests four
+// concurrent attack surfaces in a single test so a regression in any
+// of them is caught.
+TEST(Ratchet, ActiveMitmAttackSurface) {
+    auto good_aad = bytes("envelope_id=A_real_envelope|ts=2026051100000000");
+    auto p = make_pair();
+    auto ct = p.alice.encrypt(bytes("real-payload"), span_of(good_aad));
+
+    // (A1) Truncate the ciphertext (relay drops last byte)
+    {
+        auto truncated = ct;
+        truncated.pop_back();
+        EXPECT_FALSE(
+            p.bob.decrypt(span_of(truncated), span_of(good_aad)).has_value())
+            << "truncated ciphertext must reject (AEAD tag invalid)";
+    }
+    // (A2) Append junk to the ciphertext
+    {
+        auto extended = ct;
+        extended.push_back(0xAB);
+        EXPECT_FALSE(
+            p.bob.decrypt(span_of(extended), span_of(good_aad)).has_value())
+            << "ciphertext extension must reject";
+    }
+    // (A3) Rewrite envelope_id in AAD
+    {
+        auto bad_aad = good_aad;
+        bad_aad[12] ^= 0x01;
+        EXPECT_FALSE(
+            p.bob.decrypt(span_of(ct), span_of(bad_aad)).has_value())
+            << "rewritten envelope_id must reject (AAD binding)";
+    }
+    // (A4) Rewrite timestamp in AAD
+    {
+        auto bad_aad = good_aad;
+        bad_aad[30] ^= 0x01;
+        EXPECT_FALSE(
+            p.bob.decrypt(span_of(ct), span_of(bad_aad)).has_value())
+            << "rewritten timestamp must reject (AAD binding)";
+    }
+}
+
 TEST(Ratchet, FlippedOuterAadFailsDecrypt) {
     auto aad_good = bytes("envelope_id=0123456789abcdef|ts=1714867200000");
     auto aad_bad  = aad_good;
