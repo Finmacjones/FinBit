@@ -19,20 +19,12 @@ if(NOT Protobuf_FOUND)
     find_package(Protobuf REQUIRED)
 endif()
 
-find_package(fmt CONFIG QUIET)
-if(NOT fmt_FOUND)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(FMT REQUIRED IMPORTED_TARGET fmt)
-endif()
-
-find_package(spdlog CONFIG QUIET)
-if(NOT spdlog_FOUND)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(SPDLOG REQUIRED IMPORTED_TARGET spdlog)
-endif()
-
-# Asio is declared in vcpkg.json but is not yet used in code. Phase-0 build
-# tolerates its absence; net/ work in Phase 0+ will require it.
+# fmt and spdlog were declared in the Phase-0 plan but never adopted —
+# zero source files include them. Asio was similarly aspirational.
+# All three were removed from vcpkg.json; corresponding find_package /
+# link lines are dropped here. If logging/formatting deps come back
+# in a later phase, restore them via vcpkg.json (re-)plus find_package
+# + the link-target wrapper pattern used for libsodium.
 
 set(FB_PROTO_FILES
     proto/envelope.proto
@@ -108,23 +100,10 @@ target_include_directories(fb_core
         $<BUILD_INTERFACE:${FB_PROTO_GEN_DIR}>
 )
 
-if(TARGET fmt::fmt)
-    set(FB_FMT_TARGET fmt::fmt)
-else()
-    set(FB_FMT_TARGET PkgConfig::FMT)
-endif()
-if(TARGET spdlog::spdlog)
-    set(FB_SPDLOG_TARGET spdlog::spdlog)
-else()
-    set(FB_SPDLOG_TARGET PkgConfig::SPDLOG)
-endif()
-
 target_link_libraries(fb_core
     PUBLIC
         ${FB_SODIUM_TARGET}
         protobuf::libprotobuf
-        ${FB_FMT_TARGET}
-        ${FB_SPDLOG_TARGET}
         PkgConfig::SQLITE3
 )
 
