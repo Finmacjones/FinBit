@@ -181,6 +181,55 @@ TEST(Ratchet, AlternatingDirectionsAreFineAfterMultipleDhRatchets) {
 // Each decrypt attempt consumes a chain step in the Double Ratchet,
 // so we use one pair for the failure case and a fresh pair for the
 // success case to keep the chain states independent.
+// Forward secrecy: two consecutive encrypts of the SAME plaintext under
+// the SAME ratchet must produce DIFFERENT ciphertexts (different nonce,
+// different message key — symmetric chain advances). Confirms no
+// nonce/key reuse in the chain.
+TEST(Ratchet, ConsecutiveEncryptsOfSamePlaintextProduceDistinctCiphertexts) {
+    auto p = make_pair();
+    auto e1 = p.alice.encrypt(bytes("identical-plaintext"), span_of(kAad));
+    auto e2 = p.alice.encrypt(bytes("identical-plaintext"), span_of(kAad));
+    auto e3 = p.alice.encrypt(bytes("identical-plaintext"), span_of(kAad));
+    EXPECT_NE(e1, e2);
+    EXPECT_NE(e2, e3);
+    EXPECT_NE(e1, e3);
+}
+
+// Forward secrecy across a DH ratchet step. After alice→bob→alice
+// roundtrip, the chain keys advance such that compromising bob's
+// CURRENT state cannot decrypt the original alice→bob message a
+// second time (its message key was consumed, AND the symmetric
+// chain key that produced it is gone).
+//
+// We simulate compromise of bob by trying to re-decrypt the
+// original message with the post-roundtrip bob: he should reject
+// (replay) and crucially he cannot recover the plaintext.
+TEST(Ratchet, ForwardSecrecyAcrossDhStep) {
+    auto p = make_pair();
+    // alice → bob (consumes one message key in bob's recv chain)
+    auto e_a1 = p.alice.encrypt(bytes("alice-msg-1"), span_of(kAad));
+    auto pt1 = p.bob.decrypt(span_of(e_a1), span_of(kAad));
+    ASSERT_TRUE(pt1.has_value());
+
+    // bob → alice (DH ratchet: bob generates a new send chain)
+    auto e_b1 = p.bob.encrypt(bytes("bob-msg-1"), span_of(kAad));
+    auto pt2 = p.alice.decrypt(span_of(e_b1), span_of(kAad));
+    ASSERT_TRUE(pt2.has_value());
+
+    // alice → bob again (alice's send chain now uses a new DH key)
+    auto e_a2 = p.alice.encrypt(bytes("alice-msg-2"), span_of(kAad));
+    auto pt3 = p.bob.decrypt(span_of(e_a2), span_of(kAad));
+    ASSERT_TRUE(pt3.has_value());
+
+    // ATTACK: try to re-decrypt the very first message at bob.
+    // Message key was consumed, AND the chain key advanced past it
+    // (a fresh DH ratchet step happened in step 2 above). Bob has
+    // NO way to recover alice-msg-1 from his current state.
+    auto replay = p.bob.decrypt(span_of(e_a1), span_of(kAad));
+    EXPECT_FALSE(replay.has_value())
+        << "post-DH-ratchet, the original message must remain decrypted-once";
+}
+
 // Zeroization regression: when a DoubleRatchet goes out of scope, the
 // 32-byte fields that held key material (root key, chain keys, DH
 // private) must be wiped before the underlying storage is freed. Tests

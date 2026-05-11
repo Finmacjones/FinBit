@@ -654,7 +654,25 @@ int main(int argc, char** argv) {
                         std::span<const std::uint8_t>(
                             reinterpret_cast<const std::uint8_t*>(gid.data()), 32));
                     fb::proto::Frame outf;
-                    *outf.mutable_envelope() = env;
+                    auto* fwd = outf.mutable_envelope();
+                    *fwd = env;
+                    // Rewrite Envelope.sender_pubkey to the authenticated
+                    // pubkey for this connection. Without this, an
+                    // authenticated client can craft an Envelope with
+                    // sender_pubkey set to anyone else, producing
+                    // spurious "decrypt failed from <victim>" log
+                    // entries on the receiver. The ratchet AEAD still
+                    // authenticates the real sender, so impersonation
+                    // doesn't succeed at the message-content layer —
+                    // but the server should not relay a mismatched
+                    // sender claim either. Mirrors the PeerEnvelope
+                    // sender_pubkey rewrite at line ~720.
+                    if (!c.bound_user_pub.empty()) {
+                        fwd->set_sender_pubkey(std::string(
+                            reinterpret_cast<const char*>(
+                                c.bound_user_pub.data()),
+                            c.bound_user_pub.size()));
+                    }
                     auto serialized = serialize(outf);
                     for (int sfd : subs) {
                         if (sfd == c.sock.fd()) continue;  // don't echo to sender
@@ -687,7 +705,17 @@ int main(int argc, char** argv) {
                 int dst_fd = relay.lookup(std::span<const std::uint8_t>(rcpt_bytes.data(),
                                                                          rcpt_bytes.size()));
                 fb::proto::Frame outf;
-                *outf.mutable_envelope() = env;
+                auto* fwd = outf.mutable_envelope();
+                *fwd = env;
+                // See channel-envelope branch above — rewrite
+                // sender_pubkey to the authenticated pubkey so the
+                // server doesn't relay a mismatched sender claim.
+                if (!c.bound_user_pub.empty()) {
+                    fwd->set_sender_pubkey(std::string(
+                        reinterpret_cast<const char*>(
+                            c.bound_user_pub.data()),
+                        c.bound_user_pub.size()));
+                }
                 auto serialized = serialize(outf);
                 if (dst_fd >= 0) {
                     auto it = conns.find(dst_fd);
@@ -695,8 +723,12 @@ int main(int argc, char** argv) {
                         enqueue_write(loop, *it->second, serialized);
                     }
                 } else {
-                    std::vector<std::uint8_t> envb(env.ByteSizeLong());
-                    if (!env.SerializeToArray(envb.data(), static_cast<int>(envb.size()))) {
+                    // Offline queue stores the sender-rewritten envelope
+                    // (fwd above), not the original, so future drains
+                    // emit a consistent sender_pubkey.
+                    std::vector<std::uint8_t> envb(fwd->ByteSizeLong());
+                    if (!fwd->SerializeToArray(envb.data(),
+                                                static_cast<int>(envb.size()))) {
                         std::fprintf(stderr, "[server] envelope serialize failed\n");
                         return;
                     }
