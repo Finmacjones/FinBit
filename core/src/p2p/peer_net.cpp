@@ -301,7 +301,13 @@ struct PeerNet::Impl {
             // THEN do we drop the Socket which closes the fd for
             // real.
             if (listen_sock) {
+#if defined(_WIN32)
+                ::shutdown(static_cast<SOCKET>(static_cast<std::uintptr_t>(
+                               listen_sock->fd())),
+                            SD_BOTH);
+#else
                 ::shutdown(listen_sock->fd(), SHUT_RDWR);
+#endif
             }
             accept_thread->join();
             listen_sock.reset();

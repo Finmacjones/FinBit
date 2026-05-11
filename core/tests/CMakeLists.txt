@@ -18,7 +18,6 @@ add_executable(fb_core_tests
     ratelimit/token_bucket_test.cpp
     media/sframe_test.cpp
     mesh/compression_test.cpp
-    mesh/serial_bridge_test.cpp
     mesh/mqtt_bridge_test.cpp
     p2p/kademlia_test.cpp
     p2p/gossip_test.cpp
@@ -30,6 +29,12 @@ add_executable(fb_core_tests
     p2p/channel_gossip_test.cpp
     p2p/room_beacon_leak_test.cpp
 )
+
+# Serial-bridge test uses posix_openpt — POSIX-only. The bridge
+# itself is also gated out of fb_core on Windows.
+if(NOT WIN32)
+    target_sources(fb_core_tests PRIVATE mesh/serial_bridge_test.cpp)
+endif()
 
 target_link_libraries(fb_core_tests
     PRIVATE

@@ -29,6 +29,11 @@ option(FB_FEATURE_MLS "Enable MLS group crypto via vendored mlspp" OFF)
 
 if(MSVC)
     add_compile_options(/W4 /permissive-)
+    # windows.h #defines `min` and `max` as function-like macros which
+    # collide with std::min / std::numeric_limits<T>::max(). NOMINMAX
+    # disables them. _CRT_SECURE_NO_WARNINGS silences C4996 on
+    # std::getenv etc. that the CRT marks "unsafe" but we use safely.
+    add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
 else()
     add_compile_options(-Wall -Wextra -Wpedantic -Wconversion -Wshadow)
     if(FB_ENABLE_SANITIZERS AND CMAKE_BUILD_TYPE STREQUAL "Debug")

@@ -317,8 +317,11 @@ void IoLoop::run() {
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     impl_->timers.top().at - now).count();
                 if (ms < 0) ms = 0;
-                if (ms > std::numeric_limits<int>::max())
-                    ms = std::numeric_limits<int>::max();
+                // Parenthesise to defeat any rogue `max()` macro
+                // from windows.h that survives NOMINMAX (belt-and-
+                // braces — top-level CMake also defines NOMINMAX).
+                if (ms > (std::numeric_limits<int>::max)())
+                    ms = (std::numeric_limits<int>::max)();
                 timeout_ms = static_cast<int>(ms);
             }
         }
