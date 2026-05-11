@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/net/tls_client.hpp"
 
-#if defined(_WIN32)
-#  error "tls_client.cpp uses POSIX select(). Windows port required: \
-WSAPoll / IOCP, or replace the select-driven SSL_read/SSL_write loop with \
-the OpenSSL BIO-pair pattern that's portable to Win32. \
-Tracked in docs/windows-port-status.md."
-#endif
-
 #include "fb/net/tcp.hpp"
 
 #include <chrono>
@@ -19,11 +12,57 @@ Tracked in docs/windows-port-status.md."
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
-#include <sys/select.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  pragma comment(lib, "Ws2_32.lib")
+#else
+#  include <sys/select.h>
+#  include <unistd.h>
+#endif
 
 namespace fb::net {
 namespace {
+
+// Wait for socket readiness on POSIX or Windows. Returns >0 if the
+// socket became ready in the requested direction, 0 on timeout, <0
+// on error (EINTR handled internally so the caller can treat any
+// negative return as fatal).
+int wait_socket_ready(int fd, bool want_read, bool want_write,
+                      std::int64_t timeout_us) {
+    if (timeout_us < 0) timeout_us = 0;
+#if defined(_WIN32)
+    WSAPOLLFD pfd{};
+    pfd.fd     = static_cast<SOCKET>(static_cast<std::uintptr_t>(fd));
+    pfd.events = 0;
+    if (want_read)  pfd.events |= POLLRDNORM;
+    if (want_write) pfd.events |= POLLWRNORM;
+    pfd.revents = 0;
+    int ms = static_cast<int>(timeout_us / 1000);
+    int n = WSAPoll(&pfd, 1, ms);
+    if (n == SOCKET_ERROR) {
+        if (WSAGetLastError() == WSAEINTR) return 0;
+        return -1;
+    }
+    return n;
+#else
+    timeval tv{};
+    tv.tv_sec  = timeout_us / 1'000'000;
+    tv.tv_usec = timeout_us % 1'000'000;
+    fd_set rd, wr;
+    FD_ZERO(&rd); FD_ZERO(&wr);
+    if (want_read)  FD_SET(fd, &rd);
+    if (want_write) FD_SET(fd, &wr);
+    const int sel = ::select(fd + 1,
+                              want_read  ? &rd : nullptr,
+                              want_write ? &wr : nullptr,
+                              nullptr, &tv);
+    if (sel < 0 && errno == EINTR) return 0;
+    return sel;
+#endif
+}
 
 // Per-process OpenSSL init. SSL_library_init / SSL_load_error_strings
 // became no-ops in OpenSSL 1.1+, but OPENSSL_init_ssl is the proper
@@ -197,18 +236,14 @@ void TlsClient::connect(const std::string& host, std::uint16_t port,
         }
         const auto remaining = std::chrono::duration_cast<
             std::chrono::microseconds>(deadline - now).count();
-        timeval tv{};
-        tv.tv_sec  = remaining / 1'000'000;
-        tv.tv_usec = remaining % 1'000'000;
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(impl_->socket.fd(), &fds);
-        const int sel = (err == SSL_ERROR_WANT_READ)
-            ? ::select(impl_->socket.fd() + 1, &fds, nullptr, nullptr, &tv)
-            : ::select(impl_->socket.fd() + 1, nullptr, &fds, nullptr, &tv);
-        if (sel < 0 && errno != EINTR) {
+        const int sel = wait_socket_ready(
+            impl_->socket.fd(),
+            err == SSL_ERROR_WANT_READ,
+            err == SSL_ERROR_WANT_WRITE,
+            static_cast<std::int64_t>(remaining));
+        if (sel < 0) {
             throw std::runtime_error(
-                "TlsClient handshake select failed");
+                "TlsClient handshake wait_socket_ready failed");
         }
         // sel == 0 (timed out) → loop will re-check deadline and bail.
     }
@@ -273,17 +308,13 @@ void TlsClient::blocking_send_all(std::span<const std::uint8_t> data) {
         }
         const auto remaining = std::chrono::duration_cast<
             std::chrono::microseconds>(deadline - now).count();
-        timeval tv{};
-        tv.tv_sec  = remaining / 1'000'000;
-        tv.tv_usec = remaining % 1'000'000;
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(impl_->socket.fd(), &fds);
-        const int sel = (err == SSL_ERROR_WANT_READ)
-            ? ::select(impl_->socket.fd() + 1, &fds, nullptr, nullptr, &tv)
-            : ::select(impl_->socket.fd() + 1, nullptr, &fds, nullptr, &tv);
-        if (sel < 0 && errno != EINTR) {
-            throw std::runtime_error("TlsClient::send: select failed");
+        const int sel = wait_socket_ready(
+            impl_->socket.fd(),
+            err == SSL_ERROR_WANT_READ,
+            err == SSL_ERROR_WANT_WRITE,
+            static_cast<std::int64_t>(remaining));
+        if (sel < 0) {
+            throw std::runtime_error("TlsClient::send: wait_socket_ready failed");
         }
     }
 }
@@ -312,17 +343,13 @@ std::size_t TlsClient::blocking_read(std::span<std::uint8_t> out, int timeout_ms
         if (now >= deadline) return 0;
         const auto remaining = std::chrono::duration_cast<
             std::chrono::microseconds>(deadline - now).count();
-        timeval tv{};
-        tv.tv_sec  = remaining / 1'000'000;
-        tv.tv_usec = remaining % 1'000'000;
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(impl_->socket.fd(), &fds);
-        const int sel = (err == SSL_ERROR_WANT_READ)
-            ? ::select(impl_->socket.fd() + 1, &fds, nullptr, nullptr, &tv)
-            : ::select(impl_->socket.fd() + 1, nullptr, &fds, nullptr, &tv);
+        const int sel = wait_socket_ready(
+            impl_->socket.fd(),
+            err == SSL_ERROR_WANT_READ,
+            err == SSL_ERROR_WANT_WRITE,
+            static_cast<std::int64_t>(remaining));
         if (sel < 0) {
-            throw std::runtime_error("TlsClient::read: select failed");
+            throw std::runtime_error("TlsClient::read: wait_socket_ready failed");
         }
         if (sel == 0) return 0;   // timed out
     }

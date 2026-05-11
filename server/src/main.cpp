@@ -18,21 +18,25 @@
 // =============================================================================
 
 #if defined(_WIN32)
-#  error "server/src/main.cpp uses Linux-specific epoll + ifaddrs + POSIX \
-sockets directly. Windows port required: factor the accept loop behind \
-fb::net::IoLoop (already used by the client side) and call \
-GetAdaptersAddresses instead of getifaddrs. Tracked in \
-docs/windows-port-status.md."
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <iphlpapi.h>      // GetAdaptersAddresses (replaces getifaddrs)
+#  include <windows.h>       // SetConsoleCtrlHandler
+#  pragma comment(lib, "Ws2_32.lib")
+#  pragma comment(lib, "Iphlpapi.lib")
+#else
+#  include <arpa/inet.h>
+#  include <ifaddrs.h>
+#  include <net/if.h>      // IFF_UP / IFF_LOOPBACK
+#  include <netinet/in.h>
+#  include <signal.h>
+#  include <sys/epoll.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
 #endif
-
-#include <arpa/inet.h>
-#include <ifaddrs.h>
-#include <net/if.h>      // IFF_UP / IFF_LOOPBACK
-#include <netinet/in.h>
-#include <signal.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #if FB_HAVE_OPENSSL
 #  include <openssl/err.h>
@@ -76,6 +80,53 @@ enum class Transport { kTcp, kWs };
 // `ip addr` to find a URL to share.
 std::vector<std::string> external_addresses() {
     std::vector<std::string> out;
+#if defined(_WIN32)
+    // Windows: GetAdaptersAddresses. We ask for both AF_INET and
+    // AF_INET6 in one call and iterate the unicast-address chain.
+    ULONG buf_len = 16 * 1024;
+    std::vector<std::uint8_t> buf(buf_len);
+    DWORD rc = GetAdaptersAddresses(
+        AF_UNSPEC,
+        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+            GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_FRIENDLY_NAME,
+        nullptr,
+        reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()),
+        &buf_len);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        buf.resize(buf_len);
+        rc = GetAdaptersAddresses(
+            AF_UNSPEC,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_SKIP_FRIENDLY_NAME,
+            nullptr,
+            reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()),
+            &buf_len);
+    }
+    if (rc != NO_ERROR) return out;
+    for (auto* a =
+            reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+         a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp) continue;
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+            char text[INET6_ADDRSTRLEN] = {0};
+            const sockaddr* sa = u->Address.lpSockaddr;
+            if (sa->sa_family == AF_INET) {
+                const auto* sin =
+                    reinterpret_cast<const sockaddr_in*>(sa);
+                inet_ntop(AF_INET, &sin->sin_addr, text, sizeof(text));
+                out.emplace_back(text);
+            } else if (sa->sa_family == AF_INET6) {
+                const auto* sin =
+                    reinterpret_cast<const sockaddr_in6*>(sa);
+                if ((sin->sin6_addr.u.Byte[0] == 0xfe) &&
+                    ((sin->sin6_addr.u.Byte[1] & 0xc0) == 0x80)) continue;
+                inet_ntop(AF_INET6, &sin->sin6_addr, text, sizeof(text));
+                out.emplace_back(std::string("[") + text + "]");
+            }
+        }
+    }
+#else
     ifaddrs* head = nullptr;
     if (getifaddrs(&head) != 0 || !head) return out;
     for (ifaddrs* p = head; p; p = p->ifa_next) {
@@ -95,6 +146,7 @@ std::vector<std::string> external_addresses() {
         }
     }
     freeifaddrs(head);
+#endif
     return out;
 }
 
@@ -199,7 +251,18 @@ struct Conn {
 };
 
 std::atomic_bool g_run{true};
+#if defined(_WIN32)
+BOOL WINAPI on_ctrl_event(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
+        type == CTRL_CLOSE_EVENT) {
+        g_run = false;
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
 void on_signal(int) { g_run = false; }
+#endif
 
 void enqueue_write(fb::net::IoLoop& loop, Conn& c, const std::vector<std::uint8_t>& payload) {
     if (c.transport == Transport::kWs) {
@@ -313,9 +376,15 @@ int main(int argc, char** argv) {
         }
     }
     if (public_listen) bind_host = "0.0.0.0";
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(on_ctrl_event, TRUE);
+    // No SIGPIPE on Windows; send() to a closed socket returns
+    // WSAESHUTDOWN which the application layer handles.
+#else
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     fb::server::Directory dir;
     fb::server::Relay relay;

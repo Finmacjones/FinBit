@@ -2,21 +2,15 @@
 #
 # Windows build workflow.
 #
-# Builds fb_server, fb_server-headers, fb-cli against vcpkg on
-# windows-latest using MSVC. The desktop client (Qt6 + GStreamer)
-# and mesh bridge (POSIX termios) are intentionally OFF for the
-# initial Windows target — they're tracked in
-# docs/windows-port-status.md.
+# Builds fb_server + fb-cli against vcpkg on windows-latest using
+# MSVC + the win-msvc-release CMake preset. The desktop client (Qt6
+# + GStreamer) and mesh bridge (POSIX termios) are intentionally OFF
+# for the initial Windows target — see docs/windows-port-status.md.
 #
-# Until the POSIX-only files (io_loop.cpp, tcp.cpp, tls_client.cpp,
-# peer_net.cpp, gossip.cpp, server/main.cpp) have Windows backends,
-# this job is EXPECTED TO FAIL at the compile step with an
-# actionable #error pointing at the file that needs porting. That's
-# the whole point of standing the pipeline up first — each PR that
-# ports one of those files turns one #error into a green check.
-#
-# When all the #error guards have been removed, this job produces
-# a finbit-windows-x64.zip artifact on every push to main + on tag.
+# Smoke-tests fb_server.exe --help + fb-cli.exe --help after build
+# so a successful binary that immediately crashes on startup gets
+# caught here rather than at runtime. Uploads
+# finbit-windows-x64-<sha>.zip on every push to main + on tag.
 
 name: build-windows
 
@@ -35,22 +29,16 @@ jobs:
   build:
     name: build fb_server + fb-cli (windows-latest, MSVC, vcpkg)
     runs-on: windows-latest
-    # Don't fail the wider CI on Windows compile failures while
-    # the porting work is incremental. Each individual run still
-    # surfaces the exact #error so the next porting PR knows what
-    # to tackle. Flip to `false` once docs/windows-port-status.md
-    # lists every file as ported.
+    # Kept continue-on-error while the initial port settles. Flip to
+    # `false` once one green run lands so future regressions block
+    # the merge.
     continue-on-error: true
 
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: false   # mlspp is fetched manually if FB_FEATURE_MLS=ON
+          submodules: false
 
-      # vcpkg ships preinstalled on windows-latest at C:\vcpkg
-      # (VCPKG_INSTALLATION_ROOT env var). We use that rather than a
-      # custom checkout so the build matches what users get from a
-      # fresh "git clone vcpkg" + bootstrap.
       - name: locate vcpkg
         shell: pwsh
         run: |
@@ -58,8 +46,6 @@ jobs:
           echo "vcpkg at: $env:VCPKG_INSTALLATION_ROOT"
           & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" version
 
-      # Cache the vcpkg "binary cache" between runs — protobuf alone
-      # is ~5 minutes from-scratch.
       - name: cache vcpkg binary cache
         uses: actions/cache@v4
         with:
@@ -84,6 +70,34 @@ jobs:
         shell: pwsh
         run: cmake --build --preset win-msvc-release --parallel
 
+      - name: smoke — fb_server.exe --help
+        if: success()
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Path build/win-msvc-release `
+                                -Filter fb_server.exe | Select-Object -First 1
+          if (-not $exe) { throw "fb_server.exe not found" }
+          & $exe.FullName --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "fb_server.exe --help exit code $LASTEXITCODE"
+          }
+
+      - name: smoke — fb-cli.exe --help
+        if: success()
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Path build/win-msvc-release `
+                                -Filter fb-cli.exe | Select-Object -First 1
+          if (-not $exe) { throw "fb-cli.exe not found" }
+          # fb-cli prints usage to stderr and exits non-zero on no-args;
+          # asking for --help should work cleanly.
+          & $exe.FullName --help
+          # fb-cli's --help returns 0; if it returns non-zero something
+          # is genuinely wrong with the binary.
+          if ($LASTEXITCODE -ne 0) {
+            throw "fb-cli.exe --help exit code $LASTEXITCODE"
+          }
+
       - name: collect binaries
         if: success()
         shell: pwsh
@@ -92,6 +106,13 @@ jobs:
           Get-ChildItem -Recurse -Path build/win-msvc-release `
             -Include fb_server.exe, fb-cli.exe `
             | ForEach-Object { Copy-Item $_.FullName artifacts/ }
+          # vcpkg DLLs the binaries link against (libsodium.dll,
+          # protobuf.dll, etc.) live next to the .exe inside the
+          # Release subdir.  Include them so the artifact is
+          # runnable on a clean Windows box.
+          Get-ChildItem -Recurse -Path build/win-msvc-release `
+            -Include *.dll `
+            | ForEach-Object { Copy-Item $_.FullName artifacts/ -ErrorAction SilentlyContinue }
           Copy-Item LICENSE, README.md, CHANGELOG.md, ROADMAP.md `
             artifacts/ -ErrorAction SilentlyContinue
           Get-ChildItem artifacts/

@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/p2p/gossip.hpp"
 
-#if defined(_WIN32)
-#  error "gossip.cpp uses sys/epoll directly. Windows port required: \
-factor the epoll calls behind fb::net::IoLoop (which is already the \
-shared abstraction) and let IoLoop provide a Win32 backend. \
-Tracked in docs/windows-port-status.md."
-#endif
-
 #include <sodium.h>
-#include <sys/epoll.h>
-#include <unistd.h>
+
+#if defined(_WIN32)
+// EPOLL* constants are synthesised by io_loop.hpp (which we include
+// below); no <sys/epoll.h> on Windows. No <unistd.h> either.
+#else
+#  include <sys/epoll.h>
+#  include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>

@@ -1,13 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/p2p/peer_net.hpp"
 
-#if defined(_WIN32)
-#  error "peer_net.cpp uses POSIX sockets + select() (arpa/inet, netinet/in, \
-sys/socket, sys/select). Windows port required: Winsock2 + WSAPoll. \
-Depends on tcp.cpp and tls_client.cpp being ported first. \
-Tracked in docs/windows-port-status.md."
-#endif
-
 #include "fb/crypto/identity_cert.hpp"
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
@@ -27,28 +20,77 @@ Tracked in docs/windows-port-status.md."
 
 #if FB_HAVE_OPENSSL
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
-#include <signal.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <unistd.h>
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  pragma comment(lib, "Ws2_32.lib")
+#else
+#  include <arpa/inet.h>
+#  include <netinet/in.h>
+#  include <signal.h>
+#  include <sys/select.h>
+#  include <sys/socket.h>
+#  include <unistd.h>
+#endif
 
 namespace fb::p2p {
 
 namespace {
+
+// Wait for socket readiness on POSIX or Windows. >0 = ready,
+// 0 = timeout / interrupted, <0 = fatal.
+int wait_socket_ready(int fd, bool want_read, bool want_write,
+                      std::int64_t timeout_us) {
+    if (timeout_us < 0) timeout_us = 0;
+#if defined(_WIN32)
+    WSAPOLLFD pfd{};
+    pfd.fd     = static_cast<SOCKET>(static_cast<std::uintptr_t>(fd));
+    pfd.events = 0;
+    if (want_read)  pfd.events |= POLLRDNORM;
+    if (want_write) pfd.events |= POLLWRNORM;
+    pfd.revents = 0;
+    int ms = static_cast<int>(timeout_us / 1000);
+    int n = WSAPoll(&pfd, 1, ms);
+    if (n == SOCKET_ERROR) {
+        if (WSAGetLastError() == WSAEINTR) return 0;
+        return -1;
+    }
+    return n;
+#else
+    timeval tv{};
+    tv.tv_sec  = timeout_us / 1'000'000;
+    tv.tv_usec = timeout_us % 1'000'000;
+    fd_set rd, wr;
+    FD_ZERO(&rd); FD_ZERO(&wr);
+    if (want_read)  FD_SET(fd, &rd);
+    if (want_write) FD_SET(fd, &wr);
+    const int sel = ::select(fd + 1,
+                              want_read  ? &rd : nullptr,
+                              want_write ? &wr : nullptr,
+                              nullptr, &tv);
+    if (sel < 0 && errno == EINTR) return 0;
+    return sel;
+#endif
+}
 
 // Per-process OpenSSL bootstrap (idempotent).
 struct OpenSslInit {
     OpenSslInit() {
         OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS |
                          OPENSSL_INIT_LOAD_CRYPTO_STRINGS, nullptr);
+#if !defined(_WIN32)
         // SIGPIPE → EPIPE on write() to a torn-down socket. Without
         // this the entire process gets killed when a peer drops mid-
-        // send (common on TLS-handshake-failure paths).
+        // send (common on TLS-handshake-failure paths). Windows has
+        // no SIGPIPE; closed sockets return WSAESHUTDOWN.
         ::signal(SIGPIPE, SIG_IGN);
+#endif
     }
 };
 OpenSslInit& openssl_init() { static OpenSslInit i; return i; }
@@ -105,17 +147,10 @@ int drive_ssl_io(SSL* ssl, int fd, Op&& op,
         if (now >= deadline) return 0;
         const auto remaining = std::chrono::duration_cast<
             std::chrono::microseconds>(deadline - now).count();
-        timeval tv{};
-        tv.tv_sec  = remaining / 1'000'000;
-        tv.tv_usec = remaining % 1'000'000;
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(fd, &fds);
-        if (err == SSL_ERROR_WANT_READ) {
-            ::select(fd + 1, &fds, nullptr, nullptr, &tv);
-        } else {
-            ::select(fd + 1, nullptr, &fds, nullptr, &tv);
-        }
+        (void)wait_socket_ready(fd,
+            err == SSL_ERROR_WANT_READ,
+            err == SSL_ERROR_WANT_WRITE,
+            static_cast<std::int64_t>(remaining));
     }
 }
 
@@ -155,17 +190,10 @@ struct AcceptedConn {
             if (now >= deadline) return false;
             const auto remaining = std::chrono::duration_cast<
                 std::chrono::microseconds>(deadline - now).count();
-            timeval tv{};
-            tv.tv_sec  = remaining / 1'000'000;
-            tv.tv_usec = remaining % 1'000'000;
-            fd_set fds;
-            FD_ZERO(&fds);
-            FD_SET(sock.fd(), &fds);
-            if (err == SSL_ERROR_WANT_READ) {
-                ::select(sock.fd() + 1, &fds, nullptr, nullptr, &tv);
-            } else {
-                ::select(sock.fd() + 1, nullptr, &fds, nullptr, &tv);
-            }
+            (void)wait_socket_ready(sock.fd(),
+                err == SSL_ERROR_WANT_READ,
+                err == SSL_ERROR_WANT_WRITE,
+                static_cast<std::int64_t>(remaining));
         }
     }
 
@@ -425,9 +453,16 @@ void PeerNet::start_listener(const PeerListenerOptions& opts) {
     impl_->listen_sock.emplace(
         fb::net::tcp_listen(opts.bind_host, opts.bind_port));
     sockaddr_in sa{};
-    socklen_t   sl = sizeof(sa);
+#if defined(_WIN32)
+    int sl = sizeof(sa);
+    if (::getsockname(static_cast<SOCKET>(static_cast<std::uintptr_t>(
+                          impl_->listen_sock->fd())),
+                       reinterpret_cast<sockaddr*>(&sa), &sl) == 0) {
+#else
+    socklen_t sl = sizeof(sa);
     if (::getsockname(impl_->listen_sock->fd(),
                        reinterpret_cast<sockaddr*>(&sa), &sl) == 0) {
+#endif
         impl_->listen_port = ntohs(sa.sin_port);
     } else {
         impl_->listen_port = opts.bind_port;
@@ -441,13 +476,9 @@ void PeerNet::start_listener(const PeerListenerOptions& opts) {
     const int lfd = impl_->listen_sock->fd();
     impl_->accept_thread.emplace([this, lfd]() {
         while (impl_->listen_running) {
-            timeval tv{};
-            tv.tv_sec  = 0;
-            tv.tv_usec = 100 * 1000;
-            fd_set rs;
-            FD_ZERO(&rs);
-            FD_SET(lfd, &rs);
-            const int sel = ::select(lfd + 1, &rs, nullptr, nullptr, &tv);
+            const int sel = wait_socket_ready(lfd,
+                /*want_read=*/true, /*want_write=*/false,
+                /*timeout_us=*/100 * 1000);
             if (sel < 0) break;        // fd closed during shutdown
             if (sel == 0) continue;    // timeout
             fb::net::Socket s;
