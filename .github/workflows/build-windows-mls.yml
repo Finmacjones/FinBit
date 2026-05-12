@@ -1,0 +1,146 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Windows MLS-build workflow. Mirrors build-windows.yml but flips
+# FB_FEATURE_MLS=ON so the resulting fb_server.exe + fb-cli.exe ship
+# with RFC 9420 group crypto via the vendored cisco/mlspp.
+#
+# The MLS build is the heavier of the two (mlspp + hpke + tls_syntax
+# vendored sources add ~5-10 min to the build). Keeping it in its
+# own workflow means a vanilla server/CLI build (build-windows.yml)
+# isn't gated on the MLS path stabilising.
+
+name: build-windows-mls
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build fb_server + fb-cli with MLS (windows-latest, MSVC, vcpkg)
+    runs-on: windows-latest
+    # MLS build on Windows is new. Hold continue-on-error until
+    # one green run lands; flip to false thereafter.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: locate vcpkg
+        shell: pwsh
+        run: |
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
+      - name: cache vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: vendor mlspp under third_party/
+        shell: pwsh
+        run: pwsh -File scripts/fetch-mlspp.ps1
+
+      - name: configure (win-msvc-release-mls preset)
+        shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+        run: |
+          cmake --preset win-msvc-release-mls
+
+      - name: build
+        shell: pwsh
+        run: cmake --build --preset win-msvc-release-mls --parallel
+
+      - name: smoke — MLS-enabled fb_server.exe --help
+        if: success()
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Path build/win-msvc-release-mls `
+                                -Filter fb_server.exe | Select-Object -First 1
+          if (-not $exe) { throw "fb_server.exe not found" }
+          & $exe.FullName --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "fb_server.exe --help exit code $LASTEXITCODE"
+          }
+
+      - name: smoke — MLS-enabled fb-cli.exe --help
+        if: success()
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Path build/win-msvc-release-mls `
+                                -Filter fb-cli.exe | Select-Object -First 1
+          if (-not $exe) { throw "fb-cli.exe not found" }
+          & $exe.FullName --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "fb-cli.exe --help exit code $LASTEXITCODE"
+          }
+
+      - name: e2e — dm_roundtrip.ps1 against MLS-enabled binaries
+        if: success()
+        shell: pwsh
+        run: pwsh -File tools/e2e/dm_roundtrip.ps1 -Build build/win-msvc-release-mls
+
+      - name: bundle MLS .zip
+        if: success()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts-mls -Force | Out-Null
+          Get-ChildItem -Recurse -Path build/win-msvc-release-mls `
+            -Include fb_server.exe, fb-cli.exe `
+            | ForEach-Object { Copy-Item $_.FullName artifacts-mls/ }
+          Get-ChildItem -Recurse -Path build/win-msvc-release-mls -Include *.dll `
+            | ForEach-Object { Copy-Item $_.FullName artifacts-mls/ -ErrorAction SilentlyContinue }
+          Copy-Item LICENSE, README.md, CHANGELOG.md, ROADMAP.md `
+                    artifacts-mls/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path artifacts-mls/* `
+                            -DestinationPath finbit-windows-x64-mls.zip -Force
+          (Get-FileHash -Algorithm SHA256 finbit-windows-x64-mls.zip).Hash.ToLower() `
+            + "  finbit-windows-x64-mls.zip" `
+            | Out-File -Encoding ASCII finbit-windows-x64-mls.zip.sha256
+
+      - name: upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finbit-windows-x64-mls-${{ github.sha }}
+          path: |
+            finbit-windows-x64-mls.zip
+            finbit-windows-x64-mls.zip.sha256
+          retention-days: 14
+
+      - name: publish to nightly release
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "FinBit nightly (head of main)"
+          prerelease: true
+          files: |
+            finbit-windows-x64-mls.zip
+            finbit-windows-x64-mls.zip.sha256
+          fail_on_unmatched_files: true
+          target_commitish: ${{ github.sha }}
+
+      - name: publish to v* tagged release
+        if: success() && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            finbit-windows-x64-mls.zip
+            finbit-windows-x64-mls.zip.sha256
+          fail_on_unmatched_files: true

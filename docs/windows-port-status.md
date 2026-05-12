@@ -14,7 +14,7 @@ What's actually reachable from each shipped binary, after the port:
 |---|:--:|:--:|:--:|:--:|:--:|
 | 1:1 DM via Double Ratchet (text) | ✅ | ✅ | ✅ relay | ✅ | ✅ relay |
 | Channels via SenderKeys (text) | ✅ | ✅ | ✅ relay | ✅ | ✅ relay |
-| MLS-encrypted channels (RFC 9420) | ✅ (`FB_FEATURE_MLS=ON`) | ✅ (same) | ✅ relay | ⏳ pending mlspp vcpkg port | ⏳ same |
+| MLS-encrypted channels (RFC 9420) | ✅ (`FB_FEATURE_MLS=ON`) | ✅ (same) | ✅ relay | ⏳ in CI (`build-windows-mls.yml`) | ⏳ same |
 | Username log + DHT prekey publish | ✅ | ✅ | n/a | ✅ | n/a |
 | PeerNet direct P2P (mTLS) | ✅ | ✅ | n/a | ✅ | n/a |
 | Friend-relay offline store | ✅ | ✅ | n/a | ✅ | n/a |
@@ -72,7 +72,7 @@ behavioural difference), the `dm_roundtrip.ps1` failure surfaces it.
 | `fb-cli` (text DM)      | ✅           | ✅                 | n/a        |
 | `fb_desktop` (Qt6 + GStreamer) | ✅    | ⏳ in CI (build-windows-desktop.yml) | n/a |
 | WASM module             | ✅           | n/a                | ✅         |
-| MLS feature (RFC 9420)  | ✅           | ⏳ (vendored mlspp port pending) | ✅ |
+| MLS feature (RFC 9420)  | ✅           | ⏳ in CI (build-windows-mls.yml; continue-on-error) | ✅ |
 | Mesh bridge (LoRa serial) | ✅         | ✅ (Win32 CreateFile + DCB; this release) | n/a |
 
 ✅ shipped • ⏳ deferred to a later release
@@ -115,8 +115,14 @@ take the alternate branch.
   the Qt plugins and `finbit-windows-x64-desktop.zip` ships
   alongside the server bundle. Linux remains the canonical desktop
   target while the Windows GUI matures.
-- **MLS on Windows** — needs the vendored `mlspp` to build under
-  MSVC + a `mls` vcpkg feature. Tracked.
+- **MLS on Windows** — `scripts/fetch-mlspp.ps1` clones
+  cisco/mlspp into `third_party/` on the runner; CMake then
+  `add_subdirectory`s it via the `win-msvc-release-mls` preset
+  (FB_FEATURE_MLS=ON). MSVC warning-as-error flags from mlspp's
+  own CMakeLists get stripped via `/W3 /WX-` in the top-level
+  CMakeLists' MLS branch. Workflow is `continue-on-error: true`
+  while the build stabilises — flip after one green run, same
+  pattern as the server/CLI Windows port went through.
 
 ## Security parity
 

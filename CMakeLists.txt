@@ -59,8 +59,15 @@ if(FB_FEATURE_MLS)
     add_subdirectory(third_party/mlspp EXCLUDE_FROM_ALL)
     foreach(target tls_syntax bytes hpke mls_ds mls_vectors mlspp)
         if(TARGET ${target})
-            target_compile_options(${target} PRIVATE
-                -Wno-conversion -Wno-shadow -Wno-pedantic -Wno-error)
+            if(MSVC)
+                # mlspp's own CMakeLists may add /WX or treat-warnings-as-
+                # errors style flags on the MSVC arm; silence them here
+                # without trying to translate the GCC -Wno-* dialect.
+                target_compile_options(${target} PRIVATE /W3 /WX-)
+            else()
+                target_compile_options(${target} PRIVATE
+                    -Wno-conversion -Wno-shadow -Wno-pedantic -Wno-error)
+            endif()
         endif()
     endforeach()
 endif()

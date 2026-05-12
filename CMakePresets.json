@@ -55,6 +55,16 @@
                 "lhs": "${hostSystemName}",
                 "rhs": "Windows"
             }
+        },
+        {
+            "name": "win-msvc-release-mls",
+            "displayName": "Windows MSVC Release + MLS (vendored mlspp)",
+            "inherits": "win-msvc-release",
+            "binaryDir": "${sourceDir}/build/win-msvc-release-mls",
+            "cacheVariables": {
+                "VCPKG_MANIFEST_FEATURES": "server;mesh;mls",
+                "FB_FEATURE_MLS": "ON"
+            }
         }
     ],
     "buildPresets": [
@@ -63,6 +73,11 @@
         {
             "name": "win-msvc-release",
             "configurePreset": "win-msvc-release",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "win-msvc-release-mls",
+            "configurePreset": "win-msvc-release-mls",
             "configuration": "RelWithDebInfo"
         }
     ],
