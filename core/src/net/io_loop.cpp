@@ -98,12 +98,34 @@ std::pair<SOCKET, SOCKET> make_wake_pair() {
         throw std::runtime_error("wake connect: " +
                                   std::to_string(WSAGetLastError()));
     }
-    SOCKET server = ::accept(listener, nullptr, nullptr);
+    // Hardening (F7): capture the accepted peer's address and require
+    // it equals our own client's local address. Without this, a
+    // faster local process could race to connect to the listener
+    // during the brief window it's open and end up paired with our
+    // wake fd. Even if hijacked the wake bytes are zero-valued so
+    // no data leaks — but the peer-pin closes the door entirely.
+    sockaddr_in peer_addr{};
+    int peer_len = sizeof(peer_addr);
+    SOCKET server = ::accept(listener,
+        reinterpret_cast<sockaddr*>(&peer_addr), &peer_len);
     ::closesocket(listener);
     if (server == INVALID_SOCKET) {
         ::closesocket(client);
         throw std::runtime_error("wake accept: " +
                                   std::to_string(WSAGetLastError()));
+    }
+    sockaddr_in client_local{};
+    int local_len = sizeof(client_local);
+    if (::getsockname(client,
+            reinterpret_cast<sockaddr*>(&client_local),
+            &local_len) == SOCKET_ERROR ||
+        peer_addr.sin_addr.s_addr != client_local.sin_addr.s_addr ||
+        peer_addr.sin_port        != client_local.sin_port) {
+        ::closesocket(server);
+        ::closesocket(client);
+        throw std::runtime_error(
+            "wake pair: accepted peer is not our own client — "
+            "another local process raced the loopback handshake");
     }
     u_long nbio = 1;
     ::ioctlsocket(server, FIONBIO, &nbio);
