@@ -20,11 +20,21 @@
 // orchestrate a deterministic conversation.
 // =============================================================================
 
-#include <signal.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>          // SetConsoleCtrlHandler
+#  pragma comment(lib, "Ws2_32.lib")
+#else
+#  include <signal.h>
+#  include <sys/select.h>
+#  include <sys/socket.h>
+#  include <sys/types.h>
+#  include <unistd.h>
+#endif
 
 #include <array>
 #include <atomic>
@@ -84,7 +94,18 @@ std::vector<std::uint8_t> envelope_aad_bytes(
 }
 
 std::atomic_bool g_run{true};
+#if defined(_WIN32)
+BOOL WINAPI on_ctrl_event(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT ||
+        type == CTRL_CLOSE_EVENT) {
+        g_run = false;
+        return TRUE;
+    }
+    return FALSE;
+}
+#else
 void on_signal(int) { g_run = false; }
+#endif
 
 struct Args {
     std::string user;
@@ -374,6 +395,21 @@ struct Conn {
     // about ">0 means data, 0 means stop".
     std::size_t read_some(std::span<std::uint8_t> out, int timeout_ms) {
         if (tls) return tls->blocking_read(out, timeout_ms);
+#if defined(_WIN32)
+        WSAPOLLFD pfd{};
+        pfd.fd =
+            static_cast<SOCKET>(static_cast<std::uintptr_t>(sock->fd()));
+        pfd.events  = POLLRDNORM;
+        pfd.revents = 0;
+        const int sel = WSAPoll(&pfd, 1, timeout_ms);
+        if (sel <= 0) return 0;
+        const int n = ::recv(
+            static_cast<SOCKET>(static_cast<std::uintptr_t>(sock->fd())),
+            reinterpret_cast<char*>(out.data()),
+            static_cast<int>(out.size()), 0);
+        if (n <= 0) return 0;
+        return static_cast<std::size_t>(n);
+#else
         timeval tv{};
         tv.tv_sec  = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000;
@@ -385,6 +421,7 @@ struct Conn {
         const auto n = ::recv(sock->fd(), out.data(), out.size(), 0);
         if (n <= 0) return 0;
         return static_cast<std::size_t>(n);
+#endif
     }
 };
 
@@ -425,9 +462,14 @@ int main(int argc, char** argv) {
         usage();
         return 1;
     }
+#if defined(_WIN32)
+    SetConsoleCtrlHandler(on_ctrl_event, TRUE);
+    // No SIGPIPE on Windows.
+#else
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     if (sodium_init() < 0) {
         std::cerr << "sodium_init failed\n";
