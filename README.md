@@ -503,18 +503,20 @@ implementation: `docs/security-audit.md`.
 
 ## Releases
 
-Pre-built Linux x86_64 binaries are published on the
-[Releases page](../../releases) in two flavours:
+Pre-built binaries for Linux x86_64 and Windows x64 are published
+on the [Releases page](../../releases) in two flavours:
 
 | Release | Updated | Stability |
 |---|---|---|
 | **`v1.x.x`** (tagged) | When a maintainer cuts a release | Stable — runs `ctest`, refuses to publish on failure |
 | **`nightly`** | Every push to `main` | Bleeding-edge — same `ctest` gate, but no manual review |
 
-Each tarball is `finbit-linux-x86_64*.tar.gz` with `bin/fb_server`,
-`bin/fb_desktop`, `bin/fb-cli`, the LICENSE, README, CHANGELOG, ROADMAP
-and a `RUNTIME_DEPS.md` apt/pacman cheat-sheet. A `.sha256` file
-alongside lets you verify the download.
+### Linux x86_64
+
+`finbit-linux-x86_64*.tar.gz` contains `bin/fb_server`,
+`bin/fb_desktop`, `bin/fb-cli`, the LICENSE, README, CHANGELOG,
+ROADMAP and a `RUNTIME_DEPS.md` apt/pacman cheat-sheet. A `.sha256`
+sidecar lets you verify the download.
 
 ```bash
 wget https://github.com/Finmacjones/finbit/releases/download/v1.0.1/finbit-linux-x86_64-v1.0.1.tar.gz
@@ -522,16 +524,30 @@ tar xzf finbit-linux-x86_64-v1.0.1.tar.gz
 finbit-linux-x86_64-v1.0.1/bin/fb_server --help
 ```
 
-### Windows builds
+### Windows x64
 
-A Windows x64 (MSVC) build pipeline runs in CI via
-`.github/workflows/build-windows.yml` against vcpkg on the
-`windows-latest` runner. The job currently builds `fb_server` +
-`fb-cli` (no desktop GUI yet) and is `continue-on-error` while the
-POSIX-only I/O layer is incrementally ported — see
-`docs/windows-port-status.md` for the per-file status and what each
-porting PR should touch. Successful runs upload a
-`finbit-windows-x64-<sha>.zip` artifact.
+`finbit-windows-x64.zip` contains `fb_server.exe`, `fb-cli.exe`, the
+vcpkg DLLs they link against (libsodium, protobuf, sqlite3, brotli,
+openssl, zlib), and the same LICENSE / README / CHANGELOG / ROADMAP
+docs. A `.sha256` sidecar verifies the download. The build is MSVC
+(Visual Studio 17 2022) on the `windows-latest` GitHub runner. The
+desktop GUI (Qt6 + GStreamer) and mesh bridge (POSIX termios) are
+not included in v1.x — tracked in `docs/windows-port-status.md`.
+
+Tagged release:
+
+```powershell
+# PowerShell (or any browser — direct download from the Releases page)
+Invoke-WebRequest -Uri https://github.com/Finmacjones/finbit/releases/download/v1.0.1/finbit-windows-x64.zip -OutFile finbit-windows-x64.zip
+Expand-Archive finbit-windows-x64.zip -DestinationPath finbit-win
+.\finbit-win\fb_server.exe --help
+```
+
+Nightly:
+
+```powershell
+Invoke-WebRequest -Uri https://github.com/Finmacjones/finbit/releases/download/nightly/finbit-windows-x64.zip -OutFile finbit-windows-x64.zip
+```
 
 ### Cutting a new tagged release (maintainers)
 
