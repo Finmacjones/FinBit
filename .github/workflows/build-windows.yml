@@ -5,12 +5,14 @@
 # Builds fb_server + fb-cli against vcpkg on windows-latest using
 # MSVC + the win-msvc-release CMake preset. The desktop client (Qt6
 # + GStreamer) and mesh bridge (POSIX termios) are intentionally OFF
-# for the initial Windows target — see docs/windows-port-status.md.
+# for the Windows target — see docs/windows-port-status.md.
 #
 # Smoke-tests fb_server.exe --help + fb-cli.exe --help after build
 # so a successful binary that immediately crashes on startup gets
-# caught here rather than at runtime. Uploads
-# finbit-windows-x64-<sha>.zip on every push to main + on tag.
+# caught here rather than at runtime. Publishes
+# finbit-windows-x64.zip to the rolling `nightly` GitHub Release on
+# every push to main; on a v* tag, attaches the same zip to the
+# tagged release release.yml creates.
 
 name: build-windows
 
@@ -29,10 +31,9 @@ jobs:
   build:
     name: build fb_server + fb-cli (windows-latest, MSVC, vcpkg)
     runs-on: windows-latest
-    # Kept continue-on-error while the initial port settles. Flip to
-    # `false` once one green run lands so future regressions block
-    # the merge.
-    continue-on-error: true
+    # Strict mode: a failed Windows build blocks the merge. The
+    # initial port is done (see docs/windows-port-status.md) and
+    # both compile + smoke have shipped green at least once.
 
     steps:
       - uses: actions/checkout@v4
