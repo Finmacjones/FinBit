@@ -99,6 +99,18 @@ jobs:
             throw "fb-cli.exe --help exit code $LASTEXITCODE"
           }
 
+      # End-to-end functional test on Windows: spin up fb_server +
+      # bob + alice, exchange a DM with a randomised plaintext
+      # canary, assert bob decrypts it AND the server log never
+      # contains it (= server-blindness). Mirrors the Linux
+      # tools/e2e/dm_roundtrip.sh canary suite. A failure here
+      # means the Windows binaries don't deliver the same E2E
+      # behaviour the Linux binaries do.
+      - name: e2e — dm_roundtrip.ps1 (functional + canary)
+        if: success()
+        shell: pwsh
+        run: pwsh -File tools/e2e/dm_roundtrip.ps1 -Build build/win-msvc-release
+
       - name: collect binaries + bundle as zip
         if: success()
         shell: pwsh

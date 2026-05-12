@@ -6,6 +6,63 @@ manifest, `win-msvc-release` CMake preset). Pre-built binaries
 ship on the [Releases page](../../releases) as
 `finbit-windows-x64.zip` alongside the Linux tarball.
 
+## Functional parity matrix (per ship-blocking feature)
+
+What's actually reachable from each shipped binary, after the port:
+
+| Feature | Linux `fb_desktop` | Linux `fb-cli` | Linux `fb_server` | Windows `fb-cli.exe` | Windows `fb_server.exe` |
+|---|:--:|:--:|:--:|:--:|:--:|
+| 1:1 DM via Double Ratchet (text) | ✅ | ✅ | ✅ relay | ✅ | ✅ relay |
+| Channels via SenderKeys (text) | ✅ | ✅ | ✅ relay | ✅ | ✅ relay |
+| MLS-encrypted channels (RFC 9420) | ✅ (`FB_FEATURE_MLS=ON`) | ✅ (same) | ✅ relay | ⏳ pending mlspp vcpkg port | ⏳ same |
+| Username log + DHT prekey publish | ✅ | ✅ | n/a | ✅ | n/a |
+| PeerNet direct P2P (mTLS) | ✅ | ✅ | n/a | ✅ | n/a |
+| Friend-relay offline store | ✅ | ✅ | n/a | ✅ | n/a |
+| WSS / TLS relay transport | ✅ | ✅ (`--tls`) | ✅ (`--tls-raw-port` / `--tls-port`) | ✅ | ✅ |
+| Per-row AEAD SQLite store | ✅ | n/a (in-memory) | ✅ (offline queue + directory + prekeys) | n/a | ✅ |
+| Identity vault on disk (Argon2id-v2) | ✅ | n/a (ephemeral keypair) | n/a | n/a | n/a |
+| 1:1 voice / video (WebRTC) | ✅ (GStreamer) | n/a | ✅ signaling fan-out | ❌ (no `fb_desktop`) | ✅ signaling fan-out |
+| Full-mesh channel voice | ✅ | n/a | ✅ `RoomJoin/RoomRoster` | ❌ | ✅ |
+| Mesh bridge (MQTT) | ✅ (`paho-mqttpp3` feature) | n/a | n/a | ⏳ MQTT vcpkg port unverified | ⏳ |
+| Mesh bridge (LoRa serial / termios) | ✅ | n/a | n/a | ❌ `termios` not on Win32 | ❌ |
+| Anti-DoS token bucket | ✅ | n/a | ✅ | n/a | ✅ |
+| Server-blindness (canary asserts) | ✅ 10 e2e | ✅ same | ✅ same | ✅ `dm_roundtrip.ps1` | ✅ same |
+
+✅ shipped • ⏳ deferred • ❌ out of scope for v1.x
+
+### What this means for users picking a target
+
+- **Linux x86_64** — full stack: desktop GUI, voice + video, mesh
+  bridge, MLS. Use this for end-user installs and for running a
+  production relay.
+- **Windows x64** — server + CLI only at v1.0. Sufficient for
+  hosting a relay on a Windows VPS, scripting / automation via
+  `fb-cli.exe`, and Windows-side CI / build tooling. End-user GUI
+  is v1.2+ (Qt6 + GStreamer needs Windows-built GStreamer or a
+  swap to Win32 WebRTC).
+- **Web (WASM)** — full DM / channel / 1:1-call client; runs in any
+  modern browser including Windows ones, so Windows users who want
+  the GUI today have a working path via `https://`.
+
+### CI coverage per target
+
+| Test surface | Linux | Windows |
+|---|:--:|:--:|
+| `ctest` default (183 tests) | ✅ every push | ❌ (`FB_BUILD_TESTS=OFF` on Windows preset) |
+| `ctest` MLS (193 tests) | ✅ on tagged release | ❌ same |
+| ASan + UBSan (182 tests) | ✅ nightly | ❌ (sanitisers Linux-only) |
+| TSan (182 tests) | ✅ nightly | ❌ same |
+| `tools/e2e/*.sh` canary suite (10 scripts) | ✅ every push | ➜ `tools/e2e/dm_roundtrip.ps1` (1 script, same canary property) |
+| `--help` smoke | ✅ | ✅ |
+| Published binary verification (sha256) | ✅ | ✅ |
+
+The Windows runtime test footprint is intentionally smaller than
+Linux's — the Linux box hosts the sanitiser variants and the full
+e2e shell suite, while Windows CI runs the compile + smoke + one
+canary-asserting DM round-trip. If the Windows binaries had a
+regression that the unit tests couldn't catch (e.g. a `WSAPoll`
+behavioural difference), the `dm_roundtrip.ps1` failure surfaces it.
+
 ## Build matrix
 
 | Target                  | Linux x86_64 | Windows x64 (MSVC) | Web (WASM) |
