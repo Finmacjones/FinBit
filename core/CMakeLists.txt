@@ -79,6 +79,7 @@ add_library(fb_core STATIC
     src/media/sframe.cpp
     src/mesh/mqtt_bridge.cpp
     src/mesh/compression.cpp
+    src/mesh/serial_bridge.cpp
     src/p2p/host.cpp
     src/p2p/kademlia.cpp
     src/p2p/gossip.cpp
@@ -93,12 +94,6 @@ add_library(fb_core STATIC
     src/net/tls_client.cpp
 )
 
-# Serial-port mesh bridge is POSIX-only (termios). Windows port is
-# tracked in docs/windows-port-status.md but isn't required for v1.x.
-# Compile it only on non-Windows hosts so the Windows build is clean.
-if(NOT WIN32)
-    target_sources(fb_core PRIVATE src/mesh/serial_bridge.cpp)
-endif()
 
 target_include_directories(fb_core
     PUBLIC

@@ -23,8 +23,8 @@ What's actually reachable from each shipped binary, after the port:
 | Identity vault on disk (Argon2id-v2) | ✅ | n/a (ephemeral keypair) | n/a | n/a | n/a |
 | 1:1 voice / video (WebRTC) | ✅ (GStreamer) | n/a | ✅ signaling fan-out | ❌ (no `fb_desktop`) | ✅ signaling fan-out |
 | Full-mesh channel voice | ✅ | n/a | ✅ `RoomJoin/RoomRoster` | ❌ | ✅ |
-| Mesh bridge (MQTT) | ✅ (`paho-mqttpp3` feature) | n/a | n/a | ⏳ MQTT vcpkg port unverified | ⏳ |
-| Mesh bridge (LoRa serial / termios) | ✅ | n/a | n/a | ❌ `termios` not on Win32 | ❌ |
+| Mesh bridge (MQTT) | ✅ (`paho-mqttpp3` feature) | n/a | n/a | ✅ (paho-mqttpp3 x64-windows triplet) | ✅ |
+| Mesh bridge (LoRa serial) | ✅ termios | n/a | n/a | ✅ Win32 `CreateFile` + DCB | ✅ |
 | Anti-DoS token bucket | ✅ | n/a | ✅ | n/a | ✅ |
 | Server-blindness (canary asserts) | ✅ 10 e2e | ✅ same | ✅ same | ✅ `dm_roundtrip.ps1` | ✅ same |
 
@@ -70,10 +70,10 @@ behavioural difference), the `dm_roundtrip.ps1` failure surfaces it.
 | `core/` library         | ✅           | ✅                 | ✅         |
 | `fb_server` (relay)     | ✅           | ✅                 | n/a        |
 | `fb-cli` (text DM)      | ✅           | ✅                 | n/a        |
-| `fb_desktop` (Qt6 + GStreamer) | ✅    | ⏳ v1.2+            | n/a        |
+| `fb_desktop` (Qt6 + GStreamer) | ✅    | ⏳ in CI (build-windows-desktop.yml) | n/a |
 | WASM module             | ✅           | n/a                | ✅         |
 | MLS feature (RFC 9420)  | ✅           | ⏳ (vendored mlspp port pending) | ✅ |
-| Mesh bridge (LoRa serial) | ✅         | ⏳ (termios → DCB; deferred) | n/a |
+| Mesh bridge (LoRa serial) | ✅         | ✅ (Win32 CreateFile + DCB; this release) | n/a |
 
 ✅ shipped • ⏳ deferred to a later release
 
@@ -90,7 +90,7 @@ take the alternate branch.
 | `core/src/net/tls_client.cpp` | `select()` driving SSL | `WSAPoll`-backed `wait_socket_ready()` |
 | `core/src/p2p/gossip.cpp` | `EPOLL*` from `<sys/epoll.h>` | constants come from `fb/net/io_loop.hpp` synth `#define`s |
 | `core/src/p2p/peer_net.cpp` | POSIX sockets + `select()` + `SIGPIPE` ignore | Winsock2 + `WSAPoll` + no-SIGPIPE; `shutdown` uses `SD_BOTH` |
-| `core/src/mesh/serial_bridge.cpp` | `termios` | Not compiled on Windows (gated `if(NOT WIN32)` in `core/CMakeLists.txt`) |
+| `core/src/mesh/serial_bridge.cpp` | `termios` + `select()` | `CreateFileA("\\\\.\\COMx")` + DCB + `SetCommTimeouts` (100ms read window matches POSIX poll) + `ReadFile`/`WriteFile` |
 | `server/src/main.cpp` | epoll via IoLoop + `getifaddrs` + `signal()` | IoLoop Windows backend + `GetAdaptersAddresses` + `SetConsoleCtrlHandler` |
 | `tools/fb-cli/main.cpp` | `select()` + `signal()` + `MSG_NOSIGNAL` send | `WSAPoll` + `SetConsoleCtrlHandler` + Winsock send |
 
@@ -108,14 +108,13 @@ take the alternate branch.
 
 ## What's not in v1.x
 
-- **`fb_desktop`** — Qt6 ports cleanly to Windows but the
-  GStreamer/webrtcbin video stack needs Windows builds of GStreamer
-  (multi-hour MSI wrangling) or a swap to native Win32 WebRTC
-  (multi-week). v1.x ships server + CLI on Windows; desktop GUI is
-  v1.2+.
-- **Mesh bridge** — `termios` → Win32 DCB is real work for a
-  feature most Windows desktops can't use (no LoRa radio attached).
-  Stays off until there's demand.
+- **`fb_desktop`** — Build pipeline lives in
+  `build-windows-desktop.yml` (Qt6 via the `jurplel/install-qt-action`,
+  GStreamer via Chocolatey's MSI). Build is `continue-on-error`
+  until one green CI run lands. When it does, `windeployqt` bundles
+  the Qt plugins and `finbit-windows-x64-desktop.zip` ships
+  alongside the server bundle. Linux remains the canonical desktop
+  target while the Windows GUI matures.
 - **MLS on Windows** — needs the vendored `mlspp` to build under
   MSVC + a `mls` vcpkg feature. Tracked.
 

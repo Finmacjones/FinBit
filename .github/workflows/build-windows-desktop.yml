@@ -1,0 +1,160 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Windows desktop build: fb_desktop.exe (Qt6 chat GUI + GStreamer
+# voice/video) on windows-latest. Separate workflow from
+# build-windows.yml because the Qt6 + GStreamer install adds
+# significant CI time (~5-10 min cold).
+#
+# Outputs finbit-windows-x64-desktop.zip on every push to main and
+# on v* tags, attached to the same nightly / tagged Release the
+# server+CLI .zip lands in.
+
+name: build-windows-desktop
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build fb_desktop.exe (Qt6 + GStreamer, windows-latest)
+    runs-on: windows-latest
+    # Desktop port is new — keep continue-on-error while it settles.
+    # Flip to false once one green run lands.
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: locate vcpkg
+        shell: pwsh
+        run: |
+          echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+
+      - name: cache vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
+
+      - name: setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # Qt6 via the official jurplel install action — this avoids
+      # the multi-GB vcpkg qt6 port and gets us the upstream pre-built
+      # binaries that match what end-users would install themselves.
+      - name: install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.7.3
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: ''     # no extra modules — Core/Gui/Widgets/Concurrent ship in base
+          cache: true
+
+      # GStreamer for Windows. The MSI installer from
+      # gstreamer.freedesktop.org puts the runtime + dev headers under
+      # C:\gstreamer\1.0\msvc_x86_64\. We use Chocolatey for an
+      # automated install; CMake finds it via the GSTREAMER_1_0_ROOT_MSVC_X86_64
+      # env var or pkg-config (which the dev install provides).
+      - name: install GStreamer (runtime + dev)
+        shell: pwsh
+        run: |
+          choco install -y --no-progress gstreamer gstreamer-devel
+          $env:Path = "C:\gstreamer\1.0\msvc_x86_64\bin;C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig;$env:Path"
+          echo "GSTREAMER_1_0_ROOT_MSVC_X86_64=C:\gstreamer\1.0\msvc_x86_64\" >> $env:GITHUB_ENV
+          echo "PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" >> $env:GITHUB_ENV
+          echo "C:\gstreamer\1.0\msvc_x86_64\bin" >> $env:GITHUB_PATH
+
+      - name: configure (desktop preset)
+        shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+        run: |
+          cmake -S . -B build/win-desktop `
+                -G "Visual Studio 17 2022" -A x64 `
+                -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+                -DVCPKG_TARGET_TRIPLET=x64-windows `
+                -DVCPKG_MANIFEST_FEATURES="server;mesh" `
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+                -DFB_BUILD_DESKTOP_CLIENT=ON `
+                -DFB_BUILD_SERVER=OFF `
+                -DFB_BUILD_TOOLS=OFF `
+                -DFB_BUILD_TESTS=OFF `
+                -DFB_ENABLE_SANITIZERS=OFF
+
+      - name: build
+        shell: pwsh
+        run: cmake --build build/win-desktop --config RelWithDebInfo --parallel
+
+      - name: collect desktop bundle
+        if: success()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path desktop-artifacts -Force | Out-Null
+          Get-ChildItem -Recurse -Path build/win-desktop `
+            -Filter fb_desktop.exe | ForEach-Object {
+            Copy-Item $_.FullName desktop-artifacts/
+          }
+          # Use windeployqt to pull in the Qt DLLs + plugins.
+          $exe = Resolve-Path desktop-artifacts/fb_desktop.exe
+          windeployqt --release --no-translations --no-system-d3d-compiler `
+                       --no-opengl-sw --dir desktop-artifacts $exe.Path
+          # Vcpkg + GStreamer DLLs the binary links against.
+          Get-ChildItem -Recurse -Path build/win-desktop -Include *.dll `
+            | ForEach-Object { Copy-Item $_.FullName desktop-artifacts/ -ErrorAction SilentlyContinue }
+          # GStreamer runtime is in C:\gstreamer\1.0\msvc_x86_64\bin
+          if (Test-Path "C:\gstreamer\1.0\msvc_x86_64\bin") {
+            Copy-Item "C:\gstreamer\1.0\msvc_x86_64\bin\*.dll" desktop-artifacts/ -ErrorAction SilentlyContinue
+          }
+          Copy-Item LICENSE, README.md, CHANGELOG.md, ROADMAP.md `
+                    desktop-artifacts/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path desktop-artifacts/* `
+                            -DestinationPath finbit-windows-x64-desktop.zip -Force
+          (Get-FileHash -Algorithm SHA256 finbit-windows-x64-desktop.zip).Hash.ToLower() `
+            + "  finbit-windows-x64-desktop.zip" `
+            | Out-File -Encoding ASCII finbit-windows-x64-desktop.zip.sha256
+
+      - name: upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: finbit-windows-x64-desktop-${{ github.sha }}
+          path: |
+            finbit-windows-x64-desktop.zip
+            finbit-windows-x64-desktop.zip.sha256
+          retention-days: 14
+
+      - name: publish to nightly release
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "FinBit nightly (head of main)"
+          prerelease: true
+          files: |
+            finbit-windows-x64-desktop.zip
+            finbit-windows-x64-desktop.zip.sha256
+          fail_on_unmatched_files: true
+          target_commitish: ${{ github.sha }}
+
+      - name: publish to v* tagged release
+        if: success() && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            finbit-windows-x64-desktop.zip
+            finbit-windows-x64-desktop.zip.sha256
+          fail_on_unmatched_files: true

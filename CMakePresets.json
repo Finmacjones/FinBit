@@ -43,7 +43,7 @@
                 "CMAKE_BUILD_TYPE": "RelWithDebInfo",
                 "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
                 "VCPKG_TARGET_TRIPLET": "x64-windows",
-                "VCPKG_MANIFEST_FEATURES": "server",
+                "VCPKG_MANIFEST_FEATURES": "server;mesh",
                 "FB_BUILD_DESKTOP_CLIENT": "OFF",
                 "FB_BUILD_SERVER": "ON",
                 "FB_BUILD_TOOLS": "ON",

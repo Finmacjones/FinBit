@@ -30,8 +30,11 @@ add_executable(fb_core_tests
     p2p/room_beacon_leak_test.cpp
 )
 
-# Serial-bridge test uses posix_openpt — POSIX-only. The bridge
-# itself is also gated out of fb_core on Windows.
+# Serial-bridge test uses posix_openpt + ptmx PTY plumbing — POSIX
+# only. The bridge IMPLEMENTATION compiles on Windows (Win32
+# CreateFile + DCB backend), but exercising it would need a CI
+# runner with a real COM port or a virtual loopback driver. The
+# Linux test stands in for the cross-platform contract.
 if(NOT WIN32)
     target_sources(fb_core_tests PRIVATE mesh/serial_bridge_test.cpp)
 endif()

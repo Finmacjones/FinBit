@@ -526,13 +526,21 @@ finbit-linux-x86_64-v1.0.1/bin/fb_server --help
 
 ### Windows x64
 
-`finbit-windows-x64.zip` contains `fb_server.exe`, `fb-cli.exe`, the
-vcpkg DLLs they link against (libsodium, protobuf, sqlite3, brotli,
-openssl, zlib), and the same LICENSE / README / CHANGELOG / ROADMAP
-docs. A `.sha256` sidecar verifies the download. The build is MSVC
-(Visual Studio 17 2022) on the `windows-latest` GitHub runner. The
-desktop GUI (Qt6 + GStreamer) and mesh bridge (POSIX termios) are
-not included in v1.x — tracked in `docs/windows-port-status.md`.
+Two Windows artifacts ship per release:
+
+- **`finbit-windows-x64.zip`** — server + CLI bundle: `fb_server.exe`,
+  `fb-cli.exe`, the vcpkg DLLs they link against (libsodium,
+  protobuf, sqlite3, brotli, openssl, zlib, paho-mqtt for the mesh
+  feature), and the LICENSE / README / CHANGELOG / ROADMAP docs.
+- **`finbit-windows-x64-desktop.zip`** — Qt6 chat GUI + GStreamer
+  voice/video stack: `fb_desktop.exe` plus the Qt platform plugins
+  (via `windeployqt`) and the GStreamer runtime DLLs. The desktop
+  build is newer and currently `continue-on-error` while it
+  stabilises — see `docs/windows-port-status.md` for the per-feature
+  status table.
+
+Both have `.sha256` sidecars to verify the download. The build is
+MSVC (Visual Studio 17 2022) on the `windows-latest` GitHub runner.
 
 Tagged release:
 

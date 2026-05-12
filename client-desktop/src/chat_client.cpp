@@ -2,10 +2,19 @@
 #include "chat_client.hpp"
 
 #include <sodium.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  pragma comment(lib, "Ws2_32.lib")
+#else
+#  include <sys/select.h>
+#  include <sys/socket.h>
+#  include <sys/types.h>
+#  include <unistd.h>
+#endif
 
 #include <QMetaObject>
 #include <QString>
@@ -137,6 +146,15 @@ struct Conn {
     // existing read_some convention used in chat_client.
     std::size_t read_some(std::span<std::uint8_t> out, int timeout_ms) {
         if (tls) return tls->blocking_read(out, timeout_ms);
+#if defined(_WIN32)
+        WSAPOLLFD pfd{};
+        pfd.fd = static_cast<SOCKET>(
+            static_cast<std::uintptr_t>(sock->fd()));
+        pfd.events  = POLLRDNORM;
+        pfd.revents = 0;
+        const int sel = WSAPoll(&pfd, 1, timeout_ms);
+        if (sel <= 0) return 0;
+#else
         timeval tv{};
         tv.tv_sec  = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000;
@@ -145,6 +163,7 @@ struct Conn {
         FD_SET(sock->fd(), &rs);
         const int sel = ::select(sock->fd() + 1, &rs, nullptr, nullptr, &tv);
         if (sel <= 0) return 0;
+#endif
         const auto n = sock->read_some(out);
         if (n <= 0) return 0;
         return static_cast<std::size_t>(n);
