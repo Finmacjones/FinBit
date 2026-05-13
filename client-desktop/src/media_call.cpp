@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "media_call.hpp"
 
+#ifndef FB_HAVE_GSTREAMER
+#  define FB_HAVE_GSTREAMER 1
+#endif
+
+#if FB_HAVE_GSTREAMER
+
 #define GST_USE_UNSTABLE_API
 #include <gst/gst.h>
 #include <gst/app/app.h>
@@ -916,3 +922,62 @@ void MediaCall::_on_connection_state(int gst_state) {
 }
 
 }  // namespace fb::desktop
+
+#else  // FB_HAVE_GSTREAMER == 0
+
+// Chat-only build (Windows desktop until GStreamer for MSVC is fully
+// wired). Provide minimal stubs that match the .hpp signatures so the
+// rest of the client links cleanly. Every method is a no-op except
+// state inspection; calling start_outgoing / accept_incoming simply
+// emits log() to surface the limitation to the user.
+
+namespace fb::desktop {
+
+struct MediaCall::Impl {};
+
+MediaCall::MediaCall(QObject* parent)
+    : QObject(parent), impl_(std::make_unique<Impl>()) {}
+MediaCall::~MediaCall() = default;
+
+void MediaCall::set_sframe_context(
+    const std::array<std::uint8_t, 32>&,
+    const std::array<std::uint8_t, 16>&) {}
+void* MediaCall::_sframe_ctx_raw() { return nullptr; }
+void* MediaCall::_webrtc_raw() const { return nullptr; }
+void MediaCall::_on_connection_state(int) {}
+
+void MediaCall::start_outgoing(
+    const std::array<std::uint8_t, 32>& peer_pub, bool /*with_video*/) {
+    peer_pub_ = peer_pub;
+    emit log("voice / video disabled — this build is chat-only "
+             "(GStreamer not available on this platform).");
+    set_state(State::kClosed);
+}
+
+void MediaCall::accept_incoming(bool /*with_video*/) {
+    emit log("voice / video disabled — this build is chat-only.");
+    set_state(State::kClosed);
+}
+
+void MediaCall::receive_offer(const QByteArray& sdp) {
+    pending_offer_ = sdp;
+}
+void MediaCall::receive_answer(const QByteArray&) {}
+void MediaCall::receive_ice(const QByteArray&) {}
+
+void MediaCall::set_self_muted(bool) {}
+void MediaCall::hangup(bool /*silent*/) {
+    set_state(State::kClosed);
+}
+
+void MediaCall::set_state(State s) {
+    if (state_ == s) return;
+    state_ = s;
+    emit stateChanged(s);
+}
+
+void MediaCall::emit_local_ice(const QString&, const QString&, int) {}
+
+}  // namespace fb::desktop
+
+#endif  // FB_HAVE_GSTREAMER

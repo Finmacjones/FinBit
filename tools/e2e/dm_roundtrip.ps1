@@ -95,19 +95,28 @@ try {
     $bob.WaitForExit(8000) | Out-Null
     if (-not $bob.HasExited) { $bob.Kill() }
 
-    # Assertions.
+    # Always dump captured output before assertions — makes a failed
+    # run self-diagnosing without needing a re-run with extra logs.
+    Write-Host ""
+    Write-Host "== captured output =="
+    Write-Host "-- bob.stdout --"
+    Get-Content $bobOut    -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+    Write-Host "-- bob.stderr --"
+    Get-Content $bobErr    -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+    Write-Host "-- alice.stdout --"
+    Get-Content $aliceOut  -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+    Write-Host "-- alice.stderr --"
+    Get-Content $aliceErr  -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+    Write-Host "-- server.log (stdout) --"
+    Get-Content $serverLog -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
+    Write-Host "-- server.log.stderr --"
+    Get-Content "$serverLog.stderr" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
     Write-Host ""
     Write-Host "== checks =="
+
     $bobStdout = Get-Content $bobOut -Raw -ErrorAction SilentlyContinue
     if (-not $bobStdout -or -not $bobStdout.Contains("MSG: $Marker")) {
-        Write-Host "FAIL: bob did not decrypt the marker" -ForegroundColor Red
-        Write-Host "  bob.stdout:"
-        Get-Content $bobOut -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
-        Write-Host "  bob.stderr:"
-        Get-Content $bobErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
-        Write-Host "  alice.stderr:"
-        Get-Content $aliceErr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
-        throw "decrypt failed"
+        throw "FAIL: bob did not decrypt the marker (see captured output above)"
     }
     Write-Host "  OK bob received MSG: $Marker"
 
@@ -117,10 +126,7 @@ try {
     $serverContents = (Get-Content $serverLog -Raw -ErrorAction SilentlyContinue) +
                        (Get-Content "$serverLog.stderr" -Raw -ErrorAction SilentlyContinue)
     if ($serverContents -and $serverContents.Contains($Marker)) {
-        Write-Host "FAIL: server log contained plaintext marker — server is NOT blind!" `
-                   -ForegroundColor Red
-        Get-Content $serverLog -ErrorAction SilentlyContinue
-        throw "server-blindness assertion failed"
+        throw "FAIL: server log contained plaintext marker — server is NOT blind! (see captured output above)"
     }
     Write-Host "  OK server log never saw plaintext"
 

@@ -28,10 +28,7 @@
             ]
         },
         "mls": {
-            "description": "Build with MLS group crypto (mlspp)",
-            "dependencies": [
-                "mlspp"
-            ]
+            "description": "Build with MLS group crypto. mlspp is vendored under third_party/ via scripts/fetch-mlspp.{sh,ps1} (cisco/mlspp is not a stable vcpkg port), so this feature pulls no extra vcpkg deps — it just exists so callers can ask for the mls feature symmetrically with the other features."
         },
         "tests": {
             "description": "Build the gtest suite",

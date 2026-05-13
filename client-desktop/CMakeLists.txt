@@ -12,18 +12,35 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # GStreamer is the media backend for 1:1 voice/video. We pull the bare
-# minimum: gstreamer-1.0 (core), gstreamer-sdp-1.0 (parsing SDP from the
-# peer), gstreamer-webrtc-1.0 (webrtcbin element). The actual element
-# implementations live in gst-plugins-base / good / bad / ugly — they're
-# loaded at runtime so cmake doesn't need to find them, but the build
-# scripts list them in the README so packagers know what to install.
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
-    gstreamer-1.0
-    gstreamer-app-1.0
-    gstreamer-sdp-1.0
-    gstreamer-webrtc-1.0
-)
+# minimum: gstreamer-1.0 (core), gstreamer-sdp-1.0 (parsing SDP from
+# the peer), gstreamer-webrtc-1.0 (webrtcbin element). The actual
+# element implementations live in gst-plugins-base / good / bad /
+# ugly — they're loaded at runtime.
+#
+# OPTIONAL on Windows. Chocolatey's gstreamer-devel ships pkgconfig
+# files at C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig\ but the
+# Windows MSI install sometimes lands without the .pc files (depends
+# on installer version). When pkg-config can't find GStreamer we
+# build a chat-only desktop client (no voice/video buttons) — better
+# than failing the entire Windows desktop build.
+find_package(PkgConfig)
+set(FB_HAVE_GSTREAMER 0)
+if(PkgConfig_FOUND)
+    pkg_check_modules(GSTREAMER IMPORTED_TARGET
+        gstreamer-1.0
+        gstreamer-app-1.0
+        gstreamer-sdp-1.0
+        gstreamer-webrtc-1.0
+    )
+    if(GSTREAMER_FOUND)
+        set(FB_HAVE_GSTREAMER 1)
+        message(STATUS "client-desktop: GStreamer ${GSTREAMER_VERSION} — voice/video enabled")
+    else()
+        message(STATUS "client-desktop: GStreamer not found — building chat-only (no voice/video)")
+    endif()
+else()
+    message(STATUS "client-desktop: pkg-config not found — building chat-only (no voice/video)")
+endif()
 
 add_executable(fb_desktop
     src/main.cpp
@@ -38,6 +55,7 @@ add_executable(fb_desktop
     src/bip39.cpp
     src/bip39_wordlist.cpp
 )
+target_compile_definitions(fb_desktop PRIVATE FB_HAVE_GSTREAMER=${FB_HAVE_GSTREAMER})
 
 # libsodium is already a dependency of fb_core (transitively for the
 # Identity / AEAD primitives) — but identity_vault.cpp pulls it in directly
@@ -55,10 +73,12 @@ target_link_libraries(fb_desktop
     PRIVATE
         fb::core
         ${_sodium_target}
-        PkgConfig::GSTREAMER
         Qt6::Core
         Qt6::Gui
         Qt6::Widgets
         Qt6::Concurrent
 )
+if(FB_HAVE_GSTREAMER)
+    target_link_libraries(fb_desktop PRIVATE PkgConfig::GSTREAMER)
+endif()
 target_compile_features(fb_desktop PRIVATE cxx_std_20)
