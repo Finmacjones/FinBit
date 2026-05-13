@@ -93,12 +93,27 @@ try {
 
     # Wait for bob to print the message + exit.
     $bob.WaitForExit(8000) | Out-Null
-    if (-not $bob.HasExited) { $bob.Kill() }
+    if (-not $bob.HasExited) {
+        Write-Host "##[warning]bob did not exit within 8 s; force-killing"
+        $bob.Kill()
+    }
+    # Small drain interval — Start-Process holds the redirect handle
+    # briefly after the child exits on Windows; giving it 300 ms lets
+    # the OS flush the last buffered writes before we read.
+    Start-Sleep -Milliseconds 300
 
     # Always dump captured output before assertions — makes a failed
     # run self-diagnosing without needing a re-run with extra logs.
     Write-Host ""
     Write-Host "== captured output =="
+    foreach ($f in @($bobOut, $bobErr, $aliceOut, $aliceErr, $serverLog, "$serverLog.stderr")) {
+        if (Test-Path $f) {
+            $sz = (Get-Item $f).Length
+            Write-Host "  $(Split-Path -Leaf $f): $sz bytes"
+        } else {
+            Write-Host "  $(Split-Path -Leaf $f): MISSING"
+        }
+    }
     Write-Host "-- bob.stdout --"
     Get-Content $bobOut    -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $_" }
     Write-Host "-- bob.stderr --"
@@ -114,7 +129,15 @@ try {
     Write-Host ""
     Write-Host "== checks =="
 
-    $bobStdout = Get-Content $bobOut -Raw -ErrorAction SilentlyContinue
+    # Use [System.IO.File]::ReadAllText to bypass Get-Content's BOM /
+    # encoding heuristics — fb-cli writes plain ASCII, but Powershell's
+    # Get-Content has historically misread UTF-8-without-BOM as ASCII
+    # and dropped trailing bytes.
+    function Read-All([string]$p) {
+        if (-not (Test-Path $p)) { return "" }
+        return [System.IO.File]::ReadAllText($p)
+    }
+    $bobStdout = Read-All $bobOut
     if (-not $bobStdout -or -not $bobStdout.Contains("MSG: $Marker")) {
         throw "FAIL: bob did not decrypt the marker (see captured output above)"
     }
@@ -123,8 +146,7 @@ try {
     # Server log must NOT contain the plaintext marker — the relay is
     # supposed to be blind to envelope contents. Same canary test the
     # Linux e2e runs.
-    $serverContents = (Get-Content $serverLog -Raw -ErrorAction SilentlyContinue) +
-                       (Get-Content "$serverLog.stderr" -Raw -ErrorAction SilentlyContinue)
+    $serverContents = (Read-All $serverLog) + (Read-All "$serverLog.stderr")
     if ($serverContents -and $serverContents.Contains($Marker)) {
         throw "FAIL: server log contained plaintext marker — server is NOT blind! (see captured output above)"
     }

@@ -28,7 +28,10 @@
             ]
         },
         "mls": {
-            "description": "Build with MLS group crypto. mlspp is vendored under third_party/ via scripts/fetch-mlspp.{sh,ps1} (cisco/mlspp is not a stable vcpkg port), so this feature pulls no extra vcpkg deps — it just exists so callers can ask for the mls feature symmetrically with the other features."
+            "description": "Build with MLS group crypto. mlspp itself is vendored under third_party/ via scripts/fetch-mlspp.{sh,ps1} (cisco/mlspp has no stable vcpkg port). Its CMakeLists, however, hard-requires nlohmann_json — that's what's pulled here.",
+            "dependencies": [
+                "nlohmann-json"
+            ]
         },
         "tests": {
             "description": "Build the gtest suite",
