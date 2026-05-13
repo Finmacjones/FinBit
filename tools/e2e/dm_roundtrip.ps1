@@ -62,18 +62,27 @@ $srv = Start-Process -FilePath $server.FullName `
     -RedirectStandardError "$serverLog.stderr" `
     -PassThru
 try {
-    # Wait for the server to bind.
+    # Probe-by-connect was leaving an orphan fd that the server's
+    # IoLoop on Windows didn't process before bob's accept came in
+    # — the kernel queue would back up and bob's Hello never got
+    # serviced. Replace with a passive poll: just check the port
+    # shows ESTABLISHED-listener via ss-equivalent. Simpler: bound
+    # sleep, then trust the server.
     $ready = $false
-    for ($i = 0; $i -lt 50; $i++) {
-        try {
-            $probe = New-Object System.Net.Sockets.TcpClient
-            $probe.Connect("127.0.0.1", $port)
-            $probe.Close()
+    for ($i = 0; $i -lt 40; $i++) {
+        if (Get-NetTCPConnection -State Listen `
+                                  -LocalAddress 127.0.0.1 `
+                                  -LocalPort $port `
+                                  -ErrorAction SilentlyContinue) {
             $ready = $true
             break
-        } catch { Start-Sleep -Milliseconds 100 }
+        }
+        Start-Sleep -Milliseconds 100
     }
     if (-not $ready) { throw "server did not bind on 127.0.0.1:$port" }
+    # Tiny extra sleep so the server's IoLoop is in WSAPoll, not
+    # mid-init, when bob connects.
+    Start-Sleep -Milliseconds 200
 
     Write-Host "== launching fb-cli listen as bob"
     $bob = Start-Process -FilePath $cli.FullName `

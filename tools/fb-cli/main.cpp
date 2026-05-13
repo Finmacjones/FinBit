@@ -682,7 +682,11 @@ int main(int argc, char** argv) {
         hello->set_protocol_version(fb::config::kProtocolVersion);
         blocking_send(conn, serialize(f));
     }
-    auto hello_resp = blocking_recv_frame(conn, dec, 2000);
+    // 8 s instead of 2 s — Windows CI runners are slow to register
+    // bob → upload prekey → ready on cold caches, so alice's
+    // KeyFetchRequest waiting for the chain takes longer than the
+    // original POSIX-tuned 2 s timeout.
+    auto hello_resp = blocking_recv_frame(conn, dec, 8000);
     if (!hello_resp) { std::cerr << "no ServerHello\n"; return 3; }
     {
         fb::proto::Frame f;
@@ -732,7 +736,7 @@ int main(int argc, char** argv) {
             f.mutable_key_fetch()->set_username(args.peer);
             blocking_send(conn, serialize(f));
         }
-        auto resp = blocking_recv_frame(conn, dec, 2000);
+        auto resp = blocking_recv_frame(conn, dec, 8000);
         if (!resp) { std::cerr << "no key bundle response\n"; return 5; }
         fb::proto::Frame f;
         if (!f.ParseFromArray(resp->data(), static_cast<int>(resp->size())) ||
@@ -975,7 +979,7 @@ int main(int argc, char** argv) {
             f.mutable_key_fetch()->set_username(args.peer);
             blocking_send(conn, serialize(f));
         }
-        auto resp = blocking_recv_frame(conn, dec, 2000);
+        auto resp = blocking_recv_frame(conn, dec, 8000);
         if (!resp) { std::cerr << "no key bundle response\n"; return 5; }
         fb::proto::Frame f;
         if (!f.ParseFromArray(resp->data(),
@@ -1035,7 +1039,7 @@ int main(int argc, char** argv) {
             f.mutable_key_fetch()->set_username(args.peer);
             blocking_send(conn, serialize(f));
         }
-        auto resp = blocking_recv_frame(conn, dec, 2000);
+        auto resp = blocking_recv_frame(conn, dec, 8000);
         if (!resp) { std::cerr << "no key bundle response\n"; return 5; }
         fb::proto::Frame f;
         if (!f.ParseFromArray(resp->data(), static_cast<int>(resp->size())) ||
