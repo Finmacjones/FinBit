@@ -50,7 +50,13 @@ if (Test-Path $patchDir) {
         Write-Host "== applying $($p.Name)"
         Push-Location $Target
         try {
-            & git apply --whitespace=nowarn $p.FullName
+            # --ignore-whitespace is belt-and-braces against any
+            # CRLF that slipped past .gitattributes (windows-latest
+            # runners default to core.autocrlf=true). The patch
+            # itself is pinned eol=lf so this should never bite,
+            # but if it does we don't want a one-byte difference
+            # to fail the whole MLS build.
+            & git apply --whitespace=nowarn --ignore-whitespace $p.FullName
             if ($LASTEXITCODE -ne 0) {
                 throw "git apply of $($p.Name) failed (exit $LASTEXITCODE)"
             }

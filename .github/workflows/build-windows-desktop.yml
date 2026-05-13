@@ -54,14 +54,23 @@ jobs:
       # Qt6 via the official jurplel install action — this avoids
       # the multi-GB vcpkg qt6 port and gets us the upstream pre-built
       # binaries that match what end-users would install themselves.
+      - name: install Python 3.11 for Qt install action
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: install Qt 6
         uses: jurplel/install-qt-action@v4
         with:
-          version: 6.7.3
+          # Qt 6.5.3 is the LTS available on every host/arch matrix
+          # the install action ships with — newer Qt versions
+          # (6.7.x, 6.8.x) sometimes ship without the win64_msvc2022_64
+          # archive yet on the action's manifest, triggering the
+          # "python.exe exit code 1" failure observed on run #1.
+          version: '6.5.3'
           host: windows
           target: desktop
-          arch: win64_msvc2022_64
-          modules: ''     # no extra modules — Core/Gui/Widgets/Concurrent ship in base
+          arch: win64_msvc2019_64    # binary-compatible with VS 2022 cl.exe
           cache: true
 
       # GStreamer for Windows. The MSI installer from

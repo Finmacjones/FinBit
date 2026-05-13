@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Cross-platform line-ending policy.
+#
+# Default: let Git infer text vs binary per file and respect each
+# platform's native line endings on checkout (LF on POSIX, CRLF on
+# Windows). That keeps source code editable in both environments.
+* text=auto
+
+# Exceptions
+#
+# Patch files for the vendored mlspp dependency MUST stay LF
+# regardless of host. `git apply` does byte-literal matching against
+# the upstream source (which is LF) — a CRLF patch file fails with
+# "patch failed: file:line" even though the diff is otherwise valid.
+# This bit us when fetch-mlspp.ps1 ran on a windows-latest runner.
+scripts/mlspp-patches/*.patch text eol=lf
+
+# Shell scripts run with bash on the GitHub runner; CRLF would
+# trigger "bad interpreter: /bin/bash^M" on the first line.
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# Generated protobuf C++ headers and source — we don't check these
+# in, but if anyone ever does, treat them as plain text with
+# platform-native EOLs. Listed for completeness, not enforcement.
+*.pb.h  text
+*.pb.cc text
