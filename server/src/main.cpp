@@ -302,6 +302,12 @@ void send_server_hello(fb::net::IoLoop& loop, Conn& c, bool ok, const std::strin
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Unbuffered stderr so logs land in real time when captured by
+    // a parent process (CI runner, supervisord, etc.). See the
+    // matching note in tools/fb-cli/main.cpp.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
     std::string bind_host = "127.0.0.1";
     std::uint16_t port = 8765;
     std::uint16_t ws_port = 0;       // 0 = disabled

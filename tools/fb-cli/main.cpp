@@ -470,6 +470,17 @@ std::optional<std::vector<std::uint8_t>> blocking_recv_frame(Conn& c,
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Disable C-runtime stdout/stderr buffering. When a parent process
+    // captures our output via Start-Process -RedirectStandardOutput on
+    // Windows (e.g. tools/e2e/dm_roundtrip.ps1), the C++ iostream's
+    // std::endl correctly flushes the C++ buffer — but the underlying
+    // FILE* is fully-buffered (4 KB) when redirected to a non-tty,
+    // and that buffer only flushes at exit. With --wait-ms still in
+    // its loop, the "MSG:" line can sit in the FILE* buffer for
+    // seconds. _IONBF makes every write go straight through.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
     Args args;
     if (!parse(argc, argv, args)) {
         usage();

@@ -121,7 +121,12 @@ jobs:
 
       - name: build
         shell: pwsh
-        run: cmake --build build/win-desktop --config RelWithDebInfo --parallel
+        run: |
+          # /v:n (verbosity normal) surfaces compile-error lines that
+          # MSBuild swallows at /v:minimal. With this, the next CI run
+          # shows the actual MSVC error text in the step log.
+          cmake --build build/win-desktop --config RelWithDebInfo --parallel `
+                -- /v:n /nologo /m
 
       - name: collect desktop bundle
         if: success()

@@ -2,8 +2,13 @@
 #include "identity_vault.hpp"
 
 #include <sodium.h>
-#include <unistd.h>      // fsync
-#include <cstdio>        // ::rename
+#if defined(_WIN32)
+#  include <io.h>         // _commit
+#  include <windows.h>    // MoveFileExA, MOVEFILE_REPLACE_EXISTING
+#else
+#  include <unistd.h>     // fsync
+#endif
+#include <cstdio>        // ::rename (POSIX) / not used on Windows path
 #include <QFile>
 #include <QFileInfo>
 #include <QStandardPaths>
@@ -207,20 +212,34 @@ void save_vault_file(const QString& path, const VaultBlob& blob) {
         // us with a zero-byte vault. Falls back to no-op if QFileDevice::sync
         // isn't available (it is in Qt 5+).
         f.flush();
+#if defined(_WIN32)
+        // Windows: _commit(handle) flushes the file's kernel buffer
+        // to disk — equivalent to POSIX fsync(2). QFile::handle()
+        // returns the underlying file descriptor on both targets.
+        ::_commit(f.handle());
+#else
         ::fsync(f.handle());
+#endif
         f.close();
     }
-    // ::rename(2) is atomic when source and destination are on the same
-    // filesystem AND it overwrites the destination atomically (POSIX
-    // requirement). Use the libc call directly rather than QFile::rename,
-    // which on Qt6 still does a remove-then-rename (the very pattern that
-    // leaves the user with no vault on a power loss between the two).
+    // POSIX rename(2) overwrites atomically when src+dst are on the same
+    // filesystem (mandated by POSIX). Windows rename() FAILS if the
+    // destination exists — use MoveFileExA with MOVEFILE_REPLACE_EXISTING
+    // for the same atomic semantics.
     const QByteArray src_bytes = QFile::encodeName(tmp);
     const QByteArray dst_bytes = QFile::encodeName(path);
+#if defined(_WIN32)
+    if (!::MoveFileExA(src_bytes.constData(), dst_bytes.constData(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        QFile::remove(tmp);
+        throw std::runtime_error("save_vault_file: atomic rename failed");
+    }
+#else
     if (::rename(src_bytes.constData(), dst_bytes.constData()) != 0) {
         QFile::remove(tmp);
         throw std::runtime_error("save_vault_file: atomic rename failed");
     }
+#endif
 }
 
 void remove_vault_file(const QString& path) {

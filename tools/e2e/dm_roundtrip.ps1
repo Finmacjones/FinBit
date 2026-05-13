@@ -77,11 +77,15 @@ try {
 
     Write-Host "== launching fb-cli listen as bob"
     $bob = Start-Process -FilePath $cli.FullName `
-        -ArgumentList @("--user", "bob", "--listen", "--wait-ms", "5000",
+        -ArgumentList @("--user", "bob", "--listen", "--wait-ms", "12000",
                          "--server", "127.0.0.1:$port") `
         -RedirectStandardOutput $bobOut `
         -RedirectStandardError $bobErr `
-        -PassThru    Start-Sleep -Milliseconds 400
+        -PassThru
+    # Windows CI runners are slower than Linux for the
+    # register → upload-prekey → ready cycle. 400 ms was sometimes
+    # not enough; 1.5 s is generous.
+    Start-Sleep -Milliseconds 1500
 
     Write-Host "== launching fb-cli send as alice"
     $alice = Start-Process -FilePath $cli.FullName `
@@ -92,7 +96,8 @@ try {
         -PassThru -WindowStyle Hidden -Wait
 
     # Wait for bob to print the message + exit.
-    $bob.WaitForExit(8000) | Out-Null
+    # bob.exe --wait-ms 12000 self-exits after 12 s; give it 15 s.
+    $bob.WaitForExit(15000) | Out-Null
     if (-not $bob.HasExited) {
         Write-Host "##[warning]bob did not exit within 8 s; force-killing"
         $bob.Kill()
