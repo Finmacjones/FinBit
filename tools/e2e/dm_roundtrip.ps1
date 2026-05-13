@@ -134,13 +134,24 @@ try {
     Write-Host ""
     Write-Host "== checks =="
 
-    # Use [System.IO.File]::ReadAllText to bypass Get-Content's BOM /
-    # encoding heuristics — fb-cli writes plain ASCII, but Powershell's
-    # Get-Content has historically misread UTF-8-without-BOM as ASCII
-    # and dropped trailing bytes.
+    # Read each file via FileShare.ReadWrite — fb_server.exe is still
+    # holding the log handle open at this point (we kill it in the
+    # finally block, not here). Powershell's [System.IO.File]::ReadAllText
+    # opens with FileShare.None by default, which throws "process cannot
+    # access the file" when the writer is still alive.
     function Read-All([string]$p) {
         if (-not (Test-Path $p)) { return "" }
-        return [System.IO.File]::ReadAllText($p)
+        $fs = [System.IO.File]::Open(
+            $p,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite)
+        try {
+            $sr = New-Object System.IO.StreamReader($fs)
+            return $sr.ReadToEnd()
+        } finally {
+            $fs.Close()
+        }
     }
     $bobStdout = Read-All $bobOut
     if (-not $bobStdout -or -not $bobStdout.Contains("MSG: $Marker")) {

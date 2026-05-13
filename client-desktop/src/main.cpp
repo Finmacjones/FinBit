@@ -9,7 +9,7 @@
 #include <QPushButton>
 #include <QTimer>
 #include <cstdlib>
-#include <stdlib.h>   // random()
+#include <sodium.h>    // randombytes_buf (cross-platform; replaces POSIX random())
 
 #include "discord_theme.hpp"
 #include "identity_vault.hpp"
@@ -74,7 +74,12 @@ int main(int argc, char* argv[]) {
             // a fresh seed, seal it under the given passphrase, persist
             // the vault, and proceed. Useful for headless smoke tests
             // that need to spin up brand-new identities each run.
-            for (auto& b : seed) b = static_cast<std::uint8_t>(random());
+            // Test-only seed for FB_AUTO_REGISTER smoke runs — no
+            // crypto strength required, just needs to be non-zero
+            // and varied. libsodium's randombytes_buf is portable
+            // and already linked (replaces POSIX random() which
+            // doesn't exist on Windows).
+            randombytes_buf(seed.data(), seed.size());
             auto fresh_blob = fb::desktop::seal_seed(
                 QString::fromUtf8(auto_pass), seed);
             fb::desktop::save_vault_file(path, fresh_blob);

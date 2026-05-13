@@ -131,6 +131,18 @@ struct Conn {
         }
         std::size_t off = 0;
         while (off < data.size()) {
+#if defined(_WIN32)
+            const int n = ::send(
+                static_cast<SOCKET>(static_cast<std::uintptr_t>(sock->fd())),
+                reinterpret_cast<const char*>(data.data() + off),
+                static_cast<int>(data.size() - off), 0);
+            if (n == SOCKET_ERROR) {
+                const int err = WSAGetLastError();
+                if (err == WSAEINTR) continue;
+                throw std::runtime_error("send: WSA error " +
+                                          std::to_string(err));
+            }
+#else
             const auto n = ::send(sock->fd(), data.data() + off,
                                    data.size() - off, MSG_NOSIGNAL);
             if (n < 0) {
@@ -138,6 +150,7 @@ struct Conn {
                 throw std::runtime_error(std::string("send: ") +
                                           std::strerror(errno));
             }
+#endif
             off += static_cast<std::size_t>(n);
         }
     }
