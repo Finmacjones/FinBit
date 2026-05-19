@@ -971,12 +971,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             }
 
             // Seed the DHT routing table from the bootstrap file
-            // (FB_BOOTSTRAP_FILE / XDG_CONFIG / $HOME/.finbit).
-            // Without this, the routing table starts empty and
-            // publish() / lookup() can't reach anyone until the
-            // first inbound PeerEnvelope teaches us about a peer.
+            // (FB_BOOTSTRAP_FILE / XDG_CONFIG / $HOME/.finbit) AND,
+            // when FB_BOOTSTRAP_DOH=<name> is set, from DNS-over-HTTPS
+            // TXT records. Either source can be empty without breaking
+            // the other — the union is what gets seeded.
             try {
-                auto bs = fb::p2p::load_default_bootstrap();
+                auto bs = fb::p2p::load_default_bootstrap_all();
                 for (const auto& p : bs.peers) {
                     impl_->dht->routing().observe(p);
                 }

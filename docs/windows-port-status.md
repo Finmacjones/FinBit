@@ -93,6 +93,8 @@ take the alternate branch.
 | `core/src/mesh/serial_bridge.cpp` | `termios` + `select()` | `CreateFileA("\\\\.\\COMx")` + DCB + `SetCommTimeouts` (100ms read window matches POSIX poll) + `ReadFile`/`WriteFile` |
 | `server/src/main.cpp` | epoll via IoLoop + `getifaddrs` + `signal()` | IoLoop Windows backend + `GetAdaptersAddresses` + `SetConsoleCtrlHandler` |
 | `tools/fb-cli/main.cpp` | `select()` + `signal()` + `MSG_NOSIGNAL` send | `WSAPoll` + `SetConsoleCtrlHandler` + Winsock send |
+| `core/src/net/doh_resolver.cpp` | TlsClient + system CA bundle | identical (TlsClient already cross-platform) |
+| `core/src/p2p/bootstrap.cpp` (DoH) | env-driven `FB_BOOTSTRAP_DOH` | identical |
 
 ## CMake / vcpkg
 

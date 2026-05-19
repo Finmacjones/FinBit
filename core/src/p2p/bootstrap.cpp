@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/p2p/bootstrap.hpp"
 
+#include "fb/net/doh_resolver.hpp"
+
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace fb::p2p {
 
@@ -123,6 +126,48 @@ BootstrapParseResult load_default_bootstrap() {
         if (!r.peers.empty() || r.malformed_lines > 0) return r;
     }
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// DoH-based bootstrap source (censorship resistance)
+// ---------------------------------------------------------------------------
+
+BootstrapParseResult load_doh_bootstrap() {
+    const char* q = std::getenv("FB_BOOTSTRAP_DOH");
+    if (!q || !*q) return {};
+    const auto peers = fb::net::resolve_finbit_bootstrap_default(q);
+    BootstrapParseResult r;
+    r.peers = peers;
+    return r;
+}
+
+BootstrapParseResult load_default_bootstrap_all() {
+    auto file_r = load_default_bootstrap();
+    auto doh_r  = load_doh_bootstrap();
+
+    // De-duplicate by pubkey (32-byte vector → hex string for set).
+    BootstrapParseResult out;
+    out.malformed_lines = file_r.malformed_lines + doh_r.malformed_lines;
+    std::unordered_set<std::string> seen;
+    auto key = [](const PeerInfo& p) {
+        std::string k(p.pubkey.size() * 2, '0');
+        static const char hex[] = "0123456789abcdef";
+        for (std::size_t i = 0; i < p.pubkey.size(); ++i) {
+            k[i * 2]     = hex[(p.pubkey[i] >> 4) & 0xf];
+            k[i * 2 + 1] = hex[p.pubkey[i] & 0xf];
+        }
+        return k;
+    };
+    auto consume = [&](BootstrapParseResult& src) {
+        for (auto& p : src.peers) {
+            if (seen.insert(key(p)).second) {
+                out.peers.push_back(std::move(p));
+            }
+        }
+    };
+    consume(file_r);
+    consume(doh_r);
+    return out;
 }
 
 }  // namespace fb::p2p

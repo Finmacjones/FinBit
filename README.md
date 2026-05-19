@@ -162,6 +162,14 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
     `$FB_BOOTSTRAP_FILE` / XDG / `/etc/finbit/`) seeds the routing
     table on startup. One peer per line: `<hex-pubkey-32>  <addr>`
     with `#` comments allowed.
+  - **DoH bootstrap** (censorship-resistance) —
+    `FB_BOOTSTRAP_DOH=<query-name>` resolves `_finbit.<name>` TXT
+    records via DNS-over-HTTPS to Cloudflare / Google / Quad9.
+    Record format: `"fb1 ed25519:<hex32> wss://host:443[#<sha256fp>]"`.
+    Looks like normal HTTPS traffic on the wire — a censor would have
+    to block every public DoH provider to block the lookup. See
+    [`docs/censorship-resistance.md`](docs/censorship-resistance.md)
+    for the full threat model.
   - **Periodic cadence** — `republish_self` rotates our own
     provider record before its TTL expires (default every 30
     minutes; TTL is 1 hour). `gossip_pull_round` walks every

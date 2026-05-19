@@ -64,4 +64,40 @@ struct BootstrapParseResult {
 // or malformed paths are treated as "no bootstrap data".
 [[nodiscard]] BootstrapParseResult load_default_bootstrap();
 
+// =============================================================================
+// DoH bootstrap (censorship-resistance layer).
+//
+// Resolves peers via DNS-over-HTTPS TXT records under the `_finbit.`
+// prefix. The wire format for each TXT body matches the file-based
+// bootstrap line format:
+//
+//     fb1 ed25519:<hex32> <addr>
+//
+// Example DNS zone snippet:
+//
+//     _finbit.example.com.  300  IN  TXT  "fb1 ed25519:6fa3...c19e wss://relay-1.example.com:443"
+//     _finbit.example.com.  300  IN  TXT  "fb1 ed25519:b801...44df wss://relay-2.example.com:443"
+//
+// All TXT records under the same name are returned (the routing
+// table picks whichever is reachable).
+//
+// The DoH lookup is HTTPS-only to Cloudflare/Google/Quad9 — looks
+// like normal browser traffic to a passive observer. See
+// docs/censorship-resistance.md.
+//
+// Env var: FB_BOOTSTRAP_DOH=<query-name> drives this. Empty / unset
+// means no DoH lookup.
+// =============================================================================
+
+// Driven by FB_BOOTSTRAP_DOH. If the env var is unset/empty OR the
+// build doesn't have OpenSSL (FB_HAVE_OPENSSL=0), returns an empty
+// result. Never throws.
+[[nodiscard]] BootstrapParseResult load_doh_bootstrap();
+
+// Convenience: returns the UNION of load_default_bootstrap() (file)
+// and load_doh_bootstrap() (DNS-over-HTTPS). Duplicate peer pubkeys
+// from both sources are de-duplicated. This is the entry-point most
+// clients should call at startup.
+[[nodiscard]] BootstrapParseResult load_default_bootstrap_all();
+
 }  // namespace fb::p2p
