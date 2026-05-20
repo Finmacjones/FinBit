@@ -65,6 +65,22 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure --schedule-random
 
+      # End-to-end canaries against the freshly-built fb_server + fb-cli.
+      # These assert real cross-process behaviour the unit tests can't:
+      #   - dm_roundtrip        : a DM decrypts at the peer AND the server
+      #                           log never contains the plaintext (relay
+      #                           is blind).
+      #   - call_signal_roundtrip: the group-voice lazy session bootstrap
+      #                           (peer pubkey → username_lookup → key_fetch
+      #                           → init_alice → media_signal OFFER/ANSWER)
+      #                           completes for a never-DM'd peer, and the
+      #                           relay never sees the SDP.
+      # Both are pure bash + python3 (free-port picker) — no extra deps.
+      - name: e2e (server-blindness + call signaling)
+        run: |
+          bash tools/e2e/dm_roundtrip.sh build
+          bash tools/e2e/call_signal_roundtrip.sh build
+
       # -----------------------------------------------------------------
       # Bundle the three release binaries into a tarball with the LICENSE
       # so users can `wget` + extract + run.  Includes the runtime deps
