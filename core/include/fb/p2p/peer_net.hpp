@@ -59,6 +59,7 @@
 // =============================================================================
 
 #include "fb/p2p/kademlia.hpp"
+#include "fb/net/tls_client.hpp"   // fb::net::TlsFingerprint
 
 #include <cstdint>
 #include <functional>
@@ -136,6 +137,10 @@ struct PeerDialerOptions {
     // CDN routing.
     std::string front_sni;
     std::string ws_host_header;
+
+    // Tier-4: ClientHello fingerprint for outbound dials. Default
+    // kDefault; set kChrome/kFirefox to shape the JA3 toward a browser.
+    fb::net::TlsFingerprint tls_fingerprint = fb::net::TlsFingerprint::kDefault;
 };
 
 class PeerNet {

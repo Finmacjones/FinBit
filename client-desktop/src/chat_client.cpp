@@ -227,6 +227,17 @@ std::size_t conn_read_with_timeout(Conn& c, std::span<std::uint8_t> out,
     return c.read_some(out, timeout_ms);
 }
 
+// Map an FB_*_MIMIC value to a TLS fingerprint profile (Tier-4). Empty
+// falls back to Chrome when `default_chrome` (i.e. we're in a WSS
+// mimicry mode), else the OpenSSL default.
+fb::net::TlsFingerprint parse_fingerprint(const std::string& s, bool default_chrome) {
+    if (s == "chrome")  return fb::net::TlsFingerprint::kChrome;
+    if (s == "firefox") return fb::net::TlsFingerprint::kFirefox;
+    if (s == "off" || s == "none") return fb::net::TlsFingerprint::kDefault;
+    return default_chrome ? fb::net::TlsFingerprint::kChrome
+                          : fb::net::TlsFingerprint::kDefault;
+}
+
 // Compose the envelope-level AAD that's bound by the inner ratchet /
 // SenderKeys AEAD tag — `envelope_id (16) || timestamp_ms (8 BE)`.
 // Sender computes this once per envelope, passes it both as
@@ -496,6 +507,7 @@ struct ChatClient::Impl {
     // CDN routes to) — both independent of the connect host.
     std::string ws_front_sni;
     std::string ws_host_header;
+    fb::net::TlsFingerprint tls_fingerprint = fb::net::TlsFingerprint::kDefault;
     fb::net::FrameDecoder dec;
     // Serverless overlay state. Each peer holds its own username log
     // + DHT routing+provider store. Both layers' SendCallbacks wrap
@@ -673,6 +685,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
     // Tier-3 domain-fronting overrides (optional).
     if (const char* f = std::getenv("FB_FRONT_SNI")) impl_->ws_front_sni = f;
     if (const char* h = std::getenv("FB_WS_HOST"))   impl_->ws_host_header = h;
+    // Tier-4 JA3 mimicry: FB_TLS_MIMIC=chrome|firefox|off; defaults to
+    // chrome when we're connecting over WSS.
+    {
+        const char* m = std::getenv("FB_TLS_MIMIC");
+        impl_->tls_fingerprint = parse_fingerprint(m ? m : "", impl_->use_wss);
+    }
     impl_->worker = std::thread([this]() {
         try {
             if (sodium_init() < 0) {
@@ -846,6 +864,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                               env("FB_PEER_WSS") != "0";
             const std::string dialer_front  = env("FB_PEER_FRONT_SNI");
             const std::string dialer_wshost = env("FB_PEER_WS_HOST");
+            const std::string dialer_mimic  = env("FB_PEER_TLS_MIMIC");
             impl_->own_p2p_addr             = env("FB_PEER_PUBLIC_ADDR");
 
             // I4: parse FB_OFFLINE_RELAYS as a comma-separated list
@@ -983,6 +1002,8 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 dopts.wss                  = dialer_wss;
                 dopts.front_sni            = dialer_front;
                 dopts.ws_host_header       = dialer_wshost;
+                dopts.tls_fingerprint      = parse_fingerprint(
+                    dialer_mimic, /*default_chrome=*/dialer_wss);
                 impl_->peer_net->set_dialer(dopts);
                 // Inbound: stash on the overlay queue so the worker
                 // thread (this same thread, in its main poll loop)
@@ -1059,6 +1080,8 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 // SNI when set; that's what a passive observer sees.
                 tlsopts.sni_hostname         = impl_->ws_front_sni.empty()
                     ? impl_->tls_sni : impl_->ws_front_sni;
+                // Tier-4: browser JA3 ClientHello shaping.
+                tlsopts.tls_fingerprint      = impl_->tls_fingerprint;
                 if (impl_->tls_insecure_skip_verify) {
                     emit log(QString(
                         "WARNING: TLS cert validation disabled "

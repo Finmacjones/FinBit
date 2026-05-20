@@ -144,6 +144,8 @@ struct Args {
     std::string ws_host;            // Tier-3 domain-fronting: WS Host
                                     // header (real backend), independent
                                     // of the SNI/front and connect host
+    std::string mimic;              // Tier-4 JA3: "chrome"|"firefox"|"off"
+                                    // (empty => chrome when --wss is set)
 
     // Overlay relay test (N1): exercises the server-relayed
     // PeerEnvelope path without standing up the full DhtNode /
@@ -188,6 +190,8 @@ void usage() {
               << "                        (alias for --tls-sni; the censor sees only this)\n"
               << "  --ws-host HOST        Tier-3 domain-fronting: WS Host header = real backend\n"
               << "                        (what the CDN routes to; defaults to --server host)\n"
+              << "  --mimic WHICH         Tier-4 JA3: chrome|firefox|off browser ClientHello\n"
+              << "                        fingerprint (defaults to chrome when --wss is set)\n"
               << "Default URL constant: " << fb::config::kDefaultServerUrl << "\n";
 }
 
@@ -247,6 +251,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (s == "--tls-sni") { if (!next(a.tls_sni)) return false; }
         else if (s == "--front") { if (!next(a.tls_sni)) return false; }
         else if (s == "--ws-host") { if (!next(a.ws_host)) return false; }
+        else if (s == "--mimic") { if (!next(a.mimic)) return false; }
         else if (s == "--overlay-send") { a.overlay_send = true; }
         else if (s == "--overlay-recv") { a.overlay_recv = true; }
         else if (s == "--overlay-kind") {
@@ -700,6 +705,15 @@ int main(int argc, char** argv) {
         tlsopts.ca_file = args.tls_ca;
         tlsopts.insecure_skip_verify = args.tls_insecure_skip_verify;
         tlsopts.sni_hostname = args.tls_sni;
+        // Tier-4 JA3 mimicry. Explicit --mimic wins; otherwise default
+        // to Chrome whenever we're in WSS mimicry mode, off otherwise.
+        {
+            std::string m = args.mimic;
+            if (m.empty()) m = args.wss ? "chrome" : "off";
+            if (m == "chrome")  tlsopts.tls_fingerprint = fb::net::TlsFingerprint::kChrome;
+            else if (m == "firefox") tlsopts.tls_fingerprint = fb::net::TlsFingerprint::kFirefox;
+            else tlsopts.tls_fingerprint = fb::net::TlsFingerprint::kDefault;
+        }
         if (args.tls_insecure_skip_verify) {
             std::fprintf(stderr,
                 "[fb-cli] WARNING: --tls-insecure-skip-verify — server "

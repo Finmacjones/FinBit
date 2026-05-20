@@ -339,6 +339,10 @@ resolve_finbit_bootstrap(
         TlsClient tls;
         TlsClientOptions opts;
         opts.sni_hostname = endpoint.host;
+        // Tier-4: the DoH request always goes to a big public provider
+        // (Cloudflare/Google/Quad9) over 443 — present a Chrome JA3 so
+        // it blends in with ordinary browser DNS-over-HTTPS traffic.
+        opts.tls_fingerprint = TlsFingerprint::kChrome;
         // DoH endpoints use real certs from public CAs — the system
         // bundle validates them. No insecure_skip_verify here.
         if (!endpoint.pinned_sha256.empty() &&

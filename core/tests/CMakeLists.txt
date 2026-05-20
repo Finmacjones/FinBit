@@ -13,6 +13,7 @@ add_executable(fb_core_tests
     net/websocket_test.cpp
     net/ws_client_test.cpp
     net/doh_resolver_test.cpp
+    net/tls_fingerprint_test.cpp
     store/sqlite_store_test.cpp
     identity/username_log_test.cpp
     identity/username_gossip_test.cpp

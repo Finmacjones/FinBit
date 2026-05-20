@@ -745,6 +745,7 @@ bool PeerNet::send(const PeerInfo& peer,
                     // otherwise the SNI is the dialed host.
                     topts.sni_hostname         = dialer_opts.front_sni.empty()
                         ? host : dialer_opts.front_sni;
+                    topts.tls_fingerprint      = dialer_opts.tls_fingerprint;
                     topts.client_cert_pem      = dialer_opts.client_cert_pem;
                     topts.client_key_pem       = dialer_opts.client_key_pem;
                     if (peer_copy.pubkey.size() == 32) {

@@ -78,6 +78,61 @@ InitOpenSSL& openssl_init() {
     return init;
 }
 
+// Apply a browser ClientHello fingerprint profile (Tier-4). Best-effort:
+// names that a particular OpenSSL build doesn't recognise are skipped so
+// the handshake still works — shaping degrades gracefully rather than
+// failing the connection.
+void apply_fingerprint(SSL_CTX* ctx, TlsFingerprint fp) {
+    if (fp == TlsFingerprint::kDefault) return;
+
+    // TLS 1.3 ciphersuites (order matters for JA3).
+    const char* suites13 = nullptr;
+    // TLS 1.2 cipher list (OpenSSL cipher-string names, in order).
+    const char* ciphers12 = nullptr;
+    // Supported groups (curves) and signature algorithms, in order.
+    const char* groups = nullptr;
+    const char* sigalgs = nullptr;
+
+    if (fp == TlsFingerprint::kChrome) {
+        suites13 = "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:"
+                   "TLS_CHACHA20_POLY1305_SHA256";
+        ciphers12 =
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+            "ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:"
+            "AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA";
+        groups  = "X25519:P-256:P-384";
+        sigalgs = "ECDSA+SHA256:RSA-PSS+SHA256:RSA+SHA256:"
+                  "ECDSA+SHA384:RSA-PSS+SHA384:RSA+SHA384:"
+                  "RSA-PSS+SHA512:RSA+SHA512";
+    } else {  // kFirefox
+        suites13 = "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:"
+                   "TLS_AES_256_GCM_SHA384";
+        ciphers12 =
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:"
+            "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:"
+            "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:"
+            "ECDHE-ECDSA-AES256-SHA:ECDHE-ECDSA-AES128-SHA:"
+            "ECDHE-RSA-AES128-SHA:ECDHE-RSA-AES256-SHA:"
+            "AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA:AES256-SHA";
+        // Firefox advertises FFDHE groups too (OpenSSL 3.0+); harmless
+        // if a name is unknown — set1_groups_list fails and we keep the
+        // default groups for that field.
+        groups  = "X25519:P-256:P-384:ffdhe2048:ffdhe3072";
+        sigalgs = "ECDSA+SHA256:ECDSA+SHA384:ECDSA+SHA512:"
+                  "RSA-PSS+SHA256:RSA-PSS+SHA384:RSA-PSS+SHA512:"
+                  "RSA+SHA256:RSA+SHA384:RSA+SHA512";
+    }
+
+    // Each call is best-effort; clear the error queue on failure so a
+    // skipped knob doesn't poison a later real error.
+    if (suites13)  { if (SSL_CTX_set_ciphersuites(ctx, suites13) != 1) ERR_clear_error(); }
+    if (ciphers12) { if (SSL_CTX_set_cipher_list(ctx, ciphers12) != 1) ERR_clear_error(); }
+    if (groups)    { if (SSL_CTX_set1_groups_list(ctx, groups) != 1)   ERR_clear_error(); }
+    if (sigalgs)   { if (SSL_CTX_set1_sigalgs_list(ctx, sigalgs) != 1)  ERR_clear_error(); }
+}
+
 [[noreturn]] void throw_openssl(const std::string& ctx) {
     char buf[256] = {0};
     const auto err = ERR_get_error();
@@ -124,6 +179,9 @@ void TlsClient::connect(const std::string& host, std::uint16_t port,
 
     // Pin the floor at TLS 1.2 — anything older is broken.
     SSL_CTX_set_min_proto_version(impl_->ctx, TLS1_2_VERSION);
+
+    // Tier-4: reshape cipher/group/sigalg lists toward a browser JA3.
+    apply_fingerprint(impl_->ctx, opts.tls_fingerprint);
 
     if (opts.insecure_skip_verify) {
         SSL_CTX_set_verify(impl_->ctx, SSL_VERIFY_NONE, nullptr);
@@ -393,6 +451,35 @@ void TlsClient::close() {
     impl_->connected = false;
 }
 
+std::vector<std::uint8_t> debug_client_hello(TlsFingerprint fp) {
+    openssl_init();
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return {};
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    apply_fingerprint(ctx, fp);
+
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) { SSL_CTX_free(ctx); return {}; }
+    // Memory BIOs: SSL writes the ClientHello into wbio; rbio stays
+    // empty so the handshake parks at WANT_READ after the first flight.
+    BIO* rbio = BIO_new(BIO_s_mem());
+    BIO* wbio = BIO_new(BIO_s_mem());
+    SSL_set_bio(ssl, rbio, wbio);   // takes ownership of both
+    SSL_set_connect_state(ssl);
+    SSL_set_tlsext_host_name(ssl, "example.com");
+    (void)SSL_do_handshake(ssl);    // emits ClientHello, then WANT_READ
+
+    std::vector<std::uint8_t> out;
+    char buf[4096];
+    int n;
+    while ((n = BIO_read(wbio, buf, static_cast<int>(sizeof(buf)))) > 0) {
+        out.insert(out.end(), buf, buf + n);
+    }
+    SSL_free(ssl);     // frees rbio + wbio
+    SSL_CTX_free(ctx);
+    return out;
+}
+
 }  // namespace fb::net
 
 #else   // FB_HAVE_OPENSSL == 0
@@ -420,6 +507,8 @@ std::size_t TlsClient::blocking_read(std::span<std::uint8_t>, int) { unimpl(); }
 bool TlsClient::is_connected() const noexcept { return false; }
 int  TlsClient::fd()           const noexcept { return -1; }
 void TlsClient::close() {}
+
+std::vector<std::uint8_t> debug_client_hello(TlsFingerprint) { return {}; }
 
 }  // namespace fb::net
 

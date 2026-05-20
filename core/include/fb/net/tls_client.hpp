@@ -36,6 +36,23 @@
 
 namespace fb::net {
 
+// TLS ClientHello fingerprint profile (Tier-4 censorship mimicry).
+//
+// JA3/JA4 DPI classifies a TLS client by the cipher-suite list, the
+// supported-groups (curves) list, the signature-algorithm list and the
+// extension layout in the ClientHello. Stock OpenSSL's defaults differ
+// from any browser, so even a perfect SNI/ALPN/HTTP-upgrade still flags
+// as "not a browser". Selecting kChrome / kFirefox reshapes the cipher,
+// group and sigalg lists to match that browser's order.
+//
+// HONEST LIMIT: OpenSSL does not expose TLS-extension ordering or
+// client-side GREASE injection, so the resulting JA3 matches a browser
+// in the cipher/group/sigalg fields but NOT byte-for-byte in the
+// extension field. Byte-perfect uTLS-grade mimicry needs BoringSSL or
+// a custom ClientHello assembler; SNI encryption needs ECH. See
+// docs/censorship-resistance.md (Tier 4).
+enum class TlsFingerprint { kDefault, kChrome, kFirefox };
+
 struct TlsClientOptions {
     // CA file (PEM) used to validate the server cert. If empty, the
     // system CA bundle is used (SSL_CTX_set_default_verify_paths).
@@ -66,6 +83,11 @@ struct TlsClientOptions {
     // See docs/censorship-resistance.md (Tier 2).
     std::vector<std::string> alpn_protocols{"http/1.1"};
 
+    // ClientHello fingerprint profile (Tier-4). Default kDefault keeps
+    // OpenSSL's native ClientHello; kChrome / kFirefox reshape the
+    // cipher / group / sigalg lists toward that browser's JA3.
+    TlsFingerprint tls_fingerprint = TlsFingerprint::kDefault;
+
     // ---- Identity-pinned mutual auth (FinBit serverless P2P) ----
     //
     // When set, present this client cert + key during the TLS
@@ -85,6 +107,13 @@ struct TlsClientOptions {
     std::array<std::uint8_t, 32> expected_peer_pubkey{};
     bool                          expected_peer_pubkey_set = false;
 };
+
+// Diagnostic / testing: produce the raw TLS ClientHello bytes this
+// client would put on the wire for the given fingerprint profile, using
+// an in-memory BIO (no socket, no peer). Lets tests verify the JA3
+// shaping (cipher-suite / supported-group order) deterministically.
+// Returns an empty vector if OpenSSL isn't compiled in.
+[[nodiscard]] std::vector<std::uint8_t> debug_client_hello(TlsFingerprint fp);
 
 class TlsClient {
 public:

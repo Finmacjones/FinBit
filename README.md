@@ -193,6 +193,15 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
     Works against a cooperating reverse-proxy/CDN that routes by `Host`;
     ECH is the planned successor. See
     [`docs/censorship-resistance.md`](docs/censorship-resistance.md).
+  - **JA3 ClientHello shaping** (censorship-resistance, Tier 4) — the
+    TLS client can present a Chrome/Firefox-ordered cipher-suite,
+    supported-group and signature-algorithm list so its JA3 matches a
+    browser instead of stock OpenSSL. On by default for the DoH resolver
+    and the WSS paths; tunable via `fb-cli --mimic chrome|firefox|off`,
+    `FB_TLS_MIMIC`, and `PeerDialerOptions::tls_fingerprint`. Honest
+    limit: OpenSSL can't reorder extensions or inject GREASE, so this
+    isn't byte-perfect uTLS — that (and ECH for SNI encryption) needs a
+    BoringSSL/ECH toolchain. Verified by the `TlsFingerprint.*` tests.
   - **Periodic cadence** — `republish_self` rotates our own
     provider record before its TTL expires (default every 30
     minutes; TTL is 1 hour). `gossip_pull_round` walks every
