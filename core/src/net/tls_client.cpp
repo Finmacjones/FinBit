@@ -187,6 +187,27 @@ void TlsClient::connect(const std::string& host, std::uint16_t port,
         throw_openssl("SSL_set_fd");
     }
 
+    // 3b. ALPN. Browsers always advertise ALPN; a TLS ClientHello with
+    // no ALPN extension is a cheap fingerprint. Encode the protocol
+    // list in the wire format OpenSSL wants: a sequence of
+    // length-prefixed strings (1-byte length + bytes). Empty list =>
+    // suppress the extension.
+    if (!opts.alpn_protocols.empty()) {
+        std::vector<unsigned char> wire;
+        for (const auto& p : opts.alpn_protocols) {
+            if (p.empty() || p.size() > 255) continue;
+            wire.push_back(static_cast<unsigned char>(p.size()));
+            wire.insert(wire.end(), p.begin(), p.end());
+        }
+        if (!wire.empty()) {
+            // Returns 0 on success (note: inverted vs most OpenSSL APIs).
+            if (SSL_set_alpn_protos(impl_->ssl, wire.data(),
+                                    static_cast<unsigned int>(wire.size())) != 0) {
+                throw_openssl("SSL_set_alpn_protos");
+            }
+        }
+    }
+
     // 4. SNI + hostname verification. SNI is mandatory for any modern
     // server (vhosting, certificate selection); X509 hostname check
     // protects against MITM with a different valid cert.

@@ -74,6 +74,29 @@ namespace {
 
 enum class Transport { kTcp, kWs };
 
+#if FB_HAVE_OPENSSL
+// ALPN selection callback. We only ever speak HTTP/1.1 on top of TLS
+// (the WebSocket upgrade is HTTP/1.1), so we always select "http/1.1"
+// when the client offers it. This makes the negotiated-protocol field
+// in the handshake look like an ordinary HTTPS web server — part of
+// the Tier-2 TLS-on-443 mimicry (see docs/censorship-resistance.md).
+//
+// If the client offered ALPN but not http/1.1, we decline to select
+// (NOACK) rather than fail the handshake — older FinBit clients that
+// send no ALPN at all still connect.
+int alpn_select_cb(SSL* /*ssl*/, const unsigned char** out,
+                   unsigned char* outlen, const unsigned char* in,
+                   unsigned int inlen, void* /*arg*/) {
+    static const unsigned char kPref[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+    if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen,
+                              kPref, sizeof(kPref),
+                              in, inlen) == OPENSSL_NPN_NEGOTIATED) {
+        return SSL_TLSEXT_ERR_OK;
+    }
+    return SSL_TLSEXT_ERR_NOACK;
+}
+#endif
+
 // Walk every up + non-loopback interface and return their IPv4/IPv6
 // addresses in printable form. Used to print a "your server is reachable
 // at..." cheatsheet when bound to 0.0.0.0 so the operator doesn't have to
@@ -1068,6 +1091,10 @@ int main(int argc, char** argv) {
             SSL_OP_NO_COMPRESSION |
             SSL_OP_NO_TICKET |
             SSL_OP_CIPHER_SERVER_PREFERENCE);
+        // Advertise HTTP/1.1 over ALPN so the handshake looks like a
+        // normal HTTPS server (Tier-2 mimicry). We select http/1.1
+        // regardless of whether the client also offered h2.
+        SSL_CTX_set_alpn_select_cb(ssl_ctx.get(), alpn_select_cb, nullptr);
         if (SSL_CTX_use_certificate_chain_file(ssl_ctx.get(), tls_cert.c_str()) != 1) {
             std::fprintf(stderr, "[server] could not load --tls-cert %s\n",
                          tls_cert.c_str());

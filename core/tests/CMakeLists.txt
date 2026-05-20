@@ -11,6 +11,7 @@ add_executable(fb_core_tests
     crypto/mls_facade_test.cpp
     net/frame_codec_test.cpp
     net/websocket_test.cpp
+    net/ws_client_test.cpp
     net/doh_resolver_test.cpp
     store/sqlite_store_test.cpp
     identity/username_log_test.cpp

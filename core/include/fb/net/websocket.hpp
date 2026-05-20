@@ -14,6 +14,12 @@
 // protobuf protocol). Server-to-client always sends single-frame, unmasked
 // binary opcodes.
 //
+// Client-side handshake + masked framing were added for Tier-2
+// censorship-resistance (docs/censorship-resistance.md): the native
+// client can now speak real WSS to the server's --tls-port so its
+// traffic is indistinguishable from a browser's WebSocket-over-HTTPS,
+// instead of raw protobuf-over-TLS.
+//
 // Not implemented (deliberate, Phase 2 scope):
 //   - permessage-deflate compression
 //   - text frames (we always use binary)
@@ -71,10 +77,75 @@ private:
 // Build a server-to-client close frame with no body.
 [[nodiscard]] std::vector<std::uint8_t> build_close_frame();
 
+// =========================================================================
+// Client side (Tier-2 mimicry). The native FinBit client uses these to
+// speak real WSS to the server's --tls-port.
+// =========================================================================
+
+// Result of building a client upgrade request: the bytes to send plus
+// the base64 Sec-WebSocket-Key we generated (so the caller can verify
+// the server's Sec-WebSocket-Accept against compute_accept(sec_key)).
+struct ClientUpgrade {
+    std::vector<std::uint8_t> request;
+    std::string               sec_key;
+};
+
+// Build a browser-like HTTP/1.1 WebSocket upgrade request for
+// `Host: <host>[:<port>]` and the given path. Generates a fresh random
+// 16-byte Sec-WebSocket-Key. The Host header omits the port when it's
+// the default 443 (matches what browsers do over wss://).
+[[nodiscard]] ClientUpgrade build_client_upgrade_request(
+    const std::string& host, std::uint16_t port, const std::string& path = "/");
+
+// Streaming parser for the server's HTTP/1.1 101 response. Symmetric to
+// HandshakeParser: feed bytes until the "\r\n\r\n" header terminator is
+// seen, then it validates the 101 status line and that
+// Sec-WebSocket-Accept == compute_accept(expected_key).
+class ClientHandshakeParser {
+public:
+    explicit ClientHandshakeParser(std::string expected_key);
+
+    enum class Status { kNeedMore, kAccepted, kRejected };
+
+    Status feed(std::span<const std::uint8_t> bytes);
+
+    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+
+    // Bytes left after the header terminator — the first server WS frame
+    // may follow immediately. Caller drains these into a FrameParser.
+    [[nodiscard]] std::span<const std::uint8_t> trailing() const noexcept {
+        return std::span<const std::uint8_t>(buf_.data() + headers_end_,
+                                              buf_.size() - headers_end_);
+    }
+
+private:
+    std::string               expected_accept_;
+    std::vector<std::uint8_t> buf_;
+    std::size_t               headers_end_ = 0;
+    std::string               reason_;
+};
+
+// Build a client-to-server binary frame. Per RFC 6455 §5.3 every frame
+// a client sends MUST be masked with a fresh random 32-bit key; the key
+// is generated here via libsodium's CSPRNG.
+[[nodiscard]] std::vector<std::uint8_t> build_client_binary_frame(
+    std::span<const std::uint8_t> payload);
+
+// Build a client close frame (masked, no body).
+[[nodiscard]] std::vector<std::uint8_t> build_client_close_frame();
+
 // Streaming WS frame parser. Feed raw post-handshake bytes; pop assembled
 // binary messages.
+//
+// `expect_masked` controls direction: a server parsing inbound client
+// frames requires them masked (the default, preserving existing
+// behaviour); a client parsing inbound server frames must accept
+// unmasked frames, so it constructs FrameParser{false}.
 class FrameParser {
 public:
+    explicit FrameParser(bool expect_masked = true)
+        : expect_masked_(expect_masked) {}
+
     enum class PopStatus { kNeedMore, kFrameReady, kClose, kError };
 
     void feed(std::span<const std::uint8_t> bytes);
@@ -82,6 +153,7 @@ public:
     [[nodiscard]] const std::string& error() const noexcept { return error_; }
 
 private:
+    bool expect_masked_ = true;
     std::vector<std::uint8_t> buf_;
     // For multi-fragment messages we accumulate here.
     std::vector<std::uint8_t> partial_;

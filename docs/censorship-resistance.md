@@ -1,7 +1,8 @@
 # FinBit — Censorship-Resistance Architecture
 
-> Status: living doc — Tier 1 (DoH bootstrap) shipped 2026-05-19.
-> Tiers 2–4 tracked in [`docs/roadmap.md`](roadmap.md).
+> Status: living doc — Tier 1 (DoH bootstrap) shipped 2026-05-19;
+> Tier 2 (ALPN + native WSS) shipped 2026-05-20.
+> Tiers 3–4 tracked in [`docs/roadmap.md`](roadmap.md).
 
 ## 1. Threat model
 
@@ -89,24 +90,65 @@ political non-starter.
    already public — the bootstrap addresses are designed to be
    directly dialled by anyone.
 
-### Tier 2 — TLS-on-443 transport mimicry  🚧 planned
+### Tier 2 — TLS-on-443 transport mimicry  ✅ partial (ALPN + native WSS shipped 2026-05-20)
 
-**Problem.** Even with a DoH bootstrap, the actual peer transport
-(currently `wss://host:443`) is recognisably non-browser TLS — JA3
-fingerprint, length-distribution of records, absence of HTTP/2 ALPN.
+**Problem.** Even with a DoH bootstrap, the actual peer transport was
+recognisably non-browser TLS. Two concrete tells existed before this
+work:
 
-**Plan.**
-- All peer connections default to TCP/443 with a WebSocket Secure
-  upgrade. Already true today via `wss://` addresses in the bootstrap
-  list.
-- ALPN negotiation includes `h2` and `http/1.1` (with `wss` as the
-  actual protocol). A passive observer sees only TLS-1.3 + h2 — same
-  as a YouTube fetch.
-- ServerHello uses a real cert (Let's Encrypt or pinned-fingerprint
-  in the bootstrap line).
-- HTTP-Upgrade pattern: `GET / HTTP/1.1` + `Connection: Upgrade` +
-  `Upgrade: websocket` so a DPI box that does L7 parsing sees a
-  normal WebSocket upgrade.
+1. **No ALPN.** A browser ALWAYS advertises ALPN (`h2,http/1.1`) in
+   its ClientHello. FinBit's `TlsClient` sent none — a one-bit
+   classifier ("has ALPN extension?") flagged every connection.
+2. **No HTTP upgrade.** The native client spoke raw length-prefixed
+   protobuf immediately after the TLS handshake. It never performed
+   the `GET / HTTP/1.1` + `Upgrade: websocket` dance a browser does
+   over `wss://`. Only browsers (hitting the server's `--tls-port`
+   WSS endpoint) looked like WSS; the native desktop/CLI client did
+   not.
+
+**What shipped.**
+
+- **ALPN on both sides.** `TlsClientOptions::alpn_protocols` defaults
+  to `{"http/1.1"}` and is wired through `SSL_set_alpn_protos`. The
+  server registers an `alpn_select_cb` that selects `http/1.1`
+  whenever the client offers it (even if the client also offered
+  `h2`). Verified at the wire level with `openssl s_client -alpn`:
+
+  | Client offers | Server selects |
+  | --- | --- |
+  | `h2,http/1.1` (browser-like) | `http/1.1` |
+  | `http/1.1` | `http/1.1` |
+  | `h2` only | *(declines — we don't speak h2)* |
+
+  We deliberately do **not** advertise `h2` from the client, because
+  we genuinely speak HTTP/1.1 on top (the WS upgrade and the DoH GET
+  are both HTTP/1.1). Offering a protocol we can't speak would break
+  against a third-party server (e.g. a public DoH endpoint) that
+  selected it. Closing this gap (advertise `h2` for fingerprint
+  realism without speaking it) belongs with Tier 4 uTLS.
+
+- **Native WebSocket client.** `fb::net::ws` gained the client half it
+  was missing: `build_client_upgrade_request` (browser-like
+  `GET / HTTP/1.1` with a random `Sec-WebSocket-Key`, `Host`,
+  `Origin`, `User-Agent`), `ClientHandshakeParser` (validates the 101
+  + `Sec-WebSocket-Accept`), and `build_client_binary_frame` (masked
+  per RFC 6455 §5.3). `FrameParser` is now direction-aware
+  (`expect_masked`) so the client parses the server's unmasked frames.
+
+- **`fb-cli --wss`.** Drives the full path: TLS → WS upgrade → masked
+  WS binary frames carrying one serialized `Frame` each. Proven end to
+  end by `tools/e2e/wss_native_dm_roundtrip.sh` (server `--tls-port`,
+  two `--wss` peers, DM round-trips, server log stays blind).
+
+**Remaining Tier-2 follow-up.**
+- Wire the **desktop client** (`chat_client.cpp`) and **PeerNet**
+  (`peer_net.cpp`) onto the same `--wss` path. They currently dial
+  `wss://` addresses as "TLS + raw frames"; the building blocks
+  (`fb::net::ws` client helpers) are now in place, so this is
+  call-site adoption, not new protocol work.
+- HTTP-Upgrade `Connection: Upgrade` is already emitted; a future pass
+  can add believable extra headers / cookie to defeat L7 template
+  matching.
 
 ### Tier 3 — Decoy / domain-fronting  🚧 planned
 
@@ -160,8 +202,8 @@ individually defeats a nation-state adversary with a dedicated team
 
 | Tier | Status | Code | Tracking |
 | --- | --- | --- | --- |
-| 1. DoH bootstrap | ✅ shipped | `core/net/doh_resolver.*` | this commit |
-| 2. TLS-on-443 transport mimicry | 🚧 partial | `wss://` already preferred; ALPN + Upgrade headers pending | next milestone |
+| 1. DoH bootstrap | ✅ shipped | `core/net/doh_resolver.*` | done |
+| 2. TLS-on-443 transport mimicry | ✅ partial | ALPN (`tls_client.cpp` + server `alpn_select_cb`) + native WSS (`fb::net::ws` client + `fb-cli --wss`) shipped; desktop/PeerNet adoption pending | done / follow-up |
 | 3. Domain-fronting | 🔲 planned | — | v2 |
 | 4. uTLS ClientHello mimicry | 🔲 planned | — | v2 |
 

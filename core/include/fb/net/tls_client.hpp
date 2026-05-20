@@ -32,6 +32,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace fb::net {
 
@@ -48,6 +49,22 @@ struct TlsClientOptions {
     // host. Override when the server's cert CN/SAN differs from the IP
     // you're dialing (common for CDN / cert-pinned setups).
     std::string sni_hostname;
+
+    // ---- ALPN (censorship-resistance: TLS-on-443 mimicry) ----
+    //
+    // Application-Layer Protocol Negotiation list advertised in the
+    // ClientHello. A browser ALWAYS sends ALPN; a TLS client that
+    // sends none is trivially fingerprintable. We default to
+    // {"http/1.1"} because that's what we genuinely speak on top
+    // (the WebSocket upgrade and the DoH GET are both HTTP/1.1).
+    //
+    // NB: we deliberately do NOT advertise "h2" by default — if a
+    // third-party server (e.g. a public DoH endpoint) selected h2 we
+    // would have to speak HTTP/2 framing, which we don't. Offering
+    // only protocols we can actually speak keeps us correct. Set to
+    // an empty vector to suppress the ALPN extension entirely.
+    // See docs/censorship-resistance.md (Tier 2).
+    std::vector<std::string> alpn_protocols{"http/1.1"};
 
     // ---- Identity-pinned mutual auth (FinBit serverless P2P) ----
     //

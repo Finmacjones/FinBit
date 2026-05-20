@@ -170,6 +170,13 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
     to block every public DoH provider to block the lookup. See
     [`docs/censorship-resistance.md`](docs/censorship-resistance.md)
     for the full threat model.
+  - **TLS-on-443 mimicry** (censorship-resistance, Tier 2) — the TLS
+    client now advertises `http/1.1` over ALPN (browsers always send
+    ALPN; sending none was a fingerprint) and the server selects it
+    via an `alpn_select_cb`. `fb-cli --wss` speaks a real RFC 6455
+    WebSocket (HTTP/1.1 `Upgrade` + masked binary frames) to the
+    server's `--tls-port`, so a native connection is wire-identical to
+    a browser's WSS. Proven by `tools/e2e/wss_native_dm_roundtrip.sh`.
   - **Periodic cadence** — `republish_self` rotates our own
     provider record before its TTL expires (default every 30
     minutes; TTL is 1 hour). `gossip_pull_round` walks every

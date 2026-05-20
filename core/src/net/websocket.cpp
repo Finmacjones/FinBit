@@ -170,6 +170,136 @@ std::vector<std::uint8_t> build_close_frame() {
     return {0x88, 0x00};
 }
 
+// ---------------------------------------------------------------------------
+// Client side
+// ---------------------------------------------------------------------------
+
+ClientUpgrade build_client_upgrade_request(const std::string& host,
+                                           std::uint16_t port,
+                                           const std::string& path) {
+    ClientUpgrade up;
+
+    // 16 random bytes → base64 = the Sec-WebSocket-Key (RFC 6455 §4.1).
+    std::array<std::uint8_t, 16> key_raw{};
+    if (sodium_init() >= 0) {
+        randombytes_buf(key_raw.data(), key_raw.size());
+    }
+    up.sec_key = to_base64(std::span<const std::uint8_t>(key_raw.data(), key_raw.size()));
+
+    // Host header omits the port when it's the wss:// default (443), so
+    // the request matches what a browser emits for wss://host/path.
+    std::string host_hdr = host;
+    if (port != 443) host_hdr += ":" + std::to_string(port);
+
+    std::string req;
+    req += "GET " + (path.empty() ? std::string("/") : path) + " HTTP/1.1\r\n";
+    req += "Host: " + host_hdr + "\r\n";
+    req += "Upgrade: websocket\r\n";
+    req += "Connection: Upgrade\r\n";
+    req += "Sec-WebSocket-Key: " + up.sec_key + "\r\n";
+    req += "Sec-WebSocket-Version: 13\r\n";
+    // A browser also sends Origin / User-Agent; include a believable
+    // Origin so an L7 DPI box parsing the cleartext-inside-TLS upgrade
+    // (e.g. an active prober) sees an ordinary request.
+    req += "Origin: https://" + host_hdr + "\r\n";
+    req += "User-Agent: Mozilla/5.0 (FinBit)\r\n";
+    req += "\r\n";
+
+    up.request.assign(req.begin(), req.end());
+    return up;
+}
+
+ClientHandshakeParser::ClientHandshakeParser(std::string expected_key)
+    : expected_accept_(compute_accept(expected_key)) {}
+
+ClientHandshakeParser::Status
+ClientHandshakeParser::feed(std::span<const std::uint8_t> bytes) {
+    buf_.insert(buf_.end(), bytes.begin(), bytes.end());
+    static const std::uint8_t terminator[] = {'\r', '\n', '\r', '\n'};
+    auto it = std::search(buf_.begin(), buf_.end(),
+                          std::begin(terminator), std::end(terminator));
+    if (it == buf_.end()) {
+        if (buf_.size() > 16384) {
+            reason_ = "response headers too large";
+            return Status::kRejected;
+        }
+        return Status::kNeedMore;
+    }
+    headers_end_ = static_cast<std::size_t>((it - buf_.begin()) + 4);
+    const std::string headers(buf_.begin(), buf_.begin() + headers_end_);
+
+    // Status line must be "HTTP/1.1 101 ...".
+    if (headers.compare(0, 5, "HTTP/") != 0 ||
+        headers.find(" 101 ") == std::string::npos) {
+        reason_ = "server did not return 101 Switching Protocols";
+        return Status::kRejected;
+    }
+    if (!icontains(headers, "Upgrade: websocket")) {
+        reason_ = "missing Upgrade: websocket in response";
+        return Status::kRejected;
+    }
+    // Verify Sec-WebSocket-Accept matches what we expect for our key.
+    const std::string needle = "sec-websocket-accept:";
+    std::string lower_h = headers;
+    for (auto& c : lower_h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const auto pos = lower_h.find(needle);
+    if (pos == std::string::npos) {
+        reason_ = "missing Sec-WebSocket-Accept";
+        return Status::kRejected;
+    }
+    const auto eol = headers.find("\r\n", pos);
+    const std::string got =
+        trim_ws(headers.substr(pos + needle.size(), eol - pos - needle.size()));
+    if (expected_accept_.empty() || got != expected_accept_) {
+        reason_ = "Sec-WebSocket-Accept mismatch";
+        return Status::kRejected;
+    }
+    return Status::kAccepted;
+}
+
+namespace {
+
+// Common framing for masked client frames. opcode: 0x2 binary, 0x8 close.
+std::vector<std::uint8_t> build_masked_frame(std::uint8_t opcode,
+                                             std::span<const std::uint8_t> payload) {
+    std::vector<std::uint8_t> out;
+    out.push_back(static_cast<std::uint8_t>(0x80 | opcode));  // FIN + opcode
+    const std::size_t len = payload.size();
+    if (len < 126) {
+        out.push_back(static_cast<std::uint8_t>(0x80 | len));  // MASK bit + len
+    } else if (len <= 0xFFFF) {
+        out.push_back(static_cast<std::uint8_t>(0x80 | 126));
+        out.push_back(static_cast<std::uint8_t>((len >> 8) & 0xff));
+        out.push_back(static_cast<std::uint8_t>(len & 0xff));
+    } else {
+        out.push_back(static_cast<std::uint8_t>(0x80 | 127));
+        for (int i = 7; i >= 0; --i) {
+            out.push_back(static_cast<std::uint8_t>((len >> (i * 8)) & 0xff));
+        }
+    }
+    std::array<std::uint8_t, 4> mask{};
+    if (sodium_init() >= 0) {
+        randombytes_buf(mask.data(), mask.size());
+    }
+    out.insert(out.end(), mask.begin(), mask.end());
+    const std::size_t body_off = out.size();
+    out.resize(body_off + len);
+    for (std::size_t i = 0; i < len; ++i) {
+        out[body_off + i] = static_cast<std::uint8_t>(payload[i] ^ mask[i & 3]);
+    }
+    return out;
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> build_client_binary_frame(std::span<const std::uint8_t> payload) {
+    return build_masked_frame(0x2, payload);
+}
+
+std::vector<std::uint8_t> build_client_close_frame() {
+    return build_masked_frame(0x8, {});
+}
+
 void FrameParser::feed(std::span<const std::uint8_t> bytes) {
     if (!error_.empty()) return;
     buf_.insert(buf_.end(), bytes.begin(), bytes.end());
@@ -184,7 +314,12 @@ FrameParser::PopStatus FrameParser::try_pop(std::vector<std::uint8_t>& out) {
         const bool fin    = (b0 & 0x80) != 0;
         const std::uint8_t opcode = b0 & 0x0f;
         const bool mask = (b1 & 0x80) != 0;
-        if (!mask) {
+        // Direction enforcement: client→server frames MUST be masked
+        // (RFC 6455 §5.1); server→client frames MUST NOT be. A server
+        // parser (expect_masked_=true) rejects unmasked input; a client
+        // parser (expect_masked_=false) handles either but server frames
+        // are normally unmasked.
+        if (expect_masked_ && !mask) {
             error_ = "client frame missing mask";
             return PopStatus::kError;
         }
@@ -208,12 +343,16 @@ FrameParser::PopStatus FrameParser::try_pop(std::vector<std::uint8_t>& out) {
             error_ = "frame payload too large";
             return PopStatus::kError;
         }
-        if (buf_.size() < header_len + 4 + payload_len) return PopStatus::kNeedMore;
-        const std::uint8_t mask_key[4] = {
-            buf_[header_len], buf_[header_len + 1],
-            buf_[header_len + 2], buf_[header_len + 3]
-        };
-        header_len += 4;
+        const std::size_t mask_bytes = mask ? 4 : 0;
+        if (buf_.size() < header_len + mask_bytes + payload_len) return PopStatus::kNeedMore;
+        std::uint8_t mask_key[4] = {0, 0, 0, 0};
+        if (mask) {
+            mask_key[0] = buf_[header_len];
+            mask_key[1] = buf_[header_len + 1];
+            mask_key[2] = buf_[header_len + 2];
+            mask_key[3] = buf_[header_len + 3];
+            header_len += 4;
+        }
         std::vector<std::uint8_t> payload(payload_len);
         for (std::uint64_t i = 0; i < payload_len; ++i) {
             payload[i] = static_cast<std::uint8_t>(buf_[header_len + i] ^ mask_key[i & 3]);

@@ -65,6 +65,7 @@
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
 #include "fb/net/tls_client.hpp"
+#include "fb/net/websocket.hpp"
 #include "fb/p2p/gossip.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
@@ -138,6 +139,8 @@ struct Args {
     std::string tls_ca;             // CA file for cert verification
     bool tls_insecure_skip_verify = false;   // dev/CI escape hatch
     std::string tls_sni;            // override SNI hostname
+    bool wss = false;               // speak real WebSocket-over-TLS
+                                    // (Tier-2 mimicry); implies --tls
 
     // Overlay relay test (N1): exercises the server-relayed
     // PeerEnvelope path without standing up the full DhtNode /
@@ -172,6 +175,8 @@ void usage() {
               << "TLS (Phase 5+ 'looks like web traffic on :443'):\n"
               << "  --tls                 wrap the connection in TLS via fb::net::TlsClient\n"
               << "                        (server must be on --tls-port with matching cert/key)\n"
+              << "  --wss                 speak real WebSocket-over-TLS (implies --tls); traffic\n"
+              << "                        looks like a browser's WSS to the server's --tls-port\n"
               << "  --tls-ca FILE         PEM file with the CA that signed the server cert\n"
               << "                        (omit to use system CA bundle)\n"
               << "  --tls-insecure-skip-verify  skip cert validation (dev / self-signed only)\n"
@@ -227,6 +232,7 @@ bool parse(int argc, char** argv, Args& a) {
             a.linger_ms = std::atoi(ms.c_str());
         }
         else if (s == "--tls") { a.tls = true; }
+        else if (s == "--wss") { a.wss = true; a.tls = true; }
         else if (s == "--tls-ca") { if (!next(a.tls_ca)) return false; }
         else if (s == "--tls-insecure-skip-verify") {
             a.tls_insecure_skip_verify = true;
@@ -369,6 +375,13 @@ struct Conn {
     fb::net::Socket*    sock = nullptr;
     fb::net::TlsClient* tls  = nullptr;
 
+    // WebSocket-over-TLS (Tier-2 mimicry). When wss is true, outbound
+    // payloads are wrapped in masked WS binary frames and inbound bytes
+    // are de-framed via ws_parser (which expects unmasked server
+    // frames) instead of the length-prefixed FrameDecoder.
+    bool                  wss = false;
+    fb::net::ws::FrameParser ws_parser{/*expect_masked=*/false};
+
     [[nodiscard]] int fd() const {
         return tls ? tls->fd() : sock->fd();
     }
@@ -439,8 +452,13 @@ struct Conn {
 };
 
 void blocking_send(Conn& c, const std::vector<std::uint8_t>& payload) {
-    auto framed = fb::net::encode_frame(std::span<const std::uint8_t>(
-        payload.data(), payload.size()));
+    // WS path: one WS binary message per Frame (masked). The WS frame
+    // provides the message boundary, so no inner length prefix.
+    auto framed = c.wss
+        ? fb::net::ws::build_client_binary_frame(
+              std::span<const std::uint8_t>(payload.data(), payload.size()))
+        : fb::net::encode_frame(
+              std::span<const std::uint8_t>(payload.data(), payload.size()));
     c.send_all(std::span<const std::uint8_t>(framed.data(), framed.size()));
 }
 
@@ -448,7 +466,13 @@ std::optional<std::vector<std::uint8_t>> blocking_recv_frame(Conn& c,
                                                               fb::net::FrameDecoder& dec,
                                                               int timeout_ms) {
     std::vector<std::uint8_t> out;
-    if (dec.try_pop(out) == fb::net::FrameDecoder::Status::kFrameReady) return out;
+    // Try whatever's already buffered before reading more.
+    if (c.wss) {
+        if (c.ws_parser.try_pop(out) == fb::net::ws::FrameParser::PopStatus::kFrameReady)
+            return out;
+    } else {
+        if (dec.try_pop(out) == fb::net::FrameDecoder::Status::kFrameReady) return out;
+    }
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     std::array<std::uint8_t, 4096> buf;
@@ -461,8 +485,18 @@ std::optional<std::vector<std::uint8_t>> blocking_recv_frame(Conn& c,
             std::span<std::uint8_t>(buf.data(), buf.size()),
             static_cast<int>(remaining));
         if (n == 0) return std::nullopt;
-        dec.feed(std::span<const std::uint8_t>(buf.data(), n));
-        if (dec.try_pop(out) == fb::net::FrameDecoder::Status::kFrameReady) return out;
+        if (c.wss) {
+            c.ws_parser.feed(std::span<const std::uint8_t>(buf.data(), n));
+            const auto st = c.ws_parser.try_pop(out);
+            if (st == fb::net::ws::FrameParser::PopStatus::kFrameReady) return out;
+            if (st == fb::net::ws::FrameParser::PopStatus::kClose ||
+                st == fb::net::ws::FrameParser::PopStatus::kError) {
+                return std::nullopt;
+            }
+        } else {
+            dec.feed(std::span<const std::uint8_t>(buf.data(), n));
+            if (dec.try_pop(out) == fb::net::FrameDecoder::Status::kFrameReady) return out;
+        }
     }
     return std::nullopt;
 }
@@ -665,6 +699,53 @@ int main(int argc, char** argv) {
         }
         tls.connect(args.server_host, args.server_port, tlsopts);
         conn.tls = &tls;
+
+        if (args.wss) {
+            // Tier-2 mimicry: after the TLS handshake, perform a real
+            // RFC 6455 WebSocket upgrade so this connection is
+            // indistinguishable on the wire from a browser hitting the
+            // server's --tls-port. Subsequent Frames ride masked WS
+            // binary messages (see blocking_send / blocking_recv_frame).
+            const std::string ws_host =
+                args.tls_sni.empty() ? args.server_host : args.tls_sni;
+            auto up = fb::net::ws::build_client_upgrade_request(
+                ws_host, args.server_port, "/");
+            tls.blocking_send_all(std::span<const std::uint8_t>(
+                up.request.data(), up.request.size()));
+
+            fb::net::ws::ClientHandshakeParser hp(up.sec_key);
+            std::array<std::uint8_t, 4096> hbuf;
+            bool upgraded = false;
+            const auto hs_deadline = std::chrono::steady_clock::now() +
+                                     std::chrono::milliseconds(8000);
+            while (std::chrono::steady_clock::now() < hs_deadline) {
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        hs_deadline - std::chrono::steady_clock::now()).count();
+                if (remaining <= 0) break;
+                const auto n = tls.blocking_read(
+                    std::span<std::uint8_t>(hbuf.data(), hbuf.size()),
+                    static_cast<int>(remaining));
+                if (n == 0) break;
+                const auto st = hp.feed(std::span<const std::uint8_t>(hbuf.data(), n));
+                if (st == fb::net::ws::ClientHandshakeParser::Status::kAccepted) {
+                    // Any post-101 trailing bytes are the first WS frame(s).
+                    conn.ws_parser.feed(hp.trailing());
+                    upgraded = true;
+                    break;
+                }
+                if (st == fb::net::ws::ClientHandshakeParser::Status::kRejected) {
+                    std::cerr << "[fb-cli] WS upgrade rejected: "
+                              << hp.reason() << "\n";
+                    return 5;
+                }
+            }
+            if (!upgraded) {
+                std::cerr << "[fb-cli] WS upgrade did not complete\n";
+                return 5;
+            }
+            conn.wss = true;
+        }
     } else {
         sock = fb::net::tcp_connect(args.server_host, args.server_port);
         conn.sock = &sock;
