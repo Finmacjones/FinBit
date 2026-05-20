@@ -2,10 +2,18 @@
 #include "message_delegate.hpp"
 
 #include <QAbstractTextDocumentLayout>
+#include <QBuffer>
 #include <QDateTime>
+#include <QImage>
+#include <QImageReader>
+#include <QMovie>
 #include <QPainter>
+#include <QPixmap>
 #include <QTextDocument>
 #include <QTextOption>
+#include <QWidget>
+
+#include <algorithm>
 
 #include "avatar.hpp"
 
@@ -17,6 +25,25 @@ constexpr int kAvatarMargin  = 16;
 constexpr int kRowVMargin    = 4;
 constexpr int kHeaderHeight  = 22;
 constexpr int kBodyTopGap    = 2;
+constexpr int kImageMaxW     = 360;   // inline image display box
+constexpr int kImageMaxH     = 360;
+
+// Natural pixel size of an encoded image, read cheaply (header only)
+// without decoding the whole frame. Falls back to a square if unknown.
+QSize natural_image_size(const QByteArray& bytes) {
+    QBuffer buf;
+    buf.setData(bytes);
+    buf.open(QIODevice::ReadOnly);
+    QImageReader r(&buf);
+    const QSize s = r.size();
+    return s.isValid() ? s : QSize(200, 200);
+}
+
+// Box `nat` into max_w × max_h, preserving aspect ratio; never upscale.
+QSize fit_within(QSize nat, int max_w, int max_h) {
+    if (nat.width() <= max_w && nat.height() <= max_h) return nat;
+    return nat.scaled(max_w, max_h, Qt::KeepAspectRatio);
+}
 }
 
 namespace {
@@ -31,6 +58,31 @@ QColor sender_color(const QString& seed, bool is_self) {
 }
 
 }  // namespace
+
+MessageDelegate::~MessageDelegate() {
+    qDeleteAll(movies_);   // each QMovie owns its QBuffer (set as parent)
+}
+
+QMovie* MessageDelegate::movie_for(const QByteArray& bytes, QWidget* view) const {
+    auto it = movies_.find(bytes);
+    if (it != movies_.end()) return it.value();
+    auto* buf = new QBuffer();
+    buf->setData(bytes);
+    buf->open(QIODevice::ReadOnly);
+    auto* mv = new QMovie(buf);
+    buf->setParent(mv);                 // freed together with the movie
+    mv->setCacheMode(QMovie::CacheAll);
+    if (view) {
+        // Repaint the list as each GIF frame advances so it animates in
+        // place. `view` as the connection context auto-disconnects if the
+        // view goes away.
+        QObject::connect(mv, &QMovie::frameChanged, view,
+                         [view]() { view->update(); });
+    }
+    mv->start();
+    movies_.insert(bytes, mv);
+    return mv;
+}
 
 void MessageDelegate::paint(QPainter* p, const QStyleOptionViewItem& opt,
                             const QModelIndex& idx) const {
@@ -82,14 +134,42 @@ void MessageDelegate::paint(QPainter* p, const QStyleOptionViewItem& opt,
                 opt.rect.y() + kRowVMargin + fm_name.ascent(),
                 "Today at " + ts_str);
 
-    // Body — let QTextDocument wrap it within the available width.
+    // Body — an inline image/GIF if present, otherwise wrapped text.
+    const QByteArray img = idx.data(RoleImageBytes).toByteArray();
+    const int body_y = opt.rect.y() + kRowVMargin + kHeaderHeight + kBodyTopGap;
+    if (!img.isEmpty()) {
+        const QString mime = idx.data(RoleImageMime).toString();
+        QPixmap pm;
+        if (mime == QLatin1String("image/gif")) {
+            if (QMovie* mv = movie_for(img, const_cast<QWidget*>(opt.widget))) {
+                pm = mv->currentPixmap();
+            }
+        }
+        if (pm.isNull()) {
+            pm = QPixmap::fromImage(QImage::fromData(img));
+        }
+        if (!pm.isNull()) {
+            const QSize box = fit_within(pm.size(),
+                                         std::min(text_w, kImageMaxW), kImageMaxH);
+            const QPixmap scaled = pm.scaled(box, Qt::KeepAspectRatio,
+                                             Qt::SmoothTransformation);
+            p->drawPixmap(text_x, body_y, scaled);
+        } else {
+            // Undecodable bytes — show a placeholder rather than nothing.
+            p->setPen(QColor("#ed4245"));
+            p->drawText(text_x, body_y + 14, QStringLiteral("[unsupported image]"));
+        }
+        p->restore();
+        return;
+    }
+
     QFont body_font = opt.font;
     p->setFont(body_font);
     QTextDocument doc;
     doc.setDefaultFont(body_font);
     doc.setTextWidth(text_w);
     doc.setPlainText(body);
-    p->translate(text_x, opt.rect.y() + kRowVMargin + kHeaderHeight + kBodyTopGap);
+    p->translate(text_x, body_y);
     QAbstractTextDocumentLayout::PaintContext ctx;
     ctx.palette.setColor(QPalette::Text,
                          is_hist ? QColor("#888c92") : QColor("#dcddde"));
@@ -99,13 +179,25 @@ void MessageDelegate::paint(QPainter* p, const QStyleOptionViewItem& opt,
 
 QSize MessageDelegate::sizeHint(const QStyleOptionViewItem& opt,
                                 const QModelIndex& idx) const {
+    const int avail_w = opt.widget
+        ? opt.widget->width() - kAvatarMargin - kAvatarSize - 28 - 16 : 600;
+
+    // Image rows: height = header + boxed image.
+    const QByteArray img = idx.data(RoleImageBytes).toByteArray();
+    if (!img.isEmpty()) {
+        const QSize box = fit_within(natural_image_size(img),
+                                     std::min(avail_w, kImageMaxW), kImageMaxH);
+        const int h = kRowVMargin + kHeaderHeight + kBodyTopGap +
+                      box.height() + kRowVMargin;
+        return QSize(opt.rect.width(),
+                     std::max(h, kAvatarSize + 2 * kRowVMargin));
+    }
+
     const QString body = idx.data(RoleBody).toString();
     QTextDocument doc;
     QFont f = opt.font;
     doc.setDefaultFont(f);
-    const int w = opt.widget ? opt.widget->width() - kAvatarMargin - kAvatarSize - 28 - 16
-                              : 600;
-    doc.setTextWidth(w);
+    doc.setTextWidth(avail_w);
     doc.setPlainText(body);
     const int body_h = static_cast<int>(doc.size().height()) + kBodyTopGap;
     const int h = kRowVMargin + kHeaderHeight + body_h + kRowVMargin;

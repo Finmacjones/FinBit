@@ -118,6 +118,12 @@ struct Args {
     bool listen = false;
     bool send = false;
     int wait_ms = 5000;
+    // Inline attachment test mode. --send-image reads a file and DM-sends
+    // it as a DmPayload.attachment to --peer; --listen writes any inbound
+    // attachment to --image-out (if set) and prints an IMG-RECEIVED line.
+    bool send_image = false;
+    std::string image_path;   // file to send with --send-image
+    std::string image_out;    // where --listen writes a received attachment
     // Call-signaling test mode (headless, no real media). Mirrors the
     // desktop's group-call lazy bootstrap: --call-offer starts from a
     // peer PUBKEY (as a roster would surface it), does
@@ -180,6 +186,8 @@ void usage() {
               << "DM modes (Phase 0):\n"
               << "  --listen                          receive DMs\n"
               << "  --send  --peer NAME --text MSG    send a DM\n"
+              << "  --send-image --peer NAME --send-image PATH   DM an inline image/GIF\n"
+              << "  --listen --image-out PATH         write a received attachment to PATH\n"
               << "Call-signaling test modes (headless, no media):\n"
               << "  --call-listen                     print MY-PUBKEY, await OFFER, reply ANSWER\n"
               << "  --call-offer --peer-pubkey HEX --text SDP\n"
@@ -246,6 +254,9 @@ bool parse(int argc, char** argv, Args& a) {
         else if (s == "--call-offer") { a.call_offer = true; }
         else if (s == "--call-listen") { a.call_listen = true; }
         else if (s == "--peer-pubkey") { if (!next(a.peer_pubkey_hex)) return false; }
+        else if (s == "--send-image") { a.send_image = true;
+                                        if (!next(a.image_path)) return false; }
+        else if (s == "--image-out") { if (!next(a.image_out)) return false; }
         else if (s == "--channel-name") { if (!next(a.channel_name)) return false; }
         else if (s == "--dist-file") { if (!next(a.dist_file)) return false; }
         else if (s == "--channel-create") { a.channel_create = true; }
@@ -293,10 +304,12 @@ bool parse(int argc, char** argv, Args& a) {
                       (a.p2p_create ? 1 : 0) + (a.p2p_listen ? 1 : 0) +
                       (a.p2p_relay ? 1 : 0) +
                       (a.overlay_send ? 1 : 0) + (a.overlay_recv ? 1 : 0) +
-                      (a.call_offer ? 1 : 0) + (a.call_listen ? 1 : 0);
+                      (a.call_offer ? 1 : 0) + (a.call_listen ? 1 : 0) +
+                      (a.send_image ? 1 : 0);
     if (modes != 1) return false;
     if (a.send && (a.peer.empty() || a.text.empty())) return false;
     if (a.call_offer && (a.peer_pubkey_hex.empty() || a.text.empty())) return false;
+    if (a.send_image && (a.peer.empty() || a.image_path.empty())) return false;
     if (a.overlay_send && (a.peer.empty() || a.text.empty())) return false;
     if (a.channel_create &&
         (a.channel_name.empty() || a.dist_file.empty() || a.text.empty())) return false;
@@ -387,6 +400,19 @@ std::vector<std::uint8_t> serialize(const google::protobuf::MessageLite& m) {
 std::vector<std::uint8_t> pack_text_payload(const std::string& text) {
     fb::proto::DmPayload p;
     p.set_text(text);
+    return serialize(p);
+}
+
+// Pack an inline attachment (image / GIF / small file) into a DmPayload.
+std::vector<std::uint8_t> pack_attachment_payload(
+    const std::string& mime, const std::string& filename,
+    std::span<const std::uint8_t> content) {
+    fb::proto::DmPayload p;
+    auto* a = p.mutable_attachment();
+    a->set_mime_type(mime);
+    a->set_filename(filename);
+    a->set_content(std::string(reinterpret_cast<const char*>(content.data()),
+                               content.size()));
     return serialize(p);
 }
 
@@ -1291,6 +1317,77 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (args.send_image) {
+        // Same path as --send, but the DM body is a DmPayload.attachment.
+        const auto content = read_file(args.image_path);
+        if (content.empty()) {
+            std::cerr << "[fb-cli] --send-image: could not read "
+                      << args.image_path << "\n";
+            return 2;
+        }
+        if (content.size() > fb::config::kMaxInlineAttachmentBytes) {
+            std::cerr << "[fb-cli] --send-image: " << content.size()
+                      << "B exceeds the inline cap ("
+                      << fb::config::kMaxInlineAttachmentBytes << "B)\n";
+            return 2;
+        }
+        {
+            fb::proto::Frame f;
+            f.mutable_key_fetch()->set_username(args.peer);
+            blocking_send(conn, serialize(f));
+        }
+        auto resp = blocking_recv_frame(conn, dec, 8000);
+        if (!resp) { std::cerr << "no key bundle response\n"; return 5; }
+        fb::proto::Frame f;
+        if (!f.ParseFromArray(resp->data(), static_cast<int>(resp->size())) ||
+            f.body_case() != fb::proto::Frame::kKeyFetchResp ||
+            !f.key_fetch_resp().found()) {
+            std::cerr << "peer not registered yet\n"; return 6;
+        }
+        const auto& peer_b = f.key_fetch_resp().bundle();
+        if (peer_b.signed_prekey().size() != 32 ||
+            peer_b.identity_pubkey().size() != 32) {
+            std::cerr << "malformed peer bundle\n"; return 7;
+        }
+        std::array<std::uint8_t, 32> peer_x{};
+        std::memcpy(peer_x.data(), peer_b.signed_prekey().data(), 32);
+        auto shared = derive_shared_secret(x25519, std::span<const std::uint8_t, 32>(peer_x));
+        auto rat = fb::crypto::DoubleRatchet::init_alice(
+            shared, std::span<const std::uint8_t, 32>(peer_x));
+        // Derive a display filename from the path's basename.
+        std::string fname = args.image_path;
+        if (auto slash = fname.find_last_of("/\\"); slash != std::string::npos) {
+            fname = fname.substr(slash + 1);
+        }
+        const auto pt = pack_attachment_payload(
+            /*mime=*/"application/octet-stream", fname,
+            std::span<const std::uint8_t>(content.data(), content.size()));
+        std::vector<std::uint8_t> envid(16);
+        randombytes_buf(envid.data(), envid.size());
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        const auto outer_aad = envelope_aad_bytes(
+            std::span<const std::uint8_t>(envid.data(), envid.size()), now_ms);
+        auto inner = rat.encrypt(std::span<const std::uint8_t>(pt.data(), pt.size()),
+                                 std::span<const std::uint8_t>(outer_aad.data(), outer_aad.size()));
+        fb::proto::Frame f2;
+        auto* env = f2.mutable_envelope();
+        env->set_envelope_id(std::string(envid.begin(), envid.end()));
+        env->set_aad(std::string(outer_aad.begin(), outer_aad.end()));
+        env->set_timestamp_ms(now_ms);
+        env->set_user_pubkey(peer_b.identity_pubkey());
+        env->set_sender_pubkey(std::string(
+            reinterpret_cast<const char*>(identity.public_key().data()),
+            identity.public_key().size()));
+        env->set_ciphertext(std::string(inner.begin(), inner.end()));
+        env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
+        env->set_protocol_version(fb::config::kProtocolVersion);
+        blocking_send(conn, serialize(f2));
+        std::cout << "IMG-SENT: " << fname << " " << content.size() << "B" << std::endl;
+        return 0;
+    }
+
     if (args.call_offer) {
         // Headless mirror of the desktop group-call lazy bootstrap:
         // start from the peer's PUBKEY (as a RoomRoster surfaces it),
@@ -1530,6 +1627,17 @@ int main(int argc, char** argv) {
                 blocking_send(conn, serialize(qf));
             }
             std::cout << "MSG: " << payload.text() << std::endl;
+        } else if (payload.body_case() == fb::proto::DmPayload::kAttachment) {
+            const auto& at = payload.attachment();
+            if (!args.image_out.empty()) {
+                write_file(args.image_out,
+                           std::span<const std::uint8_t>(
+                               reinterpret_cast<const std::uint8_t*>(at.content().data()),
+                               at.content().size()));
+            }
+            std::cout << "IMG-RECEIVED: " << at.filename() << " "
+                      << at.content().size() << "B mime=" << at.mime_type()
+                      << std::endl;
         } else if (payload.body_case() == fb::proto::DmPayload::kChannelKey) {
             const auto& ck = payload.channel_key();
             if (ck.channel_id().size() != 32) continue;

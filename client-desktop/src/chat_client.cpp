@@ -306,6 +306,22 @@ std::vector<std::uint8_t> pack_text_payload(const std::string& text) {
     return out;
 }
 
+// Pack an inline attachment (image / GIF / small file) into a serialized
+// DmPayload. Rides the same Double Ratchet path as text via PendingSend's
+// pre_packed_payload, so the relay only ever sees ciphertext.
+std::vector<std::uint8_t> pack_attachment_payload(
+    const std::string& mime, const std::string& filename,
+    const std::string& content) {
+    fb::proto::DmPayload p;
+    auto* a = p.mutable_attachment();
+    a->set_mime_type(mime);
+    a->set_filename(filename);
+    a->set_content(content);
+    std::vector<std::uint8_t> out(p.ByteSizeLong());
+    if (!p.SerializeToArray(out.data(), static_cast<int>(out.size()))) out.clear();
+    return out;
+}
+
 QString peer_label_for(std::span<const std::uint8_t> pub) {
     QString s = "peer-";
     for (int i = 0; i < 4 && i < static_cast<int>(pub.size()); ++i) {
@@ -2003,6 +2019,22 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 emit messageReceived(
                                     peer_fp, cached_username,
                                     QString::fromStdString(payload.text()));
+                            } else if (payload.body_case() ==
+                                       fb::proto::DmPayload::kAttachment) {
+                                // Inline image / GIF / small file. Surface
+                                // it to the UI for inline rendering.
+                                // Persistence across restart is a follow-up
+                                // — for now attachments are live-session.
+                                const auto& at = payload.attachment();
+                                if (at.content().size() <=
+                                        fb::config::kMaxInlineAttachmentBytes) {
+                                    emit imageReceived(
+                                        peer_fp, cached_username,
+                                        QByteArray(at.content().data(),
+                                                   static_cast<int>(at.content().size())),
+                                        QString::fromStdString(at.mime_type()),
+                                        QString::fromStdString(at.filename()));
+                                }
                             } else if (payload.body_case() ==
                                        fb::proto::DmPayload::kChannelKey) {
                                 const auto& ck = payload.channel_key();
@@ -4330,6 +4362,36 @@ void ChatClient::send_to_peer(const QString& peer, const QString& text) {
         impl_->queue.push_back({peer.toStdString(), text.toStdString(), {}});
     }
     impl_->cv.notify_all();
+}
+
+bool ChatClient::send_image_to_peer(const QString& peer, const QString& mime,
+                                     const QString& filename,
+                                     const QByteArray& content) {
+    if (content.isEmpty()) return false;
+    if (static_cast<std::size_t>(content.size()) >
+            fb::config::kMaxInlineAttachmentBytes) {
+        emit errorOccurred(
+            QString("attachment too large (%1 KB) — inline images are "
+                    "capped at %2 KB; larger files need the blob transfer "
+                    "path (not yet built)")
+                .arg(content.size() / 1024)
+                .arg(fb::config::kMaxInlineAttachmentBytes / 1024));
+        return false;
+    }
+    // Pack as a DmPayload.attachment and ride the same Double Ratchet
+    // path text uses, via PendingSend's pre_packed_payload.
+    auto packed = pack_attachment_payload(
+        mime.toStdString(), filename.toStdString(),
+        std::string(content.constData(), static_cast<std::size_t>(content.size())));
+    PendingSend ps;
+    ps.peer = peer.toStdString();
+    ps.pre_packed_payload = std::move(packed);
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->queue.push_back(std::move(ps));
+    }
+    impl_->cv.notify_all();
+    return true;
 }
 
 void ChatClient::create_channel(const QString& name, const QString& dist_file_path) {

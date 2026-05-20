@@ -9,8 +9,11 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QDateTime>
+#include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFrame>
+#include <QMimeDatabase>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QInputDialog>
@@ -338,6 +341,10 @@ MainWindow::MainWindow(QWidget* parent)
     input_edit_->setObjectName("input");
     input_edit_->setMaximumHeight(64);
     input_edit_->setPlaceholderText("Message…");
+    attach_btn_ = new QPushButton("📎", compose);
+    attach_btn_->setObjectName("secondaryBtn");
+    attach_btn_->setToolTip("Attach an image or GIF (inline, ≤256 KB)");
+    attach_btn_->setEnabled(false);
     send_btn_ = new QPushButton("Send", compose);
     send_btn_->setEnabled(false);
     verify_btn_ = new QPushButton("Verify", compose);
@@ -347,6 +354,7 @@ MainWindow::MainWindow(QWidget* parent)
     compose_l->addWidget(target_hint_);
     compose_l->addWidget(target_edit_);
     compose_l->addWidget(input_edit_, /*stretch=*/1);
+    compose_l->addWidget(attach_btn_);
     compose_l->addWidget(send_btn_);
     compose_l->addWidget(verify_btn_);
     chat_l->addWidget(compose);
@@ -386,6 +394,7 @@ MainWindow::MainWindow(QWidget* parent)
     // ---- Wires ----
     QObject::connect(connect_btn_, &QPushButton::clicked, this, &MainWindow::onConnectClicked);
     QObject::connect(send_btn_,    &QPushButton::clicked, this, &MainWindow::onSendClicked);
+    QObject::connect(attach_btn_,  &QPushButton::clicked, this, &MainWindow::onAttachClicked);
     QObject::connect(new_chan_btn_, &QPushButton::clicked, this, &MainWindow::onNewChannelClicked);
     QObject::connect(invite_btn_, &QPushButton::clicked, this, &MainWindow::onInviteClicked);
     QObject::connect(leave_btn_, &QPushButton::clicked, this, &MainWindow::onLeaveClicked);
@@ -398,6 +407,8 @@ MainWindow::MainWindow(QWidget* parent)
     QObject::connect(client_.get(), &ChatClient::log, this, &MainWindow::appendLog);
     QObject::connect(client_.get(), &ChatClient::messageReceived, this,
                      &MainWindow::appendIncoming);
+    QObject::connect(client_.get(), &ChatClient::imageReceived, this,
+                     &MainWindow::appendIncomingImage);
     QObject::connect(client_.get(), &ChatClient::channelMessageReceived, this,
                      &MainWindow::appendChannelIncoming);
     QObject::connect(client_.get(), &ChatClient::channelJoined, this,
@@ -639,18 +650,29 @@ void MainWindow::onSignOut() {
     }
 }
 
-void MainWindow::appendMessage(const QString& key, const QString& sender_name,
-                               const QString& sender_seed, const QString& body,
-                               qint64 ts_ms, bool is_self, bool is_history) {
-    buffers_[key].push_back({sender_name, sender_seed, body, ts_ms, is_self, is_history});
+namespace {
+// Stamp every message role (text + optional inline image) onto a list
+// item, so appendMessage / appendImageMessage / the selectConversation
+// rebuild all produce identical items.
+void fill_message_item(QListWidgetItem* item, const MainWindow::Line& l) {
+    item->setData(MessageDelegate::RoleSenderName, l.sender_name);
+    item->setData(MessageDelegate::RoleSenderSeed, l.sender_seed);
+    item->setData(MessageDelegate::RoleBody, l.body);
+    item->setData(MessageDelegate::RoleTimestamp, l.ts_ms);
+    item->setData(MessageDelegate::RoleIsSelf, l.is_self);
+    item->setData(MessageDelegate::RoleIsHistory, l.is_history);
+    if (!l.image_bytes.isEmpty()) {
+        item->setData(MessageDelegate::RoleImageBytes, l.image_bytes);
+        item->setData(MessageDelegate::RoleImageMime, l.image_mime);
+    }
+}
+}  // namespace
+
+void MainWindow::appendLineToConversation(const QString& key, const Line& l) {
+    buffers_[key].push_back(l);
     if (key == current_conv_) {
         auto* item = new QListWidgetItem;
-        item->setData(MessageDelegate::RoleSenderName, sender_name);
-        item->setData(MessageDelegate::RoleSenderSeed, sender_seed);
-        item->setData(MessageDelegate::RoleBody, body);
-        item->setData(MessageDelegate::RoleTimestamp, ts_ms);
-        item->setData(MessageDelegate::RoleIsSelf, is_self);
-        item->setData(MessageDelegate::RoleIsHistory, is_history);
+        fill_message_item(item, l);
         messages_->addItem(item);
         messages_->scrollToBottom();
     } else {
@@ -666,6 +688,22 @@ void MainWindow::appendMessage(const QString& key, const QString& sender_name,
             }
         }
     }
+}
+
+void MainWindow::appendMessage(const QString& key, const QString& sender_name,
+                               const QString& sender_seed, const QString& body,
+                               qint64 ts_ms, bool is_self, bool is_history) {
+    appendLineToConversation(key,
+        Line{sender_name, sender_seed, body, ts_ms, is_self, is_history, {}, {}});
+}
+
+void MainWindow::appendImageMessage(const QString& key, const QString& sender_name,
+                                    const QString& sender_seed,
+                                    const QByteArray& image_bytes, const QString& mime,
+                                    qint64 ts_ms, bool is_self) {
+    appendLineToConversation(key,
+        Line{sender_name, sender_seed, /*body=*/{}, ts_ms, is_self,
+             /*is_history=*/false, image_bytes, mime});
 }
 
 void MainWindow::selectConversation(const QString& key) {
@@ -685,12 +723,7 @@ void MainWindow::selectConversation(const QString& key) {
     if (it != buffers_.end()) {
         for (const auto& line : it->second) {
             auto* item = new QListWidgetItem;
-            item->setData(MessageDelegate::RoleSenderName, line.sender_name);
-            item->setData(MessageDelegate::RoleSenderSeed, line.sender_seed);
-            item->setData(MessageDelegate::RoleBody, line.body);
-            item->setData(MessageDelegate::RoleTimestamp, line.ts_ms);
-            item->setData(MessageDelegate::RoleIsSelf, line.is_self);
-            item->setData(MessageDelegate::RoleIsHistory, line.is_history);
+            fill_message_item(item, line);
             messages_->addItem(item);
         }
         messages_->scrollToBottom();
@@ -736,6 +769,43 @@ void MainWindow::onSendClicked() {
         client_->send_to_peer(target, text);
     }
     input_edit_->clear();
+}
+
+void MainWindow::onAttachClicked() {
+    const auto target = target_edit_->text().trimmed();
+    if (target.isEmpty()) {
+        QMessageBox::information(this, "Attach",
+            "Pick a DM peer in the target field first.");
+        return;
+    }
+    if (target.startsWith('#')) {
+        QMessageBox::information(this, "Attach",
+            "Inline images are DM-only for now — channel attachments are a "
+            "follow-up.");
+        return;
+    }
+    const QString path = QFileDialog::getOpenFileName(
+        this, "Attach image or GIF", QString(),
+        "Images (*.png *.jpg *.jpeg *.gif *.webp *.bmp)");
+    if (path.isEmpty()) return;
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, "Attach", "Could not open that file.");
+        return;
+    }
+    const QByteArray bytes = f.readAll();
+    f.close();
+    const QString mime =
+        QMimeDatabase().mimeTypeForFileNameAndData(path, bytes).name();
+    const QString filename = QFileInfo(path).fileName();
+    rememberDmPeer(target);
+    // send_image_to_peer enforces the 256 KB cap (emits errorOccurred on
+    // overflow); only echo locally when it accepts the send.
+    if (client_->send_image_to_peer(target, mime, filename, bytes)) {
+        appendImageMessage(ConvKey::dm_user(target), my_username_, my_username_,
+                           bytes, mime, QDateTime::currentMSecsSinceEpoch(),
+                           /*is_self=*/true);
+    }
 }
 
 void MainWindow::onNewChannelClicked() {
@@ -872,6 +942,31 @@ void MainWindow::appendIncoming(const QString& peer_fp, const QString& peer_user
                   /*is_self=*/false, /*is_history=*/false);
 }
 
+void MainWindow::appendIncomingImage(const QString& peer_fp,
+                                     const QString& peer_username,
+                                     const QByteArray& content, const QString& mime,
+                                     const QString& filename) {
+    // Same sidebar-key resolution as appendIncoming.
+    const bool have_username = !peer_username.isEmpty();
+    const QString display_label = have_username ? peer_username : peer_fp;
+    const QString key = have_username ? ConvKey::dm_user(peer_username)
+                                      : (QStringLiteral("dm:") + peer_fp);
+    QListWidgetItem* item = nullptr;
+    for (int i = 0; i < dm_list_->count(); ++i) {
+        if (dm_list_->item(i)->data(Qt::UserRole).toString() == key) {
+            item = dm_list_->item(i);
+            break;
+        }
+    }
+    if (!item) {
+        item = sidebar_item(display_label, display_label, 28, dm_list_);
+        item->setData(Qt::UserRole, key);
+    }
+    (void)filename;   // reserved for a future "save as" / caption affordance
+    appendImageMessage(key, display_label, display_label, content, mime,
+                       QDateTime::currentMSecsSinceEpoch(), /*is_self=*/false);
+}
+
 void MainWindow::appendChannelIncoming(const QString& channel, const QString& sender_fp,
                                        const QString& text) {
     appendMessage(ConvKey::chan(channel), sender_fp, sender_fp, text,
@@ -890,6 +985,7 @@ void MainWindow::onConnected(const QString& my_fp) {
     status_label_->setText(QString("connected · %1").arg(my_fp));
     status_label_->setStyleSheet("color: #3ba55d;");
     send_btn_->setEnabled(true);
+    attach_btn_->setEnabled(true);
     new_chan_btn_->setEnabled(true);
     invite_btn_->setEnabled(true);
     leave_btn_->setEnabled(true);

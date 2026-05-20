@@ -65,6 +65,13 @@ public:
     // the UI thread; queues onto the worker.
     void send_to_peer(const QString& peer, const QString& text);
 
+    // Send an inline image / GIF / small file to `peer`. `content` must be
+    // <= fb::config::kMaxInlineAttachmentBytes (256 KiB) — returns false
+    // (and emits errorOccurred) otherwise. Rides the same ratchet path as
+    // a text DM. Safe to call from the UI thread.
+    bool send_image_to_peer(const QString& peer, const QString& mime,
+                            const QString& filename, const QByteArray& content);
+
     // Channels (Phase 1).
     //   create_channel — generate own SenderKeys chain, write distribution to
     //                    `dist_file_path`, subscribe to channel.
@@ -223,6 +230,10 @@ signals:
     // empty string means "not yet known — show the fingerprint until
     // peerUsernameResolved arrives".
     void messageReceived(QString peerFingerprint, QString peerUsername, QString text);
+    // Inbound inline attachment (image / GIF / small file) from a DM peer.
+    // `content` is the raw file bytes; render inline (QImage / QMovie).
+    void imageReceived(QString peerFingerprint, QString peerUsername,
+                       QByteArray content, QString mime, QString filename);
     void channelMessageReceived(QString channelName, QString senderFingerprint, QString text);
     void channelJoined(QString channelName);
     // Server resolved a sender pubkey to a registered username. Emitted on

@@ -33,6 +33,19 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QWidget* parent = nullptr);
 
+    // One rendered line in a conversation buffer. Public so the message
+    // delegate / item-fill helper can name it. image_bytes empty = text.
+    struct Line {
+        QString    sender_name;
+        QString    sender_seed;
+        QString    body;
+        qint64     ts_ms;
+        bool       is_self;
+        bool       is_history;
+        QByteArray image_bytes;   // inline image / GIF; empty = text line
+        QString    image_mime;
+    };
+
     // Adopt an unlocked identity (from LoginDialog). Pre-fills the username
     // field, displays the fingerprint, and stores the seed for later
     // connect() calls. Caller must invoke before show().
@@ -59,6 +72,7 @@ private slots:
     void onIncomingCall(const QString& peerLabel, const QString& peerFingerprint);
     void onCallStateChanged(const QString& peerLabel, int state);
     void onSendClicked();
+    void onAttachClicked();
     void onNewChannelClicked();
     void onInviteClicked();
     void onLeaveClicked();
@@ -68,6 +82,9 @@ private slots:
     void appendLog(const QString& s);
     void appendIncoming(const QString& peer_fp, const QString& peer_username,
                         const QString& text);
+    void appendIncomingImage(const QString& peer_fp, const QString& peer_username,
+                             const QByteArray& content, const QString& mime,
+                             const QString& filename);
     void appendChannelIncoming(const QString& channel, const QString& sender_fp, const QString& text);
     void onChannelJoined(const QString& channel);
     void onConnected(const QString& my_fp);
@@ -79,9 +96,14 @@ private slots:
 
 private:
     void selectConversation(const QString& key);
+    void appendLineToConversation(const QString& key, const Line& l);
     void appendMessage(const QString& key, const QString& sender_name,
                        const QString& sender_seed, const QString& body,
                        qint64 ts_ms, bool is_self, bool is_history);
+    void appendImageMessage(const QString& key, const QString& sender_name,
+                            const QString& sender_seed,
+                            const QByteArray& image_bytes, const QString& mime,
+                            qint64 ts_ms, bool is_self);
     void rememberDmPeer(const QString& username);
     void updateChatHeader();
 
@@ -144,6 +166,7 @@ private:
     QLineEdit*      target_edit_ = nullptr;
     QLabel*         target_hint_ = nullptr;
     QPlainTextEdit* input_edit_  = nullptr;
+    QPushButton*    attach_btn_  = nullptr;
     QPushButton*    send_btn_    = nullptr;
     QPushButton*    verify_btn_  = nullptr;
 
@@ -162,14 +185,6 @@ private:
     // .vault file (encrypted) at LoginDialog creation time.
     std::array<std::uint8_t, 32> my_seed_{};
 
-    struct Line {
-        QString sender_name;
-        QString sender_seed;
-        QString body;
-        qint64  ts_ms;
-        bool    is_self;
-        bool    is_history;
-    };
     std::map<QString, QList<Line>> buffers_;
     QString current_conv_;
 

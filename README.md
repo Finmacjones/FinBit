@@ -27,6 +27,13 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
   XChaCha20-Poly1305 (WASM, no AES-NI). Server only ever sees ciphertext —
   and in serverless mode it sees nothing at all (see "Serverless overlay"
   below). 183 native tests + 9 web smokes + 10 end-to-end shell demos pass.
+- **Inline images & GIFs (DMs)** — the 📎 attach button sends an image or
+  GIF as a `DmPayload.attachment`, rendered inline in the chat (animated
+  for GIFs). Rides the same Double Ratchet as text, so the relay only sees
+  ciphertext. Capped at 256 KB per attachment (a single relayed envelope
+  must fit the per-sender burst budget); larger media awaits the chunked
+  blob path. In-session today — persistent image history and channel
+  attachments are follow-ups. Proven by `tools/e2e/image_roundtrip.sh`.
 - **Channels** — Two interoperable group-crypto paths:
   - **SenderKeys** (default) — per-(group, sender) symmetric chains with
     replay rejection, out-of-order delivery, post-eviction key

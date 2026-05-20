@@ -76,10 +76,11 @@ jobs:
       #                           completes for a never-DM'd peer, and the
       #                           relay never sees the SDP.
       # Both are pure bash + python3 (free-port picker) — no extra deps.
-      - name: e2e (server-blindness + call signaling)
+      - name: e2e (server-blindness + call signaling + attachments)
         run: |
           bash tools/e2e/dm_roundtrip.sh build
           bash tools/e2e/call_signal_roundtrip.sh build
+          bash tools/e2e/image_roundtrip.sh build
 
       # Censorship-resistance transport e2e (need the openssl CLI for the
       # self-signed test certs). Each proves a full DM round-trip over the

@@ -106,6 +106,19 @@ message MlsCommit {
     bytes commit     = 2;
 }
 
+// Inline attachment — a small image / GIF / file carried directly inside
+// the DM body (not a detached blob). `content` is the raw file bytes; the
+// whole DmPayload is sealed by the Double Ratchet, so the relay sees only
+// ciphertext. Kept small on purpose: a single relayed envelope must fit
+// under the per-sender burst budget (fb::config::ratelimit::kDefaultBurstBytes,
+// 500 KB), so senders cap content at fb::config::kMaxInlineAttachmentBytes
+// (256 KiB). Larger media needs the chunked/blob path (not yet built).
+message Attachment {
+    string mime_type = 1;   // e.g. "image/png", "image/gif", "image/jpeg"
+    string filename  = 2;   // original name, for "save as" / display
+    bytes  content   = 3;   // raw file bytes (pre-encryption)
+}
+
 message DmPayload {
     oneof body {
         string                  text               = 1;
@@ -116,5 +129,6 @@ message DmPayload {
         MlsWelcome              mls_welcome        = 6;
         MlsCommit               mls_commit         = 7;
         MlsProposal             mls_proposal       = 8;
+        Attachment              attachment         = 9;
     }
 }

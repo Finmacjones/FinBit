@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -50,5 +51,14 @@ namespace ratelimit {
 inline constexpr std::uint64_t kDefaultSustainedBytesPerSec = 50 * 1024;       // 50 KB/s
 inline constexpr std::uint64_t kDefaultBurstBytes           = 500 * 1024;      // 500 KB
 }  // namespace ratelimit
+
+// Maximum size of an INLINE attachment (image / GIF / small file carried
+// directly inside a DmPayload). Must stay comfortably under the relay's
+// per-sender burst budget (ratelimit::kDefaultBurstBytes = 500 KB): a
+// single envelope whose ciphertext exceeds the burst can never pass the
+// token bucket and is dropped. 256 KiB leaves headroom for AEAD/protobuf
+// overhead and doesn't starve following messages. Larger media needs the
+// chunked/blob transfer path (not yet implemented).
+inline constexpr std::size_t kMaxInlineAttachmentBytes = 256 * 1024;          // 256 KiB
 
 }  // namespace fb::config
