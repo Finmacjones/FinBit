@@ -42,7 +42,7 @@ jobs:
             cmake build-essential ninja-build pkg-config \
             libsodium-dev libsqlite3-dev libprotobuf-dev protobuf-compiler \
             libfmt-dev libspdlog-dev libgtest-dev \
-            libbrotli-dev libssl-dev \
+            libbrotli-dev libssl-dev openssl \
             qt6-base-dev qt6-base-dev-tools qt6-tools-dev \
             libgl-dev libxkbcommon-dev libfontconfig1-dev \
             libgstreamer1.0-dev libgstreamer-plugins-bad1.0-dev \
@@ -80,6 +80,22 @@ jobs:
         run: |
           bash tools/e2e/dm_roundtrip.sh build
           bash tools/e2e/call_signal_roundtrip.sh build
+
+      # Censorship-resistance transport e2e (need the openssl CLI for the
+      # self-signed test certs). Each proves a full DM round-trip over the
+      # mimicry transport AND that the relay stays blind to the plaintext:
+      #   - wss_native_dm_roundtrip : real RFC 6455 WebSocket over TLS
+      #                               (--tls-port + fb-cli --wss; Tier 2:
+      #                               ALPN + GREASE'd Chrome JA3).
+      #   - fronting_dm_roundtrip   : domain-fronting (Tier 3) — cert is
+      #                               issued for the FRONT name only, the
+      #                               client dials the IP with SNI=front +
+      #                               Host=real backend; a no-`--front`
+      #                               control is rejected by cert verify.
+      - name: e2e (censorship transports — WSS + domain-fronting)
+        run: |
+          bash tools/e2e/wss_native_dm_roundtrip.sh build
+          bash tools/e2e/fronting_dm_roundtrip.sh build
 
       # -----------------------------------------------------------------
       # Bundle the three release binaries into a tarball with the LICENSE
