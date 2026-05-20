@@ -62,6 +62,7 @@
 #include "fb/crypto/identity.hpp"
 #include "fb/crypto/ratchet.hpp"
 #include "fb/crypto/sender_keys.hpp"
+#include "fb/net/ech.hpp"
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
 #include "fb/net/tls_client.hpp"
@@ -146,6 +147,9 @@ struct Args {
                                     // of the SNI/front and connect host
     std::string mimic;              // Tier-4 JA3: "chrome"|"firefox"|"off"
                                     // (empty => chrome when --wss is set)
+    std::string ech_b64;            // Tier-4 ECH: base64 ECHConfigList
+                                    // (encrypts SNI when the TLS stack
+                                    // supports ECH; ignored otherwise)
 
     // Overlay relay test (N1): exercises the server-relayed
     // PeerEnvelope path without standing up the full DhtNode /
@@ -192,6 +196,8 @@ void usage() {
               << "                        (what the CDN routes to; defaults to --server host)\n"
               << "  --mimic WHICH         Tier-4 JA3: chrome|firefox|off browser ClientHello\n"
               << "                        fingerprint (defaults to chrome when --wss is set)\n"
+              << "  --ech B64             Tier-4 ECH: base64 ECHConfigList; encrypts the SNI\n"
+              << "                        when built against a TLS stack with ECH support\n"
               << "Default URL constant: " << fb::config::kDefaultServerUrl << "\n";
 }
 
@@ -252,6 +258,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (s == "--front") { if (!next(a.tls_sni)) return false; }
         else if (s == "--ws-host") { if (!next(a.ws_host)) return false; }
         else if (s == "--mimic") { if (!next(a.mimic)) return false; }
+        else if (s == "--ech") { if (!next(a.ech_b64)) return false; }
         else if (s == "--overlay-send") { a.overlay_send = true; }
         else if (s == "--overlay-recv") { a.overlay_recv = true; }
         else if (s == "--overlay-kind") {
@@ -713,6 +720,17 @@ int main(int argc, char** argv) {
             if (m == "chrome")  tlsopts.tls_fingerprint = fb::net::TlsFingerprint::kChrome;
             else if (m == "firefox") tlsopts.tls_fingerprint = fb::net::TlsFingerprint::kFirefox;
             else tlsopts.tls_fingerprint = fb::net::TlsFingerprint::kDefault;
+        }
+        // Tier-4 ECH: decode the supplied ECHConfigList (encrypts the SNI
+        // when the TLS stack supports ECH; a no-op otherwise).
+        if (!args.ech_b64.empty()) {
+            if (auto ecl = fb::net::ech::decode_ech_config_list_b64(args.ech_b64)) {
+                tlsopts.ech_config_list = std::move(*ecl);
+            } else {
+                std::fprintf(stderr,
+                    "[fb-cli] WARNING: --ech value is not a valid base64 "
+                    "ECHConfigList; ignoring.\n");
+            }
         }
         if (args.tls_insecure_skip_verify) {
             std::fprintf(stderr,

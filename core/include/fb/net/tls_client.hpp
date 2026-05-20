@@ -88,6 +88,14 @@ struct TlsClientOptions {
     // cipher / group / sigalg lists toward that browser's JA3.
     TlsFingerprint tls_fingerprint = TlsFingerprint::kDefault;
 
+    // ECH (Encrypted Client Hello) config — the server's ECHConfigList
+    // wire bytes (e.g. from a DNS `ech=` value via the DoH path; decode
+    // with fb::net::ech::decode_ech_config_list_b64). When set AND the
+    // TLS stack supports ECH (FB_HAVE_ECH=1), the SNI is encrypted to
+    // this config; otherwise it's ignored (cleartext SNI). See
+    // docs/censorship-resistance.md (Tier 4).
+    std::vector<std::uint8_t> ech_config_list;
+
     // ---- Identity-pinned mutual auth (FinBit serverless P2P) ----
     //
     // When set, present this client cert + key during the TLS

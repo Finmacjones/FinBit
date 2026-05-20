@@ -73,6 +73,7 @@ add_library(fb_core STATIC
     src/net/tcp.cpp
     src/net/io_loop.cpp
     src/net/doh_resolver.cpp
+    src/net/ech.cpp
     src/net/websocket.cpp
     src/store/sqlite_store.cpp
     src/ratelimit/token_bucket.cpp
@@ -160,8 +161,28 @@ if(OpenSSL_FOUND)
     target_link_libraries(fb_core PUBLIC OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(fb_core PUBLIC FB_HAVE_OPENSSL=1)
     message(STATUS "fb_core: OpenSSL ${OPENSSL_VERSION} → TlsClient enabled")
+
+    # --- ECH (Encrypted Client Hello) detection (Tier-4) ------------------
+    # Mainline OpenSSL ships HPKE (the ECH primitive) before the SSL_* ECH
+    # handshake hooks. Probe for the client API; FB_HAVE_ECH gates the
+    # TlsClient wiring so the SNI gets encrypted only on a stack that
+    # actually supports it (a future OpenSSL, or BoringSSL). Detection and
+    # the call reference the SAME symbol, so a miss is safe (no ECH, not a
+    # build break).
+    include(CheckCXXSymbolExists)
+    set(CMAKE_REQUIRED_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+    check_cxx_symbol_exists(SSL_set1_ech_config_list "openssl/ssl.h" FB_OPENSSL_HAS_ECH)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(FB_OPENSSL_HAS_ECH)
+        target_compile_definitions(fb_core PUBLIC FB_HAVE_ECH=1)
+        message(STATUS "fb_core: OpenSSL ECH hooks present → SNI encryption available")
+    else()
+        target_compile_definitions(fb_core PUBLIC FB_HAVE_ECH=0)
+        message(STATUS "fb_core: OpenSSL has no ECH handshake hooks → ECH wiring gated off")
+    endif()
 else()
     target_compile_definitions(fb_core PUBLIC FB_HAVE_OPENSSL=0)
+    target_compile_definitions(fb_core PUBLIC FB_HAVE_ECH=0)
     message(STATUS "fb_core: OpenSSL NOT found → TlsClient throws on use")
 endif()
 

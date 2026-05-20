@@ -9,6 +9,7 @@
 #if FB_HAVE_OPENSSL
 
 #include <openssl/err.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
 
@@ -78,6 +79,28 @@ InitOpenSSL& openssl_init() {
     return init;
 }
 
+// --- GREASE (RFC 8701) -----------------------------------------------------
+// Browsers inject GREASE values to keep the ecosystem tolerant of unknown
+// TLS codepoints; their absence is itself a fingerprint. OpenSSL has no
+// client GREASE of its own, but SSL_CTX_add_custom_ext lets us add
+// extensions with GREASE type values, which moves the JA3/JA4 extension
+// list toward a browser's. (Cipher/group/version GREASE still needs
+// BoringSSL — see docs/censorship-resistance.md Tier 4.)
+constexpr std::uint16_t kGreaseValues[16] = {
+    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
+    0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa};
+
+int grease_ext_add(SSL*, unsigned int, unsigned int,
+                   const unsigned char** out, std::size_t* outlen,
+                   X509*, std::size_t, int*, void*) {
+    static const unsigned char kEmpty = 0;
+    *out = &kEmpty;   // ignored when *outlen == 0
+    *outlen = 0;      // empty GREASE extension body
+    return 1;         // 1 = include the extension
+}
+void grease_ext_free(SSL*, unsigned int, unsigned int,
+                     const unsigned char*, void*) {}
+
 // Apply a browser ClientHello fingerprint profile (Tier-4). Best-effort:
 // names that a particular OpenSSL build doesn't recognise are skipped so
 // the handshake still works — shaping degrades gracefully rather than
@@ -131,6 +154,24 @@ void apply_fingerprint(SSL_CTX* ctx, TlsFingerprint fp) {
     if (ciphers12) { if (SSL_CTX_set_cipher_list(ctx, ciphers12) != 1) ERR_clear_error(); }
     if (groups)    { if (SSL_CTX_set1_groups_list(ctx, groups) != 1)   ERR_clear_error(); }
     if (sigalgs)   { if (SSL_CTX_set1_sigalgs_list(ctx, sigalgs) != 1)  ERR_clear_error(); }
+
+    // Add two distinct GREASE extensions (like a browser's first/last
+    // GREASE). Random per-connection — TlsClient builds a fresh CTX per
+    // connect, so each handshake picks fresh values.
+    std::uint8_t r[2] = {0, 0};
+    if (RAND_bytes(r, 2) == 1) {
+        const std::uint16_t g1 = kGreaseValues[r[0] & 0x0f];
+        std::uint16_t g2 = kGreaseValues[r[1] & 0x0f];
+        if (g2 == g1) g2 = kGreaseValues[(r[1] + 1) & 0x0f];
+        for (std::uint16_t g : {g1, g2}) {
+            if (SSL_CTX_add_custom_ext(
+                    ctx, g, SSL_EXT_CLIENT_HELLO,
+                    grease_ext_add, grease_ext_free, nullptr,
+                    nullptr, nullptr) != 1) {
+                ERR_clear_error();
+            }
+        }
+    }
 }
 
 [[noreturn]] void throw_openssl(const std::string& ctx) {
@@ -265,6 +306,22 @@ void TlsClient::connect(const std::string& host, std::uint16_t port,
             }
         }
     }
+
+    // 3c. ECH (Encrypted Client Hello). Only compiled when the TLS stack
+    // exposes the hooks (FB_HAVE_ECH); otherwise the config is ignored
+    // and the SNI travels in cleartext (Tiers 2/3 still apply). When
+    // active, OpenSSL HPKE-encrypts the real SNI to the server's
+    // published config, so a passive observer sees only the outer
+    // public name.
+#if FB_HAVE_ECH
+    if (!opts.ech_config_list.empty()) {
+        if (SSL_set1_ech_config_list(impl_->ssl,
+                                     opts.ech_config_list.data(),
+                                     opts.ech_config_list.size()) != 1) {
+            ERR_clear_error();  // best-effort: fall back to cleartext SNI
+        }
+    }
+#endif
 
     // 4. SNI + hostname verification. SNI is mandatory for any modern
     // server (vhosting, certificate selection); X509 hostname check

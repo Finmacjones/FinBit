@@ -90,9 +90,14 @@ parse_finbit_txt(std::string_view txt_body) {
     auto pub = hex_decode(key_tok.substr(kKp.size()), 32);
     if (!pub) return std::nullopt;
 
-    // Token 2 (rest): the address. Any non-empty string is valid;
-    // schema validation happens at dial time.
-    auto addr = trim(rest.substr(space + 1));
+    // Token 2: the address (first whitespace-delimited token after the
+    // key). Any non-empty string is valid; schema validation happens at
+    // dial time. Further tokens (e.g. `ech=<base64>`) may follow and are
+    // parsed separately by fb::net::ech::parse_ech_param.
+    auto after_key = trim(rest.substr(space + 1));
+    const auto addr_end = after_key.find_first_of(" \t");
+    auto addr = (addr_end == std::string_view::npos)
+                    ? after_key : trim(after_key.substr(0, addr_end));
     if (addr.empty()) return std::nullopt;
 
     fb::p2p::PeerInfo info;

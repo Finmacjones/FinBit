@@ -193,15 +193,24 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
     Works against a cooperating reverse-proxy/CDN that routes by `Host`;
     ECH is the planned successor. See
     [`docs/censorship-resistance.md`](docs/censorship-resistance.md).
-  - **JA3 ClientHello shaping** (censorship-resistance, Tier 4) — the
-    TLS client can present a Chrome/Firefox-ordered cipher-suite,
-    supported-group and signature-algorithm list so its JA3 matches a
-    browser instead of stock OpenSSL. On by default for the DoH resolver
-    and the WSS paths; tunable via `fb-cli --mimic chrome|firefox|off`,
-    `FB_TLS_MIMIC`, and `PeerDialerOptions::tls_fingerprint`. Honest
-    limit: OpenSSL can't reorder extensions or inject GREASE, so this
-    isn't byte-perfect uTLS — that (and ECH for SNI encryption) needs a
-    BoringSSL/ECH toolchain. Verified by the `TlsFingerprint.*` tests.
+  - **JA3 ClientHello shaping + GREASE** (censorship-resistance, Tier 4)
+    — the TLS client presents a Chrome/Firefox-ordered cipher-suite,
+    supported-group and signature-algorithm list, and injects
+    RFC 8701 GREASE extensions, so its JA3/JA4 matches a browser instead
+    of stock OpenSSL. On by default for the DoH resolver and the WSS
+    paths; tunable via `fb-cli --mimic chrome|firefox|off`,
+    `FB_TLS_MIMIC`, and `PeerDialerOptions::tls_fingerprint`. Verified by
+    the `TlsFingerprint.*` tests (which render and parse the real
+    ClientHello). Honest limit: OpenSSL can't reorder extensions or
+    GREASE the cipher/group lists, so this isn't byte-perfect uTLS.
+  - **ECH readiness** (censorship-resistance, Tier 4) — `fb::net::ech`
+    decodes/validates an `ECHConfigList` (carried as an `ech=` token in
+    the DoH TXT record, or supplied via `fb-cli --ech` / `FB_ECH`), and
+    `TlsClient` applies it under a build-time `FB_HAVE_ECH` flag to
+    encrypt the SNI. OpenSSL 3.6 ships the HPKE primitive but not the ECH
+    handshake hooks (so it's gated off today); the wiring activates with
+    no code change on a BoringSSL/ECH-capable stack. See
+    [`docs/censorship-resistance.md`](docs/censorship-resistance.md).
   - **Periodic cadence** — `republish_self` rotates our own
     provider record before its TTL expires (default every 30
     minutes; TTL is 1 hour). `gossip_pull_round` walks every

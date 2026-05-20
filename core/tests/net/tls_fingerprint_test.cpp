@@ -83,6 +83,17 @@ std::optional<std::uint16_t> first_supported_group(const ClientHello& h) {
     return static_cast<std::uint16_t>((d[2] << 8) | d[3]);
 }
 
+// RFC 8701 GREASE values: both bytes equal and low nibble == 0xa.
+bool is_grease(std::uint16_t v) {
+    return (v >> 8) == (v & 0xff) && (v & 0x0f) == 0x0a;
+}
+bool has_grease_extension(const ClientHello& h) {
+    for (const auto& [type, _] : h.extensions) {
+        if (is_grease(type)) return true;
+    }
+    return false;
+}
+
 constexpr std::uint16_t kTLS_AES_128_GCM_SHA256 = 0x1301;
 constexpr std::uint16_t kTLS_AES_256_GCM_SHA384 = 0x1302;
 constexpr std::uint16_t kGroupX25519            = 0x001d;
@@ -105,6 +116,21 @@ TEST(TlsFingerprint, ChromeProfileReshapesClientHello) {
     auto g = first_supported_group(h);
     ASSERT_TRUE(g.has_value()) << "no supported_groups extension";
     EXPECT_EQ(*g, kGroupX25519);
+
+    // GREASE extensions are injected (browsers send them; OpenSSL's
+    // default does not).
+    EXPECT_TRUE(has_grease_extension(h)) << "no GREASE extension found";
+}
+
+TEST(TlsFingerprint, DefaultHasNoGreaseButChromeDoes) {
+    auto chrome = fb::net::debug_client_hello(fb::net::TlsFingerprint::kChrome);
+    auto deflt  = fb::net::debug_client_hello(fb::net::TlsFingerprint::kDefault);
+    if (chrome.empty() || deflt.empty()) GTEST_SKIP() << "OpenSSL not compiled in";
+    auto hc = parse_client_hello(chrome);
+    auto hd = parse_client_hello(deflt);
+    ASSERT_TRUE(hc.ok && hd.ok);
+    EXPECT_TRUE(has_grease_extension(hc));
+    EXPECT_FALSE(has_grease_extension(hd));
 }
 
 TEST(TlsFingerprint, ChromeDiffersFromDefault) {

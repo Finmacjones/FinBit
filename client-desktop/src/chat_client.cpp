@@ -46,6 +46,7 @@
 #include "fb/crypto/sender_keys.hpp"
 #include "fb/crypto/mls_facade.hpp"
 #include "media_call.hpp"
+#include "fb/net/ech.hpp"
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
 #include "fb/net/tls_client.hpp"
@@ -508,6 +509,7 @@ struct ChatClient::Impl {
     std::string ws_front_sni;
     std::string ws_host_header;
     fb::net::TlsFingerprint tls_fingerprint = fb::net::TlsFingerprint::kDefault;
+    std::vector<std::uint8_t> ech_config_list;   // Tier-4 ECH (FB_ECH)
     fb::net::FrameDecoder dec;
     // Serverless overlay state. Each peer holds its own username log
     // + DHT routing+provider store. Both layers' SendCallbacks wrap
@@ -690,6 +692,13 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
     {
         const char* m = std::getenv("FB_TLS_MIMIC");
         impl_->tls_fingerprint = parse_fingerprint(m ? m : "", impl_->use_wss);
+    }
+    // Tier-4 ECH: FB_ECH=<base64 ECHConfigList> encrypts the SNI when the
+    // TLS stack supports ECH (ignored otherwise).
+    if (const char* e = std::getenv("FB_ECH")) {
+        if (auto ecl = fb::net::ech::decode_ech_config_list_b64(e)) {
+            impl_->ech_config_list = std::move(*ecl);
+        }
     }
     impl_->worker = std::thread([this]() {
         try {
@@ -1080,8 +1089,9 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 // SNI when set; that's what a passive observer sees.
                 tlsopts.sni_hostname         = impl_->ws_front_sni.empty()
                     ? impl_->tls_sni : impl_->ws_front_sni;
-                // Tier-4: browser JA3 ClientHello shaping.
+                // Tier-4: browser JA3 ClientHello shaping + optional ECH.
                 tlsopts.tls_fingerprint      = impl_->tls_fingerprint;
+                tlsopts.ech_config_list      = impl_->ech_config_list;
                 if (impl_->tls_insecure_skip_verify) {
                     emit log(QString(
                         "WARNING: TLS cert validation disabled "

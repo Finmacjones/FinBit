@@ -2,9 +2,11 @@
 
 > Status: living doc — Tier 1 (DoH bootstrap) shipped 2026-05-19;
 > Tiers 2 (ALPN + native WSS + L7 polish), 3 (domain-fronting /
-> SNI–Host decoupling) and 4 (JA3 ClientHello shaping) shipped
-> 2026-05-20. Byte-perfect uTLS + ECH remain (need a BoringSSL/ECH
-> toolchain) — see Tier 4.
+> SNI–Host decoupling) and 4 (JA3 cipher/group/sigalg shaping + GREASE
+> extensions + gated ECH readiness) shipped 2026-05-20. The only
+> remainder is byte-perfect uTLS (full GREASE + extension ordering) and
+> live ECH SNI encryption — both need a BoringSSL/ECH TLS stack, at
+> which point the already-wired `FB_HAVE_ECH` path activates. See Tier 4.
 
 ## 1. Threat model
 
@@ -221,7 +223,7 @@ Host/SNI independence.
   It depends on newer OpenSSL/BoringSSL ECH APIs and DNS `HTTPS` RR
   key publication — queued behind the Tier-4 TLS-stack work.
 
-### Tier 4 — JA3 ClientHello shaping  ✅ partial (shipped 2026-05-20)
+### Tier 4 — JA3 shaping + GREASE + ECH readiness  ✅ partial (shipped 2026-05-20)
 
 **Problem.** JA3/JA4 fingerprinting classifies a TLS client by its
 ClientHello — the cipher-suite list, supported-groups (curves),
@@ -250,25 +252,46 @@ failing the handshake. Verified by `TlsFingerprint.*` tests, which
 render the real ClientHello bytes (in-memory BIO) and assert the cipher
 and group order changed to the browser's.
 
-**Honest ceiling — why this is "partial".** OpenSSL exposes no API to
-control TLS **extension ordering** or to inject client-side **GREASE**
-values (Chrome randomises both). So the resulting JA3 matches a browser
-in the cipher/group/sigalg fields but **not** byte-for-byte in the
-extension field — a determined JA4 classifier can still tell the
-difference. Closing that last gap needs one of:
+**GREASE extensions (shipped 2026-05-20).** Browsers inject GREASE
+(RFC 8701) values so the ecosystem stays tolerant of unknown codepoints
+— their *absence* is itself a fingerprint. OpenSSL has no client GREASE,
+but `SSL_CTX_add_custom_ext` lets us add extensions with GREASE type
+values, so the kChrome/kFirefox profiles now emit two random GREASE
+extensions per connection (the kDefault profile does not). The
+`TlsFingerprint.DefaultHasNoGreaseButChromeDoes` test renders the
+ClientHello and confirms it. This moves the JA4 *extension* list toward
+a browser's; the remaining GREASE positions OpenSSL won't expose are
+listed below.
 
-- **BoringSSL** (which exposes `SSL_CTX_set_grease_enabled` and permits
-  extension-order control) in place of OpenSSL, or a hand-rolled
-  ClientHello assembler — i.e. a uTLS-equivalent for C++. This is a
-  build-system / dependency change, deliberately not bundled here.
-- **ECH (Encrypted Client Hello)** — the strategic end state. ECH
-  encrypts the SNI and the sensitive inner extensions inside a
-  ClientHelloOuter that names a public/decoy host, which subsumes both
-  Tier-3 fronting and JA3 SNI leakage. It needs an OpenSSL/BoringSSL
-  build with ECH APIs plus DNS `HTTPS`/`SVCB` RR key publication
-  (pairs naturally with the Tier-1 DoH resolver). Tracked as the
-  Tier-4 follow-on once a TLS stack with stable ECH support is in the
-  toolchain.
+**ECH readiness (shipped 2026-05-20, gated).** The config plumbing for
+Encrypted Client Hello is in place: `fb::net::ech` decodes + validates
+an `ECHConfigList` (base64, as published in a DNS `ech=` value, which
+the DoH TXT format now carries as a trailing `ech=<base64>` token),
+`TlsClientOptions::ech_config_list` carries it (set via `fb-cli --ech`,
+the desktop `FB_ECH` env), and `TlsClient::connect` applies it under
+`#if FB_HAVE_ECH`. Build-time detection (`check_symbol_exists
+SSL_set1_ech_config_list`) drives that flag — and detection and the
+call reference the same symbol, so a stack without ECH simply leaves it
+off (cleartext SNI, no build break). On the current OpenSSL 3.6 the
+HPKE primitive is present (`openssl/hpke.h`) but the SSL_* ECH hooks are
+not, so `FB_HAVE_ECH=0` today; the moment a stack ships them (a future
+OpenSSL, or BoringSSL) the SNI gets encrypted with no code change.
+
+**Honest ceiling — what's still not byte-perfect.** Without swapping the
+TLS stack, OpenSSL still won't let us:
+
+- **GREASE the cipher list / supported-groups / key-share / version**
+  (only the *extension* GREASE is reachable via custom extensions), nor
+- **control the exact extension *ordering*** (Chrome permutes it).
+
+So the JA3/JA4 is now browser-like in ciphers, groups, sigalgs and the
+presence of GREASE extensions, but a determined JA4 classifier comparing
+exact ordering can still tell the difference. Closing that needs
+**BoringSSL** (`SSL_CTX_set_grease_enabled` + extension-order control)
+or a hand-rolled ClientHello assembler — a uTLS-equivalent for C++,
+which is a dependency/build-system change deliberately not bundled here.
+The same BoringSSL swap (or a future OpenSSL) flips `FB_HAVE_ECH` on and
+activates the already-wired SNI encryption.
 
 ## 3. What still leaks
 
@@ -297,7 +320,7 @@ individually defeats a nation-state adversary with a dedicated team
 | 1. DoH bootstrap | ✅ shipped | `core/net/doh_resolver.*` | done |
 | 2. TLS-on-443 transport mimicry | ✅ shipped | ALPN (`tls_client.cpp` + server `alpn_select_cb`) + native WSS (`fb::net::ws` client) across `fb-cli --wss`, desktop (`FB_WSS` / "WSS" checkbox), PeerNet (`FB_PEER_WSS`, auto-detecting listener); Chrome-realistic L7 upgrade headers | done |
 | 3. Domain-fronting (SNI/Host decoupling) | ✅ shipped | `--front`/`--ws-host`, `FB_FRONT_SNI`/`FB_WS_HOST`, `PeerDialerOptions::front_sni`/`ws_host_header`; `tools/e2e/fronting_dm_roundtrip.sh` | done (ECH succeeds it) |
-| 4. JA3 ClientHello shaping | ✅ partial | `TlsFingerprint` kChrome/kFirefox in `tls_client.cpp`; DoH always, WSS paths default-on; `--mimic` / `FB_TLS_MIMIC` / `FB_PEER_TLS_MIMIC` | cipher/group/sigalg done; extension-order + GREASE + ECH need BoringSSL/ECH toolchain |
+| 4. JA3 shaping + GREASE + ECH-ready | ✅ partial | `TlsFingerprint` kChrome/kFirefox + GREASE custom-ext in `tls_client.cpp`; `fb::net::ech` config decode/validate + `FB_HAVE_ECH`-gated wiring; `--mimic`/`--ech`, `FB_TLS_MIMIC`/`FB_ECH`, `FB_PEER_TLS_MIMIC` | cipher/group/sigalg + extension-GREASE + ECH config done; full GREASE + extension-order + live ECH need BoringSSL |
 
 ## 5. References
 
