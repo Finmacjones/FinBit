@@ -226,6 +226,96 @@ TEST(PeerNet, RoundTripBetweenTwoLoopbackInstances) {
     rmrf(tmpdir);
 }
 
+// Tier-2 mimicry: a dialer with wss=true performs a real WebSocket
+// upgrade, and the listener auto-detects it. This test also proves
+// raw↔WSS interop on the same listener: A dials B over WSS while B
+// dials A over raw frames — the acceptor side handles each per-
+// connection by sniffing the first bytes.
+TEST(PeerNet, RoundTripWssDialerAndRawInterop) {
+    auto tmpdir = make_tmpdir();
+    if (tmpdir.empty()) GTEST_SKIP() << "could not create tmpdir";
+    auto cpA = gen_cert(tmpdir, 1);
+    auto cpB = gen_cert(tmpdir, 2);
+    if (!cpA.ok || !cpB.ok) {
+        rmrf(tmpdir);
+        GTEST_SKIP() << "openssl(1) not available";
+    }
+
+    fb::p2p::PeerNet a, b;
+
+    std::mutex a_mu;
+    std::vector<std::vector<std::uint8_t>> a_inbox;
+    a.set_on_message([&](const fb::p2p::PeerInfo&,
+                          std::span<const std::uint8_t> bytes) {
+        std::lock_guard lk(a_mu);
+        a_inbox.emplace_back(bytes.begin(), bytes.end());
+    });
+    std::mutex b_mu;
+    std::vector<std::vector<std::uint8_t>> b_inbox;
+    b.set_on_message([&](const fb::p2p::PeerInfo&,
+                          std::span<const std::uint8_t> bytes) {
+        std::lock_guard lk(b_mu);
+        b_inbox.emplace_back(bytes.begin(), bytes.end());
+    });
+
+    fb::p2p::PeerListenerOptions a_lo;
+    a_lo.bind_host    = "127.0.0.1";
+    a_lo.tls_cert_pem = cpA.cert_path;
+    a_lo.tls_key_pem  = cpA.key_path;
+    a.start_listener(a_lo);
+
+    fb::p2p::PeerListenerOptions b_lo;
+    b_lo.bind_host    = "127.0.0.1";
+    b_lo.tls_cert_pem = cpB.cert_path;
+    b_lo.tls_key_pem  = cpB.key_path;
+    b.start_listener(b_lo);
+
+    // A dials over WSS; B dials over raw. Both listeners auto-detect.
+    fb::p2p::PeerDialerOptions a_dopts;
+    a_dopts.insecure_skip_verify = true;
+    a_dopts.wss = true;                    // <-- Tier-2 WSS dialer
+    a.set_dialer(a_dopts);
+
+    fb::p2p::PeerDialerOptions b_dopts;
+    b_dopts.insecure_skip_verify = true;
+    b_dopts.wss = false;                   // <-- legacy raw dialer
+    b.set_dialer(b_dopts);
+
+    // A → B over WSS.
+    fb::p2p::PeerInfo b_target{};
+    b_target.addr = "wss://127.0.0.1:" + std::to_string(b.listener_port());
+    const std::vector<std::uint8_t> hello{'w', 's', 's', 0x01, 0x02};
+    EXPECT_TRUE(a.send(b_target,
+        std::span<const std::uint8_t>(hello.data(), hello.size())));
+    EXPECT_TRUE(wait_until(5000, [&]() {
+        std::lock_guard lk(b_mu);
+        return !b_inbox.empty();
+    }));
+    {
+        std::lock_guard lk(b_mu);
+        ASSERT_FALSE(b_inbox.empty());
+        EXPECT_EQ(b_inbox.front(), hello);
+    }
+
+    // B → A over raw frames (independent connection).
+    fb::p2p::PeerInfo a_target{};
+    a_target.addr = "wss://127.0.0.1:" + std::to_string(a.listener_port());
+    const std::vector<std::uint8_t> reply{'r', 'a', 'w'};
+    EXPECT_TRUE(b.send(a_target,
+        std::span<const std::uint8_t>(reply.data(), reply.size())));
+    EXPECT_TRUE(wait_until(5000, [&]() {
+        std::lock_guard lk(a_mu);
+        return !a_inbox.empty();
+    }));
+    {
+        std::lock_guard lk(a_mu);
+        ASSERT_FALSE(a_inbox.empty());
+        EXPECT_EQ(a_inbox.front(), reply);
+    }
+
+    rmrf(tmpdir);
+}
+
 TEST(PeerNet, BurstSendsArriveInOrderOnSingleConnection) {
     auto tmpdir = make_tmpdir();
     if (tmpdir.empty()) GTEST_SKIP() << "could not create tmpdir";

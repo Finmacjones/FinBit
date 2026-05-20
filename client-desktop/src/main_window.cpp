@@ -73,6 +73,13 @@ MainWindow::MainWindow(QWidget* parent)
         "outside localhost — without it, the wire bytes are "
         "visible to any router on the path even though the\n"
         "message contents stay end-to-end encrypted.");
+    wss_check_ = new QCheckBox("WSS", login_box);
+    wss_check_->setToolTip(
+        "Speak real WebSocket-over-TLS (implies TLS; server must be "
+        "on a --tls-port). The connection becomes\n"
+        "wire-indistinguishable from a browser hitting an HTTPS "
+        "site — censorship-resistance mimicry. See\n"
+        "docs/censorship-resistance.md.");
     tls_insecure_check_ = new QCheckBox("(insecure)", login_box);
     tls_insecure_check_->setToolTip(
         "Skip TLS certificate validation. Only safe for local "
@@ -119,6 +126,7 @@ MainWindow::MainWindow(QWidget* parent)
     login_l->addWidget(user_edit_);
     login_l->addSpacing(8);
     login_l->addWidget(tls_check_);
+    login_l->addWidget(wss_check_);
     login_l->addWidget(tls_insecure_check_);
     login_l->addWidget(tls_ca_btn_);
     login_l->addWidget(connect_btn_);
@@ -450,7 +458,8 @@ void MainWindow::onConnectClicked() {
     status_label_->setStyleSheet("color: #faa61a;");
     user_name_lbl_->setText(my_username_);
     user_avatar_->setPixmap(make_avatar(my_username_, 32));
-    const bool use_tls = tls_check_->isChecked();
+    const bool use_wss = wss_check_->isChecked();
+    const bool use_tls = tls_check_->isChecked() || use_wss;  // WSS implies TLS
     const bool insecure = tls_insecure_check_->isChecked();
     if (use_tls) {
         client_->connect_tls(
@@ -460,7 +469,8 @@ void MainWindow::onConnectClicked() {
             /*use_tls=*/true,
             /*ca_file=*/tls_ca_path_,
             /*insecure_skip_verify=*/insecure,
-            /*sni_hostname=*/host_edit_->text());
+            /*sni_hostname=*/host_edit_->text(),
+            /*use_wss=*/use_wss);
     } else {
         client_->connect(host_edit_->text(),
                           static_cast<std::uint16_t>(port_spin_->value()),

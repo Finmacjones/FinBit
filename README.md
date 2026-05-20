@@ -173,10 +173,14 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
   - **TLS-on-443 mimicry** (censorship-resistance, Tier 2) — the TLS
     client now advertises `http/1.1` over ALPN (browsers always send
     ALPN; sending none was a fingerprint) and the server selects it
-    via an `alpn_select_cb`. `fb-cli --wss` speaks a real RFC 6455
-    WebSocket (HTTP/1.1 `Upgrade` + masked binary frames) to the
-    server's `--tls-port`, so a native connection is wire-identical to
-    a browser's WSS. Proven by `tools/e2e/wss_native_dm_roundtrip.sh`.
+    via an `alpn_select_cb`. The native client speaks a real RFC 6455
+    WebSocket (HTTP/1.1 `Upgrade` + masked binary frames) so a
+    connection is wire-identical to a browser's WSS — available in
+    `fb-cli --wss`, the **desktop client** (the "WSS" login checkbox or
+    `FB_WSS=1`), and **PeerNet** P2P links (`FB_PEER_WSS=1`; the
+    listener auto-detects WS vs raw per connection, so WSS and legacy
+    peers interoperate). Proven by `tools/e2e/wss_native_dm_roundtrip.sh`
+    and `PeerNet.RoundTripWssDialerAndRawInterop`.
   - **Periodic cadence** — `republish_self` rotates our own
     provider record before its TTL expires (default every 30
     minutes; TTL is 1 hour). `gossip_pull_round` walks every

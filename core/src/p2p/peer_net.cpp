@@ -5,6 +5,7 @@
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
 #include "fb/net/tls_client.hpp"
+#include "fb/net/websocket.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -228,6 +229,100 @@ struct AcceptedConn {
     }
 };
 
+// ---------------------------------------------------------------------------
+// WebSocket framing role (Tier-2 mimicry). kNone = legacy raw
+// length-prefixed frames. kDialer/kAcceptor select the masked/unmasked
+// direction per RFC 6455 (client masks, server doesn't).
+// ---------------------------------------------------------------------------
+enum class WsRole { kNone, kDialer, kAcceptor };
+
+// Dialer-side WS upgrade over an already-connected channel (TlsClient).
+// Returns the bytes that arrived after the 101 response (the first WS
+// frame may be piggy-backed). Throws on rejection / timeout.
+template <class Channel>
+std::vector<std::uint8_t> ws_client_upgrade(Channel& ch,
+                                            const std::string& host,
+                                            std::uint16_t port) {
+    auto up = fb::net::ws::build_client_upgrade_request(host, port, "/");
+    ch.blocking_send_all(std::span<const std::uint8_t>(
+        up.request.data(), up.request.size()));
+    fb::net::ws::ClientHandshakeParser hp(up.sec_key);
+    std::array<std::uint8_t, 4096> buf{};
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        const auto n = ch.blocking_read(
+            std::span<std::uint8_t>(buf.data(), buf.size()),
+            static_cast<int>(remaining));
+        if (n == 0) continue;
+        const auto st = hp.feed(std::span<const std::uint8_t>(buf.data(), n));
+        if (st == fb::net::ws::ClientHandshakeParser::Status::kAccepted) {
+            auto t = hp.trailing();
+            return std::vector<std::uint8_t>(t.begin(), t.end());
+        }
+        if (st == fb::net::ws::ClientHandshakeParser::Status::kRejected) {
+            throw std::runtime_error("ws_client_upgrade rejected: " + hp.reason());
+        }
+    }
+    throw std::runtime_error("ws_client_upgrade timed out");
+}
+
+// Acceptor-side auto-detection. Reads the first chunk: if it's an HTTP
+// upgrade ("GET "), completes the RFC 6455 server handshake (sends 101)
+// and reports role=kAcceptor with any trailing bytes; otherwise reports
+// role=kNone and hands back the bytes it read so the caller seeds them
+// into the raw FrameDecoder. Returns kNone with no prebuffer on a
+// dead/empty connection.
+struct WsDetect {
+    WsRole                    role = WsRole::kNone;
+    std::vector<std::uint8_t> prebuffer;
+};
+template <class Channel>
+WsDetect ws_detect_and_accept(Channel& ch) {
+    WsDetect out;
+    std::array<std::uint8_t, 4096> buf{};
+    const auto first_n = ch.blocking_read(
+        std::span<std::uint8_t>(buf.data(), buf.size()), 5000);
+    if (first_n == 0) return out;  // nothing arrived / closed
+    std::vector<std::uint8_t> first(buf.data(), buf.data() + first_n);
+
+    const bool looks_http = first_n >= 4 && first[0] == 'G' &&
+        first[1] == 'E' && first[2] == 'T' && first[3] == ' ';
+    if (!looks_http) {
+        out.prebuffer = std::move(first);  // raw frame bytes
+        return out;
+    }
+
+    fb::net::ws::HandshakeParser hp;
+    auto st = hp.feed(std::span<const std::uint8_t>(first.data(), first.size()));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (st == fb::net::ws::HandshakeParser::Status::kNeedMore &&
+           std::chrono::steady_clock::now() < deadline) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        const auto m = ch.blocking_read(
+            std::span<std::uint8_t>(buf.data(), buf.size()),
+            static_cast<int>(remaining));
+        if (m == 0) break;
+        st = hp.feed(std::span<const std::uint8_t>(buf.data(), m));
+    }
+    if (st != fb::net::ws::HandshakeParser::Status::kAccepted) {
+        throw std::runtime_error("ws_detect_and_accept: handshake failed");
+    }
+    const auto accept = fb::net::ws::compute_accept(hp.client_key());
+    const auto resp = fb::net::ws::build_101_response(accept);
+    ch.blocking_send_all(std::span<const std::uint8_t>(resp.data(), resp.size()));
+    out.role = WsRole::kAcceptor;
+    auto t = hp.trailing();
+    out.prebuffer.assign(t.begin(), t.end());
+    return out;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -349,16 +444,69 @@ struct PeerNet::Impl {
     // The shared read/write loop. Templated over the channel type so
     // both AcceptedConn (server-side) and TlsClient (client-side)
     // work without duplicating the body.
+    //
+    // `ws_role` selects the framing: kNone = length-prefixed raw frames
+    // (legacy); kDialer/kAcceptor = RFC 6455 WS framing (Tier-2
+    // mimicry) with the correct mask direction for each end. Any
+    // `prebuffered` bytes (e.g. trailing bytes after a WS upgrade, or
+    // the first chunk a raw acceptor already read during detection) are
+    // fed into the de-framer before the main loop starts.
     template <class Channel>
-    void run_loop(Channel& ch, Worker& w, const PeerInfo& peer_label) {
+    void run_loop(Channel& ch, Worker& w, const PeerInfo& peer_label,
+                  WsRole ws_role = WsRole::kNone,
+                  const std::vector<std::uint8_t>& prebuffered = {}) {
+        const bool ws = (ws_role != WsRole::kNone);
         fb::net::FrameDecoder dec;
+        fb::net::ws::FrameParser wsp(
+            /*expect_masked=*/ws_role == WsRole::kAcceptor);
         std::array<std::uint8_t, 4096> rbuf{};
+
+        auto frame_out = [&](std::span<const std::uint8_t> p) {
+            if (ws_role == WsRole::kDialer)
+                return fb::net::ws::build_client_binary_frame(p);
+            if (ws_role == WsRole::kAcceptor)
+                return fb::net::ws::build_server_binary_frame(p);
+            return fb::net::encode_frame(p);
+        };
+        auto feed = [&](std::span<const std::uint8_t> b) {
+            if (ws) wsp.feed(b); else dec.feed(b);
+        };
+        auto deliver_ready = [&]() {
+            std::vector<std::uint8_t> frame;
+            for (;;) {
+                bool ready;
+                if (ws) {
+                    ready = wsp.try_pop(frame) ==
+                            fb::net::ws::FrameParser::PopStatus::kFrameReady;
+                } else {
+                    ready = dec.try_pop(frame) ==
+                            fb::net::FrameDecoder::Status::kFrameReady;
+                }
+                if (!ready) break;
+                OnMessage cb_copy;
+                {
+                    std::lock_guard lk(cb_mu);
+                    cb_copy = on_msg;
+                }
+                if (cb_copy) {
+                    cb_copy(peer_label,
+                             std::span<const std::uint8_t>(
+                                 frame.data(), frame.size()));
+                }
+            }
+        };
+
         try {
+            if (!prebuffered.empty()) {
+                feed(std::span<const std::uint8_t>(
+                    prebuffered.data(), prebuffered.size()));
+                deliver_ready();
+            }
             while (!w.stop && !global_stop) {
                 // 1. Drain queued writes (non-blocking, take what's
                 //    there in a single dequeue cycle).
                 while (auto pending = w.dequeue_for(/*ms=*/0)) {
-                    auto framed = fb::net::encode_frame(
+                    auto framed = frame_out(
                         std::span<const std::uint8_t>(
                             pending->data(), pending->size()));
                     ch.blocking_send_all(
@@ -371,22 +519,8 @@ struct PeerNet::Impl {
                     std::span<std::uint8_t>(rbuf.data(), rbuf.size()),
                     /*timeout_ms=*/100);
                 if (n > 0) {
-                    dec.feed(std::span<const std::uint8_t>(
-                        rbuf.data(), n));
-                    std::vector<std::uint8_t> frame;
-                    while (dec.try_pop(frame) ==
-                           fb::net::FrameDecoder::Status::kFrameReady) {
-                        OnMessage cb_copy;
-                        {
-                            std::lock_guard lk(cb_mu);
-                            cb_copy = on_msg;
-                        }
-                        if (cb_copy) {
-                            cb_copy(peer_label,
-                                     std::span<const std::uint8_t>(
-                                         frame.data(), frame.size()));
-                        }
-                    }
+                    feed(std::span<const std::uint8_t>(rbuf.data(), n));
+                    deliver_ready();
                 }
                 // 3. If there are still queued writes, loop back and
                 //    drain them. Otherwise wait briefly for new
@@ -538,7 +672,20 @@ void PeerNet::start_listener(const PeerListenerOptions& opts) {
                  conn_ptr, from]() mutable {
                     auto strong = w_weak.lock();
                     if (!strong) return;
-                    impl_->run_loop(*conn_ptr, *strong, from);
+                    // Auto-detect WS vs raw on the first inbound bytes so
+                    // a WSS dialer and a raw dialer both interoperate
+                    // with this listener (Tier-2 mimicry).
+                    WsRole role = WsRole::kNone;
+                    std::vector<std::uint8_t> pre;
+                    try {
+                        auto det = ws_detect_and_accept(*conn_ptr);
+                        role = det.role;
+                        pre  = std::move(det.prebuffer);
+                    } catch (...) {
+                        strong->stop = true;
+                        return;
+                    }
+                    impl_->run_loop(*conn_ptr, *strong, from, role, pre);
                 });
             {
                 std::lock_guard lk(impl_->in_mu);
@@ -600,17 +747,24 @@ bool PeerNet::send(const PeerInfo& peer,
                                      topts.expected_peer_pubkey.begin());
                         topts.expected_peer_pubkey_set = true;
                     }
+                    WsRole role = WsRole::kNone;
+                    std::vector<std::uint8_t> pre;
                     try {
                         tls.connect(host, port, topts);
+                        if (dialer_opts.wss) {
+                            // Tier-2: cloak the P2P link as browser WSS.
+                            pre  = ws_client_upgrade(tls, host, port);
+                            role = WsRole::kDialer;
+                        }
                     } catch (const std::exception&) {
-                        // Dial failed — bail. The pool entry stays
-                        // (with stop=true) so re-tries don't busy-
-                        // dial; ChatClient's higher layer is
+                        // Dial (or WS upgrade) failed — bail. The pool
+                        // entry stays (with stop=true) so re-tries don't
+                        // busy-dial; ChatClient's higher layer is
                         // expected to clear stale entries.
                         strong->stop = true;
                         return;
                     }
-                    impl_->run_loop(tls, *strong, peer_copy);
+                    impl_->run_loop(tls, *strong, peer_copy, role, pre);
                 });
         }
     }

@@ -45,13 +45,21 @@ public:
     // disables cert validation entirely (dev / self-signed only —
     // never use against a real server). `sni_hostname` overrides
     // the SNI sent during the TLS handshake; defaults to `host`.
+    //
+    // When `use_wss` is true (implies use_tls), the worker performs a
+    // real RFC 6455 WebSocket upgrade after the TLS handshake and
+    // frames traffic as masked WS binary messages — wire-identical to
+    // a browser hitting the relay's --tls-port (Tier-2 censorship
+    // mimicry; see docs/censorship-resistance.md). Also auto-enabled
+    // by the FB_WSS=1 environment variable.
     void connect_tls(const QString& host, std::uint16_t port,
                       const QString& user,
                       const std::array<std::uint8_t, 32>& seed,
                       bool use_tls,
                       const QString& ca_file,
                       bool insecure_skip_verify,
-                      const QString& sni_hostname);
+                      const QString& sni_hostname,
+                      bool use_wss = false);
 
     // Send a DM to `peer` (must be a registered username). Safe to call from
     // the UI thread; queues onto the worker.

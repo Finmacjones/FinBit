@@ -140,12 +140,21 @@ work:
   end by `tools/e2e/wss_native_dm_roundtrip.sh` (server `--tls-port`,
   two `--wss` peers, DM round-trips, server log stays blind).
 
+**Desktop + PeerNet adoption (shipped 2026-05-20).**
+- **Desktop client** (`chat_client.cpp`): a "WSS" login checkbox (and
+  the `FB_WSS=1` env var for headless runs) makes the client perform
+  the WS upgrade after TLS and frame all relay traffic as masked WS
+  binary messages — same path as `fb-cli --wss`, against the relay's
+  `--tls-port`.
+- **PeerNet** (`peer_net.cpp`): `PeerDialerOptions::wss` (driven by
+  `FB_PEER_WSS=1`) makes the **dialer** perform a client WS upgrade,
+  and the **listener auto-detects** WS vs raw per inbound connection
+  by sniffing the first bytes (`GET ` ⇒ WS). A WSS dialer and a raw
+  dialer therefore interoperate with the same listener — verified by
+  `PeerNet.RoundTripWssDialerAndRawInterop`. P2P links can now look
+  like browser WSS too, not just client→relay links.
+
 **Remaining Tier-2 follow-up.**
-- Wire the **desktop client** (`chat_client.cpp`) and **PeerNet**
-  (`peer_net.cpp`) onto the same `--wss` path. They currently dial
-  `wss://` addresses as "TLS + raw frames"; the building blocks
-  (`fb::net::ws` client helpers) are now in place, so this is
-  call-site adoption, not new protocol work.
 - HTTP-Upgrade `Connection: Upgrade` is already emitted; a future pass
   can add believable extra headers / cookie to defeat L7 template
   matching.
@@ -203,7 +212,7 @@ individually defeats a nation-state adversary with a dedicated team
 | Tier | Status | Code | Tracking |
 | --- | --- | --- | --- |
 | 1. DoH bootstrap | ✅ shipped | `core/net/doh_resolver.*` | done |
-| 2. TLS-on-443 transport mimicry | ✅ partial | ALPN (`tls_client.cpp` + server `alpn_select_cb`) + native WSS (`fb::net::ws` client + `fb-cli --wss`) shipped; desktop/PeerNet adoption pending | done / follow-up |
+| 2. TLS-on-443 transport mimicry | ✅ partial | ALPN (`tls_client.cpp` + server `alpn_select_cb`) + native WSS (`fb::net::ws` client) across `fb-cli --wss`, desktop (`FB_WSS` / "WSS" checkbox) and PeerNet (`FB_PEER_WSS`, auto-detecting listener) | done; only L7 header polish + uTLS remain |
 | 3. Domain-fronting | 🔲 planned | — | v2 |
 | 4. uTLS ClientHello mimicry | 🔲 planned | — | v2 |
 

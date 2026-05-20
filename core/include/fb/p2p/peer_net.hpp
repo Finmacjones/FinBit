@@ -114,6 +114,16 @@ struct PeerDialerOptions {
     // them from an Ed25519 seed.
     std::string client_cert_pem;
     std::string client_key_pem;
+
+    // Censorship-resistance (Tier 2). When true, after the TLS
+    // handshake the dialer performs an RFC 6455 WebSocket upgrade and
+    // frames all traffic as masked WS binary messages, so a P2P link
+    // is wire-indistinguishable from a browser's WSS. The listener
+    // auto-detects WS vs raw per inbound connection, so a WSS dialer
+    // interoperates with any listener (and a raw dialer with a
+    // WSS-capable listener). Default false keeps the raw
+    // frames-over-TLS behaviour. See docs/censorship-resistance.md.
+    bool wss = false;
 };
 
 class PeerNet {

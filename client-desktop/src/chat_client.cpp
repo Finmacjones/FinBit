@@ -49,6 +49,7 @@
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
 #include "fb/net/tls_client.hpp"
+#include "fb/net/websocket.hpp"
 #include "fb/identity/username_gossip.hpp"
 #include "fb/identity/username_log.hpp"
 #include "fb/p2p/bootstrap.hpp"
@@ -120,6 +121,30 @@ struct Conn {
     fb::net::Socket*    sock = nullptr;
     fb::net::TlsClient* tls  = nullptr;
 
+    // WebSocket-over-TLS (Tier-2 mimicry). When wss is true, outbound
+    // payloads are wrapped in masked WS binary frames and inbound bytes
+    // are de-framed via ws_parser (which expects unmasked server
+    // frames) instead of the length-prefixed FrameDecoder.
+    bool                     wss = false;
+    fb::net::ws::FrameParser ws_parser{/*expect_masked=*/false};
+
+    // De-framing seam shared by the hello + steady-state read sites:
+    // route raw bytes into whichever de-framer is active, and pop the
+    // next assembled Frame. `dec` is the caller's length-prefixed
+    // decoder (used in the non-WSS path).
+    void deframe_feed(std::span<const std::uint8_t> bytes,
+                      fb::net::FrameDecoder& dec) {
+        if (wss) ws_parser.feed(bytes);
+        else     dec.feed(bytes);
+    }
+    bool deframe_pop(fb::net::FrameDecoder& dec, std::vector<std::uint8_t>& out) {
+        if (wss) {
+            return ws_parser.try_pop(out) ==
+                   fb::net::ws::FrameParser::PopStatus::kFrameReady;
+        }
+        return dec.try_pop(out) == fb::net::FrameDecoder::Status::kFrameReady;
+    }
+
     [[nodiscard]] int fd() const {
         return tls ? tls->fd() : sock->fd();
     }
@@ -184,8 +209,13 @@ struct Conn {
 };
 
 void blocking_send(Conn& c, const std::vector<std::uint8_t>& payload) {
-    auto framed = fb::net::encode_frame(
-        std::span<const std::uint8_t>(payload.data(), payload.size()));
+    // WS path: one masked WS binary message per Frame (the WS frame is
+    // the message boundary, so no inner length prefix).
+    auto framed = c.wss
+        ? fb::net::ws::build_client_binary_frame(
+              std::span<const std::uint8_t>(payload.data(), payload.size()))
+        : fb::net::encode_frame(
+              std::span<const std::uint8_t>(payload.data(), payload.size()));
     c.send_all(std::span<const std::uint8_t>(framed.data(), framed.size()));
 }
 
@@ -456,6 +486,7 @@ struct ChatClient::Impl {
     // legacy connect() path so existing callers see no behaviour
     // change.
     bool        use_tls = false;
+    bool        use_wss = false;   // Tier-2: real WSS to the relay
     std::string tls_ca_file;
     bool        tls_insecure_skip_verify = false;
     std::string tls_sni;
@@ -617,13 +648,19 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                               bool use_tls,
                               const QString& ca_file,
                               bool insecure_skip_verify,
-                              const QString& sni_hostname) {
+                              const QString& sni_hostname,
+                              bool use_wss) {
     if (impl_->running.exchange(true)) return;
     impl_->host = host;
     impl_->port = port;
     impl_->username = user;
     impl_->seed = seed;
-    impl_->use_tls = use_tls;
+    // FB_WSS=1 forces WSS even when the caller didn't ask — handy for
+    // headless / auto-register runs that have no UI toggle. WSS implies
+    // TLS.
+    const char* wss_env = std::getenv("FB_WSS");
+    impl_->use_wss = use_wss || (wss_env && *wss_env && std::string(wss_env) != "0");
+    impl_->use_tls = use_tls || impl_->use_wss;
     impl_->tls_ca_file = ca_file.toStdString();
     impl_->tls_insecure_skip_verify = insecure_skip_verify;
     impl_->tls_sni = sni_hostname.toStdString();
@@ -796,6 +833,8 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             const std::string peer_host     = env("FB_PEER_LISTEN_HOST");
             const std::string dialer_ca     = env("FB_PEER_DIALER_CA");
             const bool dialer_insecure      = !env("FB_PEER_DIALER_INSECURE").empty();
+            const bool dialer_wss           = !env("FB_PEER_WSS").empty() &&
+                                              env("FB_PEER_WSS") != "0";
             impl_->own_p2p_addr             = env("FB_PEER_PUBLIC_ADDR");
 
             // I4: parse FB_OFFLINE_RELAYS as a comma-separated list
@@ -930,6 +969,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 fb::p2p::PeerDialerOptions dopts;
                 dopts.ca_file              = dialer_ca;
                 dopts.insecure_skip_verify = dialer_insecure;
+                dopts.wss                  = dialer_wss;
                 impl_->peer_net->set_dialer(dopts);
                 // Inbound: stash on the overlay queue so the worker
                 // thread (this same thread, in its main poll loop)
@@ -1012,6 +1052,53 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 impl_->tls->connect(impl_->host.toStdString(),
                                      impl_->port, tlsopts);
                 impl_->conn.tls = &impl_->tls.value();
+
+                if (impl_->use_wss) {
+                    // Tier-2: real WebSocket upgrade so the link looks
+                    // like a browser hitting the relay's --tls-port.
+                    const std::string ws_host = impl_->tls_sni.empty()
+                        ? impl_->host.toStdString() : impl_->tls_sni;
+                    auto up = fb::net::ws::build_client_upgrade_request(
+                        ws_host, impl_->port, "/");
+                    impl_->tls->blocking_send_all(
+                        std::span<const std::uint8_t>(
+                            up.request.data(), up.request.size()));
+                    fb::net::ws::ClientHandshakeParser hp(up.sec_key);
+                    std::array<std::uint8_t, 4096> hbuf;
+                    bool upgraded = false;
+                    const auto hs_deadline =
+                        std::chrono::steady_clock::now() +
+                        std::chrono::seconds(8);
+                    while (std::chrono::steady_clock::now() < hs_deadline) {
+                        const auto remaining =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                hs_deadline - std::chrono::steady_clock::now())
+                                .count();
+                        if (remaining <= 0) break;
+                        auto n = impl_->tls->blocking_read(
+                            std::span<std::uint8_t>(hbuf.data(), hbuf.size()),
+                            static_cast<int>(remaining));
+                        if (n == 0) continue;
+                        auto st = hp.feed(
+                            std::span<const std::uint8_t>(hbuf.data(), n));
+                        if (st == fb::net::ws::ClientHandshakeParser::Status::kAccepted) {
+                            impl_->conn.ws_parser.feed(hp.trailing());
+                            upgraded = true;
+                            break;
+                        }
+                        if (st == fb::net::ws::ClientHandshakeParser::Status::kRejected) {
+                            emit errorOccurred(QString("WSS upgrade rejected: %1")
+                                .arg(QString::fromStdString(hp.reason())));
+                            return;
+                        }
+                    }
+                    if (!upgraded) {
+                        emit errorOccurred("WSS upgrade did not complete");
+                        return;
+                    }
+                    impl_->conn.wss = true;
+                    emit log("connected over WSS (WebSocket-over-TLS)");
+                }
             } else {
                 impl_->sock.emplace(
                     fb::net::tcp_connect(impl_->host.toStdString(),
@@ -1043,10 +1130,10 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         std::span<std::uint8_t>(hbuf.data(), hbuf.size()),
                         100);
                     if (n == 0) continue;
-                    impl_->dec.feed(std::span<const std::uint8_t>(
-                        hbuf.data(), n));
-                    if (impl_->dec.try_pop(hello_frame) ==
-                        fb::net::FrameDecoder::Status::kFrameReady) {
+                    impl_->conn.deframe_feed(
+                        std::span<const std::uint8_t>(hbuf.data(), n),
+                        impl_->dec);
+                    if (impl_->conn.deframe_pop(impl_->dec, hello_frame)) {
                         break;
                     }
                 }
@@ -3812,11 +3899,11 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         std::span<std::uint8_t>(rxbuf.data(), rxbuf.size()),
                         100);
                 if (n > 0) {
-                    impl_->dec.feed(std::span<const std::uint8_t>(
-                        rxbuf.data(), n));
+                    impl_->conn.deframe_feed(
+                        std::span<const std::uint8_t>(rxbuf.data(), n),
+                        impl_->dec);
                     std::vector<std::uint8_t> frame;
-                    while (impl_->dec.try_pop(frame) ==
-                           fb::net::FrameDecoder::Status::kFrameReady) {
+                    while (impl_->conn.deframe_pop(impl_->dec, frame)) {
                         fb::proto::Frame f;
                         if (!f.ParseFromArray(frame.data(),
                                               static_cast<int>(frame.size()))) {

@@ -101,6 +101,7 @@ private:
     // store. Production deployments use real CA-issued certs and
     // leave the insecure box unchecked.
     QCheckBox*   tls_check_           = nullptr;
+    QCheckBox*   wss_check_           = nullptr;
     QCheckBox*   tls_insecure_check_  = nullptr;
     QPushButton* tls_ca_btn_          = nullptr;
     // Path of the user-picked CA file (PEM). Empty = system trust
