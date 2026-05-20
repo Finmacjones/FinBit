@@ -174,13 +174,25 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
     client now advertises `http/1.1` over ALPN (browsers always send
     ALPN; sending none was a fingerprint) and the server selects it
     via an `alpn_select_cb`. The native client speaks a real RFC 6455
-    WebSocket (HTTP/1.1 `Upgrade` + masked binary frames) so a
-    connection is wire-identical to a browser's WSS — available in
-    `fb-cli --wss`, the **desktop client** (the "WSS" login checkbox or
-    `FB_WSS=1`), and **PeerNet** P2P links (`FB_PEER_WSS=1`; the
-    listener auto-detects WS vs raw per connection, so WSS and legacy
-    peers interoperate). Proven by `tools/e2e/wss_native_dm_roundtrip.sh`
-    and `PeerNet.RoundTripWssDialerAndRawInterop`.
+    WebSocket (HTTP/1.1 `Upgrade` + masked binary frames) with a
+    Chrome-realistic header set, so a connection is wire-identical to a
+    browser's WSS — available in `fb-cli --wss`, the **desktop client**
+    (the "WSS" login checkbox or `FB_WSS=1`), and **PeerNet** P2P links
+    (`FB_PEER_WSS=1`; the listener auto-detects WS vs raw per
+    connection, so WSS and legacy peers interoperate). Proven by
+    `tools/e2e/wss_native_dm_roundtrip.sh` and
+    `PeerNet.RoundTripWssDialerAndRawInterop`.
+  - **Domain-fronting** (censorship-resistance, Tier 3) — the TCP
+    connect address, the TLS SNI (the *front* a censor sees in
+    cleartext), and the HTTP `Host` header (the *real* backend, inside
+    TLS) are independently settable: `fb-cli --front <sni> --ws-host
+    <backend>`, the desktop client's `FB_FRONT_SNI` / `FB_WS_HOST`, and
+    `PeerDialerOptions::front_sni` / `ws_host_header`. Proven by
+    `tools/e2e/fronting_dm_roundtrip.sh` (front-only cert; SNI=front
+    validates, Host=backend differs; no-`--front` control is rejected).
+    Works against a cooperating reverse-proxy/CDN that routes by `Host`;
+    ECH is the planned successor. See
+    [`docs/censorship-resistance.md`](docs/censorship-resistance.md).
   - **Periodic cadence** — `republish_self` rotates our own
     provider record before its TTL expires (default every 30
     minutes; TTL is 1 hour). `gossip_pull_round` walks every

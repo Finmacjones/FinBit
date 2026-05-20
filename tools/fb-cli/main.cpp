@@ -138,9 +138,12 @@ struct Args {
     bool tls = false;
     std::string tls_ca;             // CA file for cert verification
     bool tls_insecure_skip_verify = false;   // dev/CI escape hatch
-    std::string tls_sni;            // override SNI hostname
+    std::string tls_sni;            // override SNI hostname (= front domain)
     bool wss = false;               // speak real WebSocket-over-TLS
                                     // (Tier-2 mimicry); implies --tls
+    std::string ws_host;            // Tier-3 domain-fronting: WS Host
+                                    // header (real backend), independent
+                                    // of the SNI/front and connect host
 
     // Overlay relay test (N1): exercises the server-relayed
     // PeerEnvelope path without standing up the full DhtNode /
@@ -181,6 +184,10 @@ void usage() {
               << "                        (omit to use system CA bundle)\n"
               << "  --tls-insecure-skip-verify  skip cert validation (dev / self-signed only)\n"
               << "  --tls-sni HOST        override SNI hostname (defaults to --server host)\n"
+              << "  --front HOST          Tier-3 domain-fronting: TLS SNI = front domain\n"
+              << "                        (alias for --tls-sni; the censor sees only this)\n"
+              << "  --ws-host HOST        Tier-3 domain-fronting: WS Host header = real backend\n"
+              << "                        (what the CDN routes to; defaults to --server host)\n"
               << "Default URL constant: " << fb::config::kDefaultServerUrl << "\n";
 }
 
@@ -238,6 +245,8 @@ bool parse(int argc, char** argv, Args& a) {
             a.tls_insecure_skip_verify = true;
         }
         else if (s == "--tls-sni") { if (!next(a.tls_sni)) return false; }
+        else if (s == "--front") { if (!next(a.tls_sni)) return false; }
+        else if (s == "--ws-host") { if (!next(a.ws_host)) return false; }
         else if (s == "--overlay-send") { a.overlay_send = true; }
         else if (s == "--overlay-recv") { a.overlay_recv = true; }
         else if (s == "--overlay-kind") {
@@ -697,7 +706,15 @@ int main(int argc, char** argv) {
                 "cert is NOT being validated. Use only against a known "
                 "self-signed dev server.\n");
         }
-        tls.connect(args.server_host, args.server_port, tlsopts);
+        try {
+            tls.connect(args.server_host, args.server_port, tlsopts);
+        } catch (const std::exception& e) {
+            // TLS handshake / cert-verification failure. Exit cleanly
+            // with a diagnostic instead of letting the exception reach
+            // std::terminate (which core-dumps).
+            std::cerr << "[fb-cli] TLS connect failed: " << e.what() << "\n";
+            return 6;
+        }
         conn.tls = &tls;
 
         if (args.wss) {
@@ -706,8 +723,13 @@ int main(int argc, char** argv) {
             // indistinguishable on the wire from a browser hitting the
             // server's --tls-port. Subsequent Frames ride masked WS
             // binary messages (see blocking_send / blocking_recv_frame).
+            //
+            // Tier-3 fronting: the Host header (real backend) is
+            // independent of the TLS SNI (--front / --tls-sni) and the
+            // TCP connect host (--server). --ws-host sets it; otherwise
+            // it defaults to the connect host.
             const std::string ws_host =
-                args.tls_sni.empty() ? args.server_host : args.tls_sni;
+                args.ws_host.empty() ? args.server_host : args.ws_host;
             auto up = fb::net::ws::build_client_upgrade_request(
                 ws_host, args.server_port, "/");
             tls.blocking_send_all(std::span<const std::uint8_t>(

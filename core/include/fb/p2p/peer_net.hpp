@@ -124,6 +124,18 @@ struct PeerDialerOptions {
     // WSS-capable listener). Default false keeps the raw
     // frames-over-TLS behaviour. See docs/censorship-resistance.md.
     bool wss = false;
+
+    // Tier-3 domain-fronting (only meaningful with wss=true). When
+    // non-empty, front_sni overrides the TLS SNI sent on outbound dials
+    // (the front domain a censor sees) and ws_host_header sets the WS
+    // Host header (the real backend a fronting CDN / reverse-proxy
+    // routes to). Both are independent of the dialed connect address.
+    // Empty => SNI and Host both default to the dialed host (no
+    // fronting). NB: a single front applies to ALL outbound dials, so
+    // PeerNet fronting suits a fixed-front deployment, not per-peer
+    // CDN routing.
+    std::string front_sni;
+    std::string ws_host_header;
 };
 
 class PeerNet {

@@ -174,9 +174,10 @@ std::vector<std::uint8_t> build_close_frame() {
 // Client side
 // ---------------------------------------------------------------------------
 
-ClientUpgrade build_client_upgrade_request(const std::string& host,
+ClientUpgrade build_client_upgrade_request(const std::string& host_header,
                                            std::uint16_t port,
-                                           const std::string& path) {
+                                           const std::string& path,
+                                           const WsUpgradeOptions& opts) {
     ClientUpgrade up;
 
     // 16 random bytes → base64 = the Sec-WebSocket-Key (RFC 6455 §4.1).
@@ -188,21 +189,46 @@ ClientUpgrade build_client_upgrade_request(const std::string& host,
 
     // Host header omits the port when it's the wss:// default (443), so
     // the request matches what a browser emits for wss://host/path.
-    std::string host_hdr = host;
+    std::string host_hdr = host_header;
     if (port != 443) host_hdr += ":" + std::to_string(port);
 
+    // A current Chrome/Windows UA by default — the single most common
+    // browser fingerprint, so it blends in. Overridable for callers
+    // that want to imitate a different client.
+    const std::string ua = opts.user_agent.empty()
+        ? std::string("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/131.0.0.0 Safari/537.36")
+        : opts.user_agent;
+    const std::string origin = opts.origin.empty()
+        ? ("https://" + host_hdr) : opts.origin;
+
+    // Header set + ORDER chosen to match Chrome's wss:// upgrade so an
+    // L7 DPI box doing template matching sees an ordinary request.
     std::string req;
     req += "GET " + (path.empty() ? std::string("/") : path) + " HTTP/1.1\r\n";
     req += "Host: " + host_hdr + "\r\n";
-    req += "Upgrade: websocket\r\n";
     req += "Connection: Upgrade\r\n";
-    req += "Sec-WebSocket-Key: " + up.sec_key + "\r\n";
+    if (opts.browser_headers) {
+        req += "Pragma: no-cache\r\n";
+        req += "Cache-Control: no-cache\r\n";
+    }
+    req += "User-Agent: " + ua + "\r\n";
+    req += "Upgrade: websocket\r\n";
+    req += "Origin: " + origin + "\r\n";
     req += "Sec-WebSocket-Version: 13\r\n";
-    // A browser also sends Origin / User-Agent; include a believable
-    // Origin so an L7 DPI box parsing the cleartext-inside-TLS upgrade
-    // (e.g. an active prober) sees an ordinary request.
-    req += "Origin: https://" + host_hdr + "\r\n";
-    req += "User-Agent: Mozilla/5.0 (FinBit)\r\n";
+    if (opts.browser_headers) {
+        req += "Accept-Encoding: gzip, deflate, br\r\n";
+        req += "Accept-Language: en-US,en;q=0.9\r\n";
+    }
+    req += "Sec-WebSocket-Key: " + up.sec_key + "\r\n";
+    if (opts.browser_headers) {
+        // Advertised, never required — our server doesn't echo it back,
+        // so permessage-deflate stays OFF and our raw WS framing is
+        // unaffected. A browser advertises this exact value.
+        req += "Sec-WebSocket-Extensions: permessage-deflate; "
+               "client_max_window_bits\r\n";
+    }
     req += "\r\n";
 
     up.request.assign(req.begin(), req.end());

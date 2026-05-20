@@ -1,8 +1,8 @@
 # FinBit — Censorship-Resistance Architecture
 
 > Status: living doc — Tier 1 (DoH bootstrap) shipped 2026-05-19;
-> Tier 2 (ALPN + native WSS) shipped 2026-05-20.
-> Tiers 3–4 tracked in [`docs/roadmap.md`](roadmap.md).
+> Tier 2 (ALPN + native WSS + L7 polish) and Tier 3 (domain-fronting /
+> SNI–Host decoupling) shipped 2026-05-20. Tier 4 (uTLS / ECH) planned.
 
 ## 1. Threat model
 
@@ -154,25 +154,70 @@ work:
   `PeerNet.RoundTripWssDialerAndRawInterop`. P2P links can now look
   like browser WSS too, not just client→relay links.
 
-**Remaining Tier-2 follow-up.**
-- HTTP-Upgrade `Connection: Upgrade` is already emitted; a future pass
-  can add believable extra headers / cookie to defeat L7 template
-  matching.
+**L7 header polish (shipped 2026-05-20).** The upgrade request now
+matches a current Chrome/Windows WebSocket handshake — real
+`User-Agent`, Chrome's header *order*, and the
+`Pragma`/`Cache-Control`/`Accept-Encoding`/`Accept-Language`/
+`Sec-WebSocket-Extensions: permessage-deflate` headers a browser
+sends. (We advertise `permessage-deflate` but the server never echoes
+it, so compression stays off and our raw WS framing is unaffected.)
+The old `User-Agent: Mozilla/5.0 (FinBit)` giveaway is gone;
+`WsUpgradeOptions` lets a caller override the UA/Origin or drop to a
+minimal request.
 
-### Tier 3 — Decoy / domain-fronting  🚧 planned
+### Tier 3 — Domain-fronting (SNI / Host decoupling)  ✅ shipped 2026-05-20
 
 **Problem.** Tier 2 still relies on the censor not knowing the IP of
-any FinBit relay. Once IPs are leaked (compelled disclosure, scraping
-TXT records, etc.), they can be IP-blocked.
+any FinBit relay, and on the TLS SNI not naming it. The SNI travels in
+cleartext in a (non-ECH) ClientHello, so a censor that SNI-filters can
+block a connection to `relay.finbit.example` even on port 443.
 
-**Plan.**
-- Optionally route the WebSocket upgrade through a CDN that supports
-  domain-fronting (Cloudflare Workers, Fastly, CloudFront). The
-  client connects to `cdn.cloudflare.com:443` with SNI =
-  `random-customer.cloudflare.com` and the actual destination encoded
-  in the request body.
-- This DOES require either (a) operator-paid CDN account, or (b) a
-  community-run pool. Defer scope decisions to v2.
+**What shipped.** FinBit now decouples the **three identities** a
+fronted connection needs, so they can each be set independently:
+
+| Layer | What it is | Set by |
+| --- | --- | --- |
+| TCP connect address | the CDN / reverse-proxy edge you dial | `--server` (fb-cli), connect host |
+| TLS SNI | the **front** domain the censor sees in cleartext | `--front` / `--tls-sni`, `FB_FRONT_SNI`, `PeerDialerOptions::front_sni` |
+| HTTP `Host` header | the **real backend** the front routes to (inside TLS) | `--ws-host`, `FB_WS_HOST`, `PeerDialerOptions::ws_host_header` |
+
+A fronted dial connects to a benign-looking edge, presents SNI = a
+popular co-hosted domain, and carries the real destination only in the
+encrypted `Host` header — indistinguishable on the wire from an
+ordinary HTTPS fetch of the front.
+
+Example (`fb-cli`):
+
+```
+fb-cli --wss --server <cdn-edge-ip>:443 \
+       --front cdn-hosted-popular-site.example \
+       --ws-host relay.finbit.example \
+       --tls-ca <front-ca.pem>
+```
+
+Wired across `fb-cli` (`--front` / `--ws-host`), the desktop client
+(`FB_FRONT_SNI` / `FB_WS_HOST`), and PeerNet
+(`PeerDialerOptions::front_sni` / `ws_host_header`). Proven by
+`tools/e2e/fronting_dm_roundtrip.sh`: the server's cert is issued for
+the **front domain only**, the client dials `127.0.0.1` with SNI =
+front (hostname verification ON) and Host = a different backend, and
+the DM round-trips — while a negative control with no `--front`
+(SNI = `127.0.0.1`) is correctly rejected by cert verification. Unit
+test `WsUpgradeRequest.HostHeaderIsIndependentOfFrontSni` locks the
+Host/SNI independence.
+
+**Honest caveats.**
+- **Classic same-CDN fronting is restricted.** Google, AWS
+  CloudFront, and Cloudflare disabled cross-tenant domain fronting
+  (different SNI vs Host on the *same* CDN) around 2018. So this works
+  today against (a) a **cooperating reverse proxy / relay you control**
+  that routes by `Host`, (b) CDNs that still permit it, or (c) a
+  decoy-routing front. FinBit ships the *mechanism*; the front is an
+  operational choice.
+- **ECH is the strategic successor.** Encrypted Client Hello encrypts
+  the SNI itself, removing the need for a Host/SNI mismatch entirely.
+  It depends on newer OpenSSL/BoringSSL ECH APIs and DNS `HTTPS` RR
+  key publication — queued behind the Tier-4 TLS-stack work.
 
 ### Tier 4 — uTLS / browser ClientHello mimicry  🚧 planned
 
@@ -212,9 +257,9 @@ individually defeats a nation-state adversary with a dedicated team
 | Tier | Status | Code | Tracking |
 | --- | --- | --- | --- |
 | 1. DoH bootstrap | ✅ shipped | `core/net/doh_resolver.*` | done |
-| 2. TLS-on-443 transport mimicry | ✅ partial | ALPN (`tls_client.cpp` + server `alpn_select_cb`) + native WSS (`fb::net::ws` client) across `fb-cli --wss`, desktop (`FB_WSS` / "WSS" checkbox) and PeerNet (`FB_PEER_WSS`, auto-detecting listener) | done; only L7 header polish + uTLS remain |
-| 3. Domain-fronting | 🔲 planned | — | v2 |
-| 4. uTLS ClientHello mimicry | 🔲 planned | — | v2 |
+| 2. TLS-on-443 transport mimicry | ✅ shipped | ALPN (`tls_client.cpp` + server `alpn_select_cb`) + native WSS (`fb::net::ws` client) across `fb-cli --wss`, desktop (`FB_WSS` / "WSS" checkbox), PeerNet (`FB_PEER_WSS`, auto-detecting listener); Chrome-realistic L7 upgrade headers | done |
+| 3. Domain-fronting (SNI/Host decoupling) | ✅ shipped | `--front`/`--ws-host`, `FB_FRONT_SNI`/`FB_WS_HOST`, `PeerDialerOptions::front_sni`/`ws_host_header`; `tools/e2e/fronting_dm_roundtrip.sh` | done (ECH succeeds it) |
+| 4. uTLS / ECH ClientHello mimicry | 🔲 planned | — | v2 |
 
 ## 5. References
 

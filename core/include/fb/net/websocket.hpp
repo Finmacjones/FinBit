@@ -90,12 +90,34 @@ struct ClientUpgrade {
     std::string               sec_key;
 };
 
-// Build a browser-like HTTP/1.1 WebSocket upgrade request for
-// `Host: <host>[:<port>]` and the given path. Generates a fresh random
-// 16-byte Sec-WebSocket-Key. The Host header omits the port when it's
-// the default 443 (matches what browsers do over wss://).
+// Knobs for the upgrade request's L7 fingerprint. Defaults mimic a
+// current Chrome on Windows so the request survives DPI template
+// matching (Tier-2). See docs/censorship-resistance.md.
+struct WsUpgradeOptions {
+    // Empty => a current Chrome/Windows User-Agent.
+    std::string user_agent;
+    // Empty => "https://<host_header>" (what a browser sends for a
+    // page-initiated wss:// connection).
+    std::string origin;
+    // When true (default) emit the full browser header set
+    // (Pragma/Cache-Control/Accept-Encoding/Accept-Language/
+    // Sec-WebSocket-Extensions) in Chrome's order. Set false for a
+    // minimal request.
+    bool browser_headers = true;
+};
+
+// Build a browser-like HTTP/1.1 WebSocket upgrade request.
+//
+// `host_header` is the value placed in the `Host:` header — for a
+// domain-fronted connection (Tier-3) this is the REAL backend the CDN
+// routes to, which is independent of the TLS SNI (the front domain,
+// set via TlsClientOptions::sni_hostname) and of the TCP connect
+// address (the CDN edge). The Host port is omitted when it's the
+// wss:// default (443), matching browsers. Generates a fresh random
+// 16-byte Sec-WebSocket-Key.
 [[nodiscard]] ClientUpgrade build_client_upgrade_request(
-    const std::string& host, std::uint16_t port, const std::string& path = "/");
+    const std::string& host_header, std::uint16_t port,
+    const std::string& path = "/", const WsUpgradeOptions& opts = {});
 
 // Streaming parser for the server's HTTP/1.1 101 response. Symmetric to
 // HandshakeParser: feed bytes until the "\r\n\r\n" header terminator is

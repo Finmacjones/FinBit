@@ -490,6 +490,12 @@ struct ChatClient::Impl {
     std::string tls_ca_file;
     bool        tls_insecure_skip_verify = false;
     std::string tls_sni;
+    // Tier-3 domain-fronting (FB_FRONT_SNI / FB_WS_HOST). When set,
+    // ws_front_sni overrides the TLS SNI (the front the censor sees)
+    // and ws_host_header sets the WS Host header (the real backend the
+    // CDN routes to) — both independent of the connect host.
+    std::string ws_front_sni;
+    std::string ws_host_header;
     fb::net::FrameDecoder dec;
     // Serverless overlay state. Each peer holds its own username log
     // + DHT routing+provider store. Both layers' SendCallbacks wrap
@@ -664,6 +670,9 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
     impl_->tls_ca_file = ca_file.toStdString();
     impl_->tls_insecure_skip_verify = insecure_skip_verify;
     impl_->tls_sni = sni_hostname.toStdString();
+    // Tier-3 domain-fronting overrides (optional).
+    if (const char* f = std::getenv("FB_FRONT_SNI")) impl_->ws_front_sni = f;
+    if (const char* h = std::getenv("FB_WS_HOST"))   impl_->ws_host_header = h;
     impl_->worker = std::thread([this]() {
         try {
             if (sodium_init() < 0) {
@@ -835,6 +844,8 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             const bool dialer_insecure      = !env("FB_PEER_DIALER_INSECURE").empty();
             const bool dialer_wss           = !env("FB_PEER_WSS").empty() &&
                                               env("FB_PEER_WSS") != "0";
+            const std::string dialer_front  = env("FB_PEER_FRONT_SNI");
+            const std::string dialer_wshost = env("FB_PEER_WS_HOST");
             impl_->own_p2p_addr             = env("FB_PEER_PUBLIC_ADDR");
 
             // I4: parse FB_OFFLINE_RELAYS as a comma-separated list
@@ -970,6 +981,8 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 dopts.ca_file              = dialer_ca;
                 dopts.insecure_skip_verify = dialer_insecure;
                 dopts.wss                  = dialer_wss;
+                dopts.front_sni            = dialer_front;
+                dopts.ws_host_header       = dialer_wshost;
                 impl_->peer_net->set_dialer(dopts);
                 // Inbound: stash on the overlay queue so the worker
                 // thread (this same thread, in its main poll loop)
@@ -1042,7 +1055,10 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 fb::net::TlsClientOptions tlsopts;
                 tlsopts.ca_file              = impl_->tls_ca_file;
                 tlsopts.insecure_skip_verify = impl_->tls_insecure_skip_verify;
-                tlsopts.sni_hostname         = impl_->tls_sni;
+                // Tier-3: the front domain (FB_FRONT_SNI) overrides the
+                // SNI when set; that's what a passive observer sees.
+                tlsopts.sni_hostname         = impl_->ws_front_sni.empty()
+                    ? impl_->tls_sni : impl_->ws_front_sni;
                 if (impl_->tls_insecure_skip_verify) {
                     emit log(QString(
                         "WARNING: TLS cert validation disabled "
@@ -1056,8 +1072,10 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 if (impl_->use_wss) {
                     // Tier-2: real WebSocket upgrade so the link looks
                     // like a browser hitting the relay's --tls-port.
-                    const std::string ws_host = impl_->tls_sni.empty()
-                        ? impl_->host.toStdString() : impl_->tls_sni;
+                    // Tier-3: the WS Host header (real backend) is
+                    // FB_WS_HOST when set, independent of the front SNI.
+                    const std::string ws_host = impl_->ws_host_header.empty()
+                        ? impl_->host.toStdString() : impl_->ws_host_header;
                     auto up = fb::net::ws::build_client_upgrade_request(
                         ws_host, impl_->port, "/");
                     impl_->tls->blocking_send_all(

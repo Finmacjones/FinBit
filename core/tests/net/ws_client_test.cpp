@@ -224,3 +224,59 @@ TEST(WsUpgradeRequest, IncludesNonDefaultPortInHostHeader) {
     EXPECT_NE(req.find("GET /chat HTTP/1.1\r\n"), std::string::npos);
     EXPECT_NE(req.find("Host: example.com:8443\r\n"), std::string::npos);
 }
+
+// Tier-2 L7 polish: the default request looks like a current Chrome.
+TEST(WsUpgradeRequest, EmitsBrowserRealisticHeaders) {
+    auto up = ws::build_client_upgrade_request("example.com", 443, "/");
+    const std::string req(up.request.begin(), up.request.end());
+    EXPECT_NE(req.find("User-Agent: Mozilla/5.0 "), std::string::npos);
+    EXPECT_NE(req.find("Chrome/"), std::string::npos);
+    EXPECT_NE(req.find("Pragma: no-cache\r\n"), std::string::npos);
+    EXPECT_NE(req.find("Cache-Control: no-cache\r\n"), std::string::npos);
+    EXPECT_NE(req.find("Accept-Encoding: gzip, deflate, br\r\n"), std::string::npos);
+    EXPECT_NE(req.find("Accept-Language: "), std::string::npos);
+    EXPECT_NE(req.find("Sec-WebSocket-Extensions: permessage-deflate"),
+              std::string::npos);
+    EXPECT_NE(req.find("Origin: https://example.com\r\n"), std::string::npos);
+    // No FinBit-branded leak in the default profile.
+    EXPECT_EQ(req.find("FinBit"), std::string::npos);
+}
+
+// The polished request must still be accepted by the server-side
+// HandshakeParser (header order / extra headers don't break parsing).
+TEST(WsUpgradeRequest, PolishedRequestStillAcceptedByServer) {
+    auto up = ws::build_client_upgrade_request("relay.example.com", 443, "/");
+    ws::HandshakeParser server;
+    ASSERT_EQ(server.feed(view(up.request)),
+              ws::HandshakeParser::Status::kAccepted);
+    EXPECT_EQ(server.client_key(), up.sec_key);
+}
+
+TEST(WsUpgradeRequest, UserAgentAndOriginOverridable) {
+    ws::WsUpgradeOptions o;
+    o.user_agent = "curl/8.4.0";
+    o.origin     = "https://front.example";
+    o.browser_headers = false;
+    auto up = ws::build_client_upgrade_request("real.example", 443, "/", o);
+    const std::string req(up.request.begin(), up.request.end());
+    EXPECT_NE(req.find("User-Agent: curl/8.4.0\r\n"), std::string::npos);
+    EXPECT_NE(req.find("Origin: https://front.example\r\n"), std::string::npos);
+    // browser_headers=false suppresses the extra set.
+    EXPECT_EQ(req.find("Pragma:"), std::string::npos);
+    EXPECT_EQ(req.find("Sec-WebSocket-Extensions:"), std::string::npos);
+}
+
+// Tier-3: the Host header is independent of the TLS SNI (front). The
+// request builder only knows the Host (the real backend); the SNI is
+// set separately on TlsClientOptions. Here we prove the Host carries
+// the REAL backend even when it differs from a front domain.
+TEST(WsUpgradeRequest, HostHeaderIsIndependentOfFrontSni) {
+    // Caller fronts via SNI=front.example (set on the TLS layer) but
+    // routes to real.backend.example via the Host header.
+    auto up = ws::build_client_upgrade_request("real.backend.example", 443, "/");
+    const std::string req(up.request.begin(), up.request.end());
+    EXPECT_NE(req.find("Host: real.backend.example\r\n"), std::string::npos);
+    // The front domain must NOT appear in the cleartext HTTP — only the
+    // (encrypted) SNI carries it.
+    EXPECT_EQ(req.find("front.example"), std::string::npos);
+}

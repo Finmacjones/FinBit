@@ -237,13 +237,15 @@ struct AcceptedConn {
 enum class WsRole { kNone, kDialer, kAcceptor };
 
 // Dialer-side WS upgrade over an already-connected channel (TlsClient).
-// Returns the bytes that arrived after the 101 response (the first WS
-// frame may be piggy-backed). Throws on rejection / timeout.
+// `host_header` is the WS Host value (the real backend; for Tier-3
+// fronting it differs from the TLS SNI). Returns the bytes that arrived
+// after the 101 response (the first WS frame may be piggy-backed).
+// Throws on rejection / timeout.
 template <class Channel>
 std::vector<std::uint8_t> ws_client_upgrade(Channel& ch,
-                                            const std::string& host,
+                                            const std::string& host_header,
                                             std::uint16_t port) {
-    auto up = fb::net::ws::build_client_upgrade_request(host, port, "/");
+    auto up = fb::net::ws::build_client_upgrade_request(host_header, port, "/");
     ch.blocking_send_all(std::span<const std::uint8_t>(
         up.request.data(), up.request.size()));
     fb::net::ws::ClientHandshakeParser hp(up.sec_key);
@@ -739,7 +741,10 @@ bool PeerNet::send(const PeerInfo& peer,
                     fb::net::TlsClientOptions topts;
                     topts.ca_file              = dialer_opts.ca_file;
                     topts.insecure_skip_verify = dialer_opts.insecure_skip_verify;
-                    topts.sni_hostname         = host;
+                    // Tier-3: front_sni overrides the SNI (front domain);
+                    // otherwise the SNI is the dialed host.
+                    topts.sni_hostname         = dialer_opts.front_sni.empty()
+                        ? host : dialer_opts.front_sni;
                     topts.client_cert_pem      = dialer_opts.client_cert_pem;
                     topts.client_key_pem       = dialer_opts.client_key_pem;
                     if (peer_copy.pubkey.size() == 32) {
@@ -753,7 +758,12 @@ bool PeerNet::send(const PeerInfo& peer,
                         tls.connect(host, port, topts);
                         if (dialer_opts.wss) {
                             // Tier-2: cloak the P2P link as browser WSS.
-                            pre  = ws_client_upgrade(tls, host, port);
+                            // Tier-3: WS Host = real backend (ws_host_header)
+                            // when fronting, else the dialed host.
+                            const std::string ws_host =
+                                dialer_opts.ws_host_header.empty()
+                                    ? host : dialer_opts.ws_host_header;
+                            pre  = ws_client_upgrade(tls, ws_host, port);
                             role = WsRole::kDialer;
                         }
                     } catch (const std::exception&) {
