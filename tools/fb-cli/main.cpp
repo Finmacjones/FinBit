@@ -118,6 +118,16 @@ struct Args {
     bool listen = false;
     bool send = false;
     int wait_ms = 5000;
+    // Call-signaling test mode (headless, no real media). Mirrors the
+    // desktop's group-call lazy bootstrap: --call-offer starts from a
+    // peer PUBKEY (as a roster would surface it), does
+    // username_lookup → key_fetch → init_alice → media_signal OFFER,
+    // then waits for the ANSWER. --call-listen prints MY-PUBKEY, then
+    // receives the OFFER (init_bob), prints it, and replies with an
+    // ANSWER. The SDP is a marker string — no GStreamer involved.
+    bool call_offer  = false;
+    bool call_listen = false;
+    std::string peer_pubkey_hex;    // 64 hex chars = peer's 32-byte ed25519 pub
     // Channel mode (Phase 1):
     std::string channel_name;       // hashed to 32-byte channel id
     std::string dist_file;          // where the distribution blob lives
@@ -170,6 +180,10 @@ void usage() {
               << "DM modes (Phase 0):\n"
               << "  --listen                          receive DMs\n"
               << "  --send  --peer NAME --text MSG    send a DM\n"
+              << "Call-signaling test modes (headless, no media):\n"
+              << "  --call-listen                     print MY-PUBKEY, await OFFER, reply ANSWER\n"
+              << "  --call-offer --peer-pubkey HEX --text SDP\n"
+              << "                                    bootstrap (lookup→fetch→init), send OFFER\n"
               << "Channel modes (Phase 1, SenderKeys group crypto):\n"
               << "  --channel-create --channel-name NAME --dist-file PATH --text MSG\n"
               << "                                    create chain, write dist file, send msg\n"
@@ -229,6 +243,9 @@ bool parse(int argc, char** argv, Args& a) {
         }
         else if (s == "--listen") { a.listen = true; }
         else if (s == "--send") { a.send = true; }
+        else if (s == "--call-offer") { a.call_offer = true; }
+        else if (s == "--call-listen") { a.call_listen = true; }
+        else if (s == "--peer-pubkey") { if (!next(a.peer_pubkey_hex)) return false; }
         else if (s == "--channel-name") { if (!next(a.channel_name)) return false; }
         else if (s == "--dist-file") { if (!next(a.dist_file)) return false; }
         else if (s == "--channel-create") { a.channel_create = true; }
@@ -275,9 +292,11 @@ bool parse(int argc, char** argv, Args& a) {
                       (a.channel_invite ? 1 : 0) +
                       (a.p2p_create ? 1 : 0) + (a.p2p_listen ? 1 : 0) +
                       (a.p2p_relay ? 1 : 0) +
-                      (a.overlay_send ? 1 : 0) + (a.overlay_recv ? 1 : 0);
+                      (a.overlay_send ? 1 : 0) + (a.overlay_recv ? 1 : 0) +
+                      (a.call_offer ? 1 : 0) + (a.call_listen ? 1 : 0);
     if (modes != 1) return false;
     if (a.send && (a.peer.empty() || a.text.empty())) return false;
+    if (a.call_offer && (a.peer_pubkey_hex.empty() || a.text.empty())) return false;
     if (a.overlay_send && (a.peer.empty() || a.text.empty())) return false;
     if (a.channel_create &&
         (a.channel_name.empty() || a.dist_file.empty() || a.text.empty())) return false;
@@ -369,6 +388,52 @@ std::vector<std::uint8_t> pack_text_payload(const std::string& text) {
     fb::proto::DmPayload p;
     p.set_text(text);
     return serialize(p);
+}
+
+// Pack a media-call signal (OFFER/ANSWER/…) into a DmPayload protobuf.
+// `sdp` is the marker payload — in the headless test it's an opaque
+// string standing in for a real SDP, so no GStreamer is needed.
+std::vector<std::uint8_t> pack_media_signal_payload(
+    std::span<const std::uint8_t> call_id, std::uint32_t kind,
+    const std::string& sdp) {
+    fb::proto::DmPayload p;
+    auto* ms = p.mutable_media_signal();
+    ms->set_call_id(std::string(call_id.begin(), call_id.end()));
+    ms->set_kind(kind);
+    ms->set_payload(sdp);
+    return serialize(p);
+}
+
+// Decode an even-length hex string into bytes. Returns false on a bad
+// character or odd length.
+bool hex_to_bytes(const std::string& hex, std::vector<std::uint8_t>& out) {
+    if (hex.size() % 2 != 0) return false;
+    auto nyb = [](char c, int& v) -> bool {
+        if (c >= '0' && c <= '9') { v = c - '0'; return true; }
+        if (c >= 'a' && c <= 'f') { v = 10 + (c - 'a'); return true; }
+        if (c >= 'A' && c <= 'F') { v = 10 + (c - 'A'); return true; }
+        return false;
+    };
+    out.clear();
+    out.reserve(hex.size() / 2);
+    for (std::size_t i = 0; i < hex.size(); i += 2) {
+        int hi = 0, lo = 0;
+        if (!nyb(hex[i], hi) || !nyb(hex[i + 1], lo)) return false;
+        out.push_back(static_cast<std::uint8_t>((hi << 4) | lo));
+    }
+    return true;
+}
+
+// Hex-encode bytes (lowercase). Used so --call-listen can print its
+// pubkey for the offerer to target, mirroring how a roster surfaces it.
+std::string bytes_to_hex(std::span<const std::uint8_t> b) {
+    static const char* k = "0123456789abcdef";
+    std::string s(b.size() * 2, '0');
+    for (std::size_t i = 0; i < b.size(); ++i) {
+        s[i * 2]     = k[(b[i] >> 4) & 0xf];
+        s[i * 2 + 1] = k[b[i] & 0xf];
+    }
+    return s;
 }
 
 // Pack a channel-key invite into a DmPayload protobuf.
@@ -1226,6 +1291,121 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (args.call_offer) {
+        // Headless mirror of the desktop group-call lazy bootstrap:
+        // start from the peer's PUBKEY (as a RoomRoster surfaces it),
+        // resolve username → fetch prekey → init_alice → send a
+        // media_signal OFFER, then wait for the ANSWER.
+        std::vector<std::uint8_t> peer_pub;
+        if (!hex_to_bytes(args.peer_pubkey_hex, peer_pub) || peer_pub.size() != 32) {
+            std::cerr << "--call-offer needs --peer-pubkey <64 hex chars>\n";
+            return 2;
+        }
+        // 1. Reverse-lookup the username for this pubkey.
+        {
+            fb::proto::Frame qf;
+            qf.mutable_username_lookup()->set_pubkey(
+                std::string(peer_pub.begin(), peer_pub.end()));
+            blocking_send(conn, serialize(qf));
+        }
+        std::string peer_username;
+        {
+            const auto resp = blocking_recv_frame(conn, dec, 8000);
+            if (!resp) { std::cerr << "no username_resp\n"; return 5; }
+            fb::proto::Frame rf;
+            if (!rf.ParseFromArray(resp->data(), static_cast<int>(resp->size())) ||
+                rf.body_case() != fb::proto::Frame::kUsernameResp ||
+                !rf.username_resp().found()) {
+                std::cerr << "peer pubkey not known to server\n"; return 6;
+            }
+            peer_username = rf.username_resp().username();
+        }
+        std::cerr << "[fb-cli] call-offer: resolved pubkey → " << peer_username << "\n";
+        // 2. Fetch the peer's prekey bundle by username.
+        {
+            fb::proto::Frame f;
+            f.mutable_key_fetch()->set_username(peer_username);
+            blocking_send(conn, serialize(f));
+        }
+        const auto resp = blocking_recv_frame(conn, dec, 8000);
+        if (!resp) { std::cerr << "no key bundle response\n"; return 5; }
+        fb::proto::Frame f;
+        if (!f.ParseFromArray(resp->data(), static_cast<int>(resp->size())) ||
+            f.body_case() != fb::proto::Frame::kKeyFetchResp ||
+            !f.key_fetch_resp().found()) {
+            std::cerr << "peer not registered yet\n"; return 6;
+        }
+        const auto& peer_b = f.key_fetch_resp().bundle();
+        if (peer_b.signed_prekey().size() != 32 ||
+            peer_b.identity_pubkey().size() != 32) {
+            std::cerr << "malformed peer bundle\n"; return 7;
+        }
+        // 3. init_alice + send a media_signal OFFER (kind=1).
+        std::array<std::uint8_t, 32> peer_x{};
+        std::memcpy(peer_x.data(), peer_b.signed_prekey().data(), 32);
+        auto shared = derive_shared_secret(x25519, std::span<const std::uint8_t, 32>(peer_x));
+        auto rat = fb::crypto::DoubleRatchet::init_alice(
+            shared, std::span<const std::uint8_t, 32>(peer_x));
+        std::array<std::uint8_t, 16> call_id{};
+        randombytes_buf(call_id.data(), call_id.size());
+        const auto pt = pack_media_signal_payload(
+            std::span<const std::uint8_t>(call_id.data(), call_id.size()),
+            /*kind=*/1 /*OFFER*/, args.text);
+        std::vector<std::uint8_t> envid(16);
+        randombytes_buf(envid.data(), envid.size());
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        const auto outer_aad = envelope_aad_bytes(
+            std::span<const std::uint8_t>(envid.data(), envid.size()), now_ms);
+        auto inner = rat.encrypt(std::span<const std::uint8_t>(pt.data(), pt.size()),
+                                 std::span<const std::uint8_t>(outer_aad.data(), outer_aad.size()));
+        fb::proto::Frame f2;
+        auto* env = f2.mutable_envelope();
+        env->set_envelope_id(std::string(envid.begin(), envid.end()));
+        env->set_aad(std::string(outer_aad.begin(), outer_aad.end()));
+        env->set_timestamp_ms(now_ms);
+        env->set_user_pubkey(peer_b.identity_pubkey());
+        env->set_sender_pubkey(std::string(
+            reinterpret_cast<const char*>(identity.public_key().data()),
+            identity.public_key().size()));
+        env->set_ciphertext(std::string(inner.begin(), inner.end()));
+        env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
+        env->set_protocol_version(fb::config::kProtocolVersion);
+        blocking_send(conn, serialize(f2));
+        std::cout << "CALL-OFFER-SENT: " << args.text << std::endl;
+        // 4. Wait for the ANSWER (kind=2) on the same ratchet.
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(args.wait_ms);
+        while (g_run && std::chrono::steady_clock::now() < deadline) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       deadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) break;
+            auto fr = blocking_recv_frame(conn, dec, static_cast<int>(remaining));
+            if (!fr) continue;
+            fb::proto::Frame in;
+            if (!in.ParseFromArray(fr->data(), static_cast<int>(fr->size()))) continue;
+            if (in.body_case() != fb::proto::Frame::kEnvelope) continue;
+            const auto& ienv = in.envelope();
+            std::vector<std::uint8_t> aad(ienv.aad().begin(), ienv.aad().end());
+            auto dpt = rat.decrypt(
+                std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(ienv.ciphertext().data()),
+                    ienv.ciphertext().size()),
+                std::span<const std::uint8_t>(aad.data(), aad.size()));
+            if (!dpt) continue;
+            fb::proto::DmPayload dp;
+            if (!dp.ParseFromArray(dpt->data(), static_cast<int>(dpt->size()))) continue;
+            if (dp.body_case() == fb::proto::DmPayload::kMediaSignal &&
+                dp.media_signal().kind() == 2 /*ANSWER*/) {
+                std::cout << "CALL-ANSWER: " << dp.media_signal().payload() << std::endl;
+                return 0;
+            }
+        }
+        std::cerr << "[fb-cli] call-offer: no ANSWER within wait window\n";
+        return 8;
+    }
+
     // listen mode — handles BOTH plain DM text and channel-key invites that
     // arrive over DM, plus channel envelopes that follow once we've installed
     // the distribution.
@@ -1233,6 +1413,16 @@ int main(int argc, char** argv) {
     fb::crypto::GroupSession group_session;
     // channel_id (32 bytes) -> display name we learned from the invite
     std::map<std::string, std::string> known_channels;
+
+    // Call-signaling responder: advertise our pubkey so the offerer can
+    // target us (as a RoomRoster would in the real client), then the
+    // loop below answers any media_signal OFFER it decrypts.
+    if (args.call_listen) {
+        std::cout << "MY-PUBKEY: "
+                  << bytes_to_hex(std::span<const std::uint8_t>(
+                         identity.public_key().data(), identity.public_key().size()))
+                  << std::endl;
+    }
 
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(args.wait_ms);
@@ -1364,6 +1554,50 @@ int main(int argc, char** argv) {
             blocking_send(conn, serialize(subf));
             known_channels[ck.channel_id()] = ck.channel_name();
             std::cout << "INVITE: #" << ck.channel_name() << std::endl;
+        } else if (payload.body_case() == fb::proto::DmPayload::kMediaSignal) {
+            // Call-signaling: an OFFER (kind=1) arrived from a peer who
+            // bootstrapped a session to us (init_bob above handled the
+            // first-contact ratchet). Print it and answer (kind=2) over
+            // the same ratchet so the offerer's wait completes — proving
+            // the full lazy-bootstrap → OFFER/ANSWER round-trip.
+            const auto& ms = payload.media_signal();
+            if (ms.kind() == 1 /*OFFER*/) {
+                std::cout << "CALL-OFFER: " << ms.payload() << std::endl;
+                if (rat && env.sender_pubkey().size() == 32) {
+                    const std::string answer_sdp = "v=0 answer for " + ms.payload();
+                    const auto apt = pack_media_signal_payload(
+                        std::span<const std::uint8_t>(
+                            reinterpret_cast<const std::uint8_t*>(ms.call_id().data()),
+                            ms.call_id().size()),
+                        /*kind=*/2 /*ANSWER*/, answer_sdp);
+                    std::vector<std::uint8_t> aenvid(16);
+                    randombytes_buf(aenvid.data(), aenvid.size());
+                    const auto a_now = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count());
+                    const auto a_aad = envelope_aad_bytes(
+                        std::span<const std::uint8_t>(aenvid.data(), aenvid.size()), a_now);
+                    auto a_inner = rat->encrypt(
+                        std::span<const std::uint8_t>(apt.data(), apt.size()),
+                        std::span<const std::uint8_t>(a_aad.data(), a_aad.size()));
+                    fb::proto::Frame af;
+                    auto* aenv = af.mutable_envelope();
+                    aenv->set_envelope_id(std::string(aenvid.begin(), aenvid.end()));
+                    aenv->set_aad(std::string(a_aad.begin(), a_aad.end()));
+                    aenv->set_timestamp_ms(a_now);
+                    aenv->set_user_pubkey(env.sender_pubkey());
+                    aenv->set_sender_pubkey(std::string(
+                        reinterpret_cast<const char*>(identity.public_key().data()),
+                        identity.public_key().size()));
+                    aenv->set_ciphertext(std::string(a_inner.begin(), a_inner.end()));
+                    aenv->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
+                    aenv->set_protocol_version(fb::config::kProtocolVersion);
+                    blocking_send(conn, serialize(af));
+                    std::cout << "CALL-ANSWER-SENT" << std::endl;
+                }
+            } else if (ms.kind() == 2 /*ANSWER*/) {
+                std::cout << "CALL-ANSWER: " << ms.payload() << std::endl;
+            }
         }
     }
     return 0;
