@@ -124,6 +124,10 @@ struct Args {
     bool send_image = false;
     std::string image_path;   // file to send with --send-image
     std::string image_out;    // where --listen writes a received attachment
+    // Room SFrame key distribution test (Lever B group keying). --send-roomkey
+    // DMs a random room_secret to --peer; --listen prints any received one.
+    bool send_roomkey = false;
+    int  room_epoch = 1;
     // Call-signaling test mode (headless, no real media). Mirrors the
     // desktop's group-call lazy bootstrap: --call-offer starts from a
     // peer PUBKEY (as a roster would surface it), does
@@ -257,6 +261,10 @@ bool parse(int argc, char** argv, Args& a) {
         else if (s == "--send-image") { a.send_image = true;
                                         if (!next(a.image_path)) return false; }
         else if (s == "--image-out") { if (!next(a.image_out)) return false; }
+        else if (s == "--send-roomkey") { a.send_roomkey = true; }
+        else if (s == "--room-epoch") { std::string v;
+                                        if (!next(v)) return false;
+                                        a.room_epoch = std::atoi(v.c_str()); }
         else if (s == "--channel-name") { if (!next(a.channel_name)) return false; }
         else if (s == "--dist-file") { if (!next(a.dist_file)) return false; }
         else if (s == "--channel-create") { a.channel_create = true; }
@@ -305,11 +313,12 @@ bool parse(int argc, char** argv, Args& a) {
                       (a.p2p_relay ? 1 : 0) +
                       (a.overlay_send ? 1 : 0) + (a.overlay_recv ? 1 : 0) +
                       (a.call_offer ? 1 : 0) + (a.call_listen ? 1 : 0) +
-                      (a.send_image ? 1 : 0);
+                      (a.send_image ? 1 : 0) + (a.send_roomkey ? 1 : 0);
     if (modes != 1) return false;
     if (a.send && (a.peer.empty() || a.text.empty())) return false;
     if (a.call_offer && (a.peer_pubkey_hex.empty() || a.text.empty())) return false;
     if (a.send_image && (a.peer.empty() || a.image_path.empty())) return false;
+    if (a.send_roomkey && a.peer.empty()) return false;
     if (a.overlay_send && (a.peer.empty() || a.text.empty())) return false;
     if (a.channel_create &&
         (a.channel_name.empty() || a.dist_file.empty() || a.text.empty())) return false;
@@ -413,6 +422,20 @@ std::vector<std::uint8_t> pack_attachment_payload(
     a->set_filename(filename);
     a->set_content(std::string(reinterpret_cast<const char*>(content.data()),
                                content.size()));
+    return serialize(p);
+}
+
+// Pack a room SFrame key (Lever B group keying) into a DmPayload.
+std::vector<std::uint8_t> pack_room_key_payload(
+    std::span<const std::uint8_t> room_id, std::uint32_t epoch,
+    std::span<const std::uint8_t> secret) {
+    fb::proto::DmPayload p;
+    auto* rk = p.mutable_room_key();
+    rk->set_room_id(std::string(reinterpret_cast<const char*>(room_id.data()),
+                                room_id.size()));
+    rk->set_epoch(epoch);
+    rk->set_secret(std::string(reinterpret_cast<const char*>(secret.data()),
+                               secret.size()));
     return serialize(p);
 }
 
@@ -1388,6 +1411,68 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (args.send_roomkey) {
+        // DM a random room_secret to --peer over the ratchet (Lever B
+        // group-call keying for SenderKeys channels). Same path as --send.
+        {
+            fb::proto::Frame f;
+            f.mutable_key_fetch()->set_username(args.peer);
+            blocking_send(conn, serialize(f));
+        }
+        auto resp = blocking_recv_frame(conn, dec, 8000);
+        if (!resp) { std::cerr << "no key bundle response\n"; return 5; }
+        fb::proto::Frame f;
+        if (!f.ParseFromArray(resp->data(), static_cast<int>(resp->size())) ||
+            f.body_case() != fb::proto::Frame::kKeyFetchResp ||
+            !f.key_fetch_resp().found()) {
+            std::cerr << "peer not registered yet\n"; return 6;
+        }
+        const auto& peer_b = f.key_fetch_resp().bundle();
+        if (peer_b.signed_prekey().size() != 32 ||
+            peer_b.identity_pubkey().size() != 32) {
+            std::cerr << "malformed peer bundle\n"; return 7;
+        }
+        std::array<std::uint8_t, 32> peer_x{};
+        std::memcpy(peer_x.data(), peer_b.signed_prekey().data(), 32);
+        auto shared = derive_shared_secret(x25519, std::span<const std::uint8_t, 32>(peer_x));
+        auto rat = fb::crypto::DoubleRatchet::init_alice(
+            shared, std::span<const std::uint8_t, 32>(peer_x));
+        std::array<std::uint8_t, 32> room_id{};   // opaque for the test
+        std::array<std::uint8_t, 32> secret{};
+        randombytes_buf(secret.data(), secret.size());
+        const auto pt = pack_room_key_payload(
+            std::span<const std::uint8_t>(room_id.data(), room_id.size()),
+            static_cast<std::uint32_t>(args.room_epoch),
+            std::span<const std::uint8_t>(secret.data(), secret.size()));
+        std::vector<std::uint8_t> envid(16);
+        randombytes_buf(envid.data(), envid.size());
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        const auto outer_aad = envelope_aad_bytes(
+            std::span<const std::uint8_t>(envid.data(), envid.size()), now_ms);
+        auto inner = rat.encrypt(std::span<const std::uint8_t>(pt.data(), pt.size()),
+                                 std::span<const std::uint8_t>(outer_aad.data(), outer_aad.size()));
+        fb::proto::Frame f2;
+        auto* env = f2.mutable_envelope();
+        env->set_envelope_id(std::string(envid.begin(), envid.end()));
+        env->set_aad(std::string(outer_aad.begin(), outer_aad.end()));
+        env->set_timestamp_ms(now_ms);
+        env->set_user_pubkey(peer_b.identity_pubkey());
+        env->set_sender_pubkey(std::string(
+            reinterpret_cast<const char*>(identity.public_key().data()),
+            identity.public_key().size()));
+        env->set_ciphertext(std::string(inner.begin(), inner.end()));
+        env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
+        env->set_protocol_version(fb::config::kProtocolVersion);
+        blocking_send(conn, serialize(f2));
+        std::cout << "ROOMKEY-SENT: epoch=" << args.room_epoch << " secret="
+                  << bytes_to_hex(std::span<const std::uint8_t>(
+                         secret.data(), secret.size()))
+                  << std::endl;
+        return 0;
+    }
+
     if (args.call_offer) {
         // Headless mirror of the desktop group-call lazy bootstrap:
         // start from the peer's PUBKEY (as a RoomRoster surfaces it),
@@ -1637,6 +1722,13 @@ int main(int argc, char** argv) {
             }
             std::cout << "IMG-RECEIVED: " << at.filename() << " "
                       << at.content().size() << "B mime=" << at.mime_type()
+                      << std::endl;
+        } else if (payload.body_case() == fb::proto::DmPayload::kRoomKey) {
+            const auto& rk = payload.room_key();
+            std::cout << "ROOMKEY: epoch=" << rk.epoch() << " secret="
+                      << bytes_to_hex(std::span<const std::uint8_t>(
+                             reinterpret_cast<const std::uint8_t*>(rk.secret().data()),
+                             rk.secret().size()))
                       << std::endl;
         } else if (payload.body_case() == fb::proto::DmPayload::kChannelKey) {
             const auto& ck = payload.channel_key();

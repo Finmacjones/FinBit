@@ -119,6 +119,19 @@ message Attachment {
     bytes  content   = 3;   // raw file bytes (pre-encryption)
 }
 
+// Room SFrame key distribution (Lever B group-call keying for SenderKeys
+// channels; MLS channels source the room_secret from the MLS exporter
+// instead). The room creator/forwarder picks a random 32-byte room_secret
+// and DMs it to each member over the Double Ratchet — so the relay (and
+// any media forwarder) never sees it. Members feed it to
+// fb::media::derive_room_sframe_key to derive each sender's SFrame key.
+// Rotated (new secret + bumped epoch) on membership change.
+message RoomKey {
+    bytes  room_id = 1;   // 32-byte room/channel id
+    uint32 epoch   = 2;   // matches RoomRoster.sframe_epoch
+    bytes  secret  = 3;   // 32-byte room_secret
+}
+
 message DmPayload {
     oneof body {
         string                  text               = 1;
@@ -130,5 +143,6 @@ message DmPayload {
         MlsCommit               mls_commit         = 7;
         MlsProposal             mls_proposal       = 8;
         Attachment              attachment         = 9;
+        RoomKey                 room_key           = 10;
     }
 }

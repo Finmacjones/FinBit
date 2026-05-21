@@ -646,6 +646,11 @@ struct ChatClient::Impl {
     // MediaCall's audioLevel signal; drives active-speaker selection
     // (Lever A). Entries removed when a call closes.
     std::map<std::string, double> peer_audio_levels;
+    // room_id → (epoch, room_secret) received via DmPayload.room_key
+    // (Lever B group keying for SenderKeys rooms). The media relay derives
+    // per-sender SFrame keys from this; until that lands it's stored + logged.
+    std::map<std::string, std::pair<std::uint32_t, std::array<std::uint8_t, 32>>>
+        room_secrets;
     // Per-room set of peer-pubkey strings we've already mesh-dialed (or
     // accepted from). Diffed against incoming RoomRoster broadcasts so
     // re-rosters don't redial existing peers, and departed peers get
@@ -2126,6 +2131,34 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                         QByteArray(c.data(), static_cast<int>(c.size())),
                                         QString::fromStdString(at.mime_type()),
                                         QString::fromStdString(at.filename()));
+                                }
+                            } else if (payload.body_case() ==
+                                       fb::proto::DmPayload::kRoomKey) {
+                                // Group-call room secret (Lever B). The sender
+                                // DMs a random 32-byte room_secret over the
+                                // ratchet so the relay/forwarder never sees it;
+                                // we store it keyed by room_id and the media
+                                // relay derives each sender's SFrame key from it
+                                // via fb::media::derive_room_sframe_key.
+                                const auto& rk = payload.room_key();
+                                if (rk.secret().size() == 32 &&
+                                    !rk.room_id().empty()) {
+                                    std::array<std::uint8_t, 32> secret{};
+                                    std::memcpy(secret.data(),
+                                                rk.secret().data(), 32);
+                                    impl_->room_secrets[rk.room_id()] = {
+                                        rk.epoch(), secret};
+                                    QString rid =
+                                        QByteArray(rk.room_id().data(),
+                                                   static_cast<int>(
+                                                       rk.room_id().size()))
+                                            .toHex()
+                                            .left(16);
+                                    emit log(QString("room secret installed "
+                                                     "(epoch %1, room %2…) from %3")
+                                                 .arg(rk.epoch())
+                                                 .arg(rid)
+                                                 .arg(peer_fp));
                                 }
                             } else if (payload.body_case() ==
                                        fb::proto::DmPayload::kChannelKey) {
