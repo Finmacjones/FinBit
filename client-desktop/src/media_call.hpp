@@ -79,6 +79,13 @@ public:
     // until we un-mute. No-op if the pipeline isn't built yet.
     void set_self_muted(bool muted);
 
+    // Gate PLAYBACK of this peer's inbound audio (active-speaker
+    // selection, Lever A). Unlike set_self_muted (which silences our
+    // outbound mic), this silences what WE hear from this peer —
+    // ChatClient mutes non-active speakers in big rooms to cap decode
+    // load. No-op until the inbound audio chain exists.
+    void set_playback_muted(bool muted);
+
     // End the call. Sends HANGUP to the peer unless `silent` (used when
     // the peer hung up first).
     void hangup(bool silent = false);
@@ -112,6 +119,11 @@ signals:
 
     void stateChanged(State s);
     void log(const QString& msg);
+
+    // Inbound-audio RMS (dBFS, ≤0) for this peer, ~5×/s from the `level`
+    // element. ChatClient aggregates these across the room to pick the
+    // active speakers.
+    void audioLevel(double rmsDb);
 
     // Remote video frame ready for paint. width/height come straight
     // from the GStreamer caps; pixel format is BGRA32 (preconverted by

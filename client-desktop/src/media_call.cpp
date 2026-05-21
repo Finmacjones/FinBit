@@ -121,10 +121,24 @@ GstElement* build_pipeline(bool add_video, GstElement** out_webrtc, QString* err
         // The named `mute_volume` element lets MediaCall::set_self_muted
         // toggle outbound audio without ripping the pipeline down. Other
         // participants stop hearing us instantly; flip back and we resume.
+        // opusenc tuned for many-party voice (Lever A of the no-SFU
+        // scaling plan, docs/serverless-group-calls.md):
+        //   dtx=true            — discontinuous transmission: a silent
+        //                         participant sends ~nothing, so a 24-way
+        //                         mesh costs ~(#talkers) not ~(N-1) streams.
+        //   audio-type=voice    — Opus voice mode (better at low rates).
+        //   bitrate-type=constrained-vbr + bitrate=24000 — predictable
+        //                         ~24 kbps voice; constrained-VBR lets DTX
+        //                         actually drop to near-zero on silence.
+        //   inband-fec + packet-loss-percentage=10 — recover lost packets
+        //                         without retransmit (mesh has no SFU to
+        //                         do selective retransmission).
         const gchar* desc =
             "pulsesrc ! audioconvert ! audioresample ! "
             "volume name=mute_volume mute=false ! "
-            "queue ! opusenc ! rtpopuspay pt=96 ! "
+            "queue ! opusenc audio-type=voice bitrate=24000 "
+            "bitrate-type=constrained-vbr dtx=true inband-fec=true "
+            "packet-loss-percentage=10 ! rtpopuspay pt=96 ! "
             "capsfilter caps=application/x-rtp,media=(string)audio,"
             "encoding-name=(string)OPUS,payload=(int)96";
         GError* gerr = nullptr;
@@ -491,7 +505,14 @@ void on_pad_added(GstElement* webrtc, GstPad* new_pad, gpointer user) {
 
     const gchar* desc = nullptr;
     if (is_audio) {
+        // `level` posts RMS messages every 200 ms (drives active-speaker
+        // selection + a future speaking indicator); `play_volume` lets
+        // ChatClient gate playback of non-active speakers in big rooms
+        // (Lever A, docs/serverless-group-calls.md) without tearing the
+        // inbound chain down.
         desc = "rtpopusdepay ! opusdec ! audioconvert ! audioresample ! "
+               "level name=in_level interval=200000000 post-messages=true ! "
+               "volume name=play_volume mute=false ! "
                "queue ! autoaudiosink";
     } else if (is_video) {
         // appsink emits "new-sample"; we pull GstSample → BGRA bytes →
@@ -669,11 +690,31 @@ gboolean on_bus_message(GstBus*, GstMessage* msg, gpointer user) {
             // Quiet — fired on every join.
             break;
         case GST_MESSAGE_ELEMENT: {
+            const GstStructure* s = gst_message_get_structure(msg);
+            const gchar* sname = s ? gst_structure_get_name(s) : nullptr;
+            if (sname && std::strcmp(sname, "level") == 0) {
+                // Inbound-audio RMS from the `level` element. Average the
+                // per-channel RMS (dBFS, ≤0; -inf-ish on silence) and hand
+                // it to the active-speaker coordinator. Cheap + frequent
+                // (every 200 ms), so don't log it.
+                double rms_db = -120.0;
+                const GValue* arr = gst_structure_get_value(s, "rms");
+                if (arr && GST_VALUE_HOLDS_ARRAY(arr)) {
+                    const guint n = gst_value_array_get_size(arr);
+                    if (n > 0) {
+                        double sum = 0.0;
+                        for (guint i = 0; i < n; ++i) {
+                            sum += g_value_get_double(gst_value_array_get_value(arr, i));
+                        }
+                        rms_db = sum / n;
+                    }
+                }
+                post_to_qt(call, [call, rms_db]() { emit call->audioLevel(rms_db); });
+                break;
+            }
             // webrtcbin posts custom messages here — surface their structure
             // names so we can tell what's flowing internally even if no
             // notify signal fires.
-            const GstStructure* s = gst_message_get_structure(msg);
-            const gchar* sname = s ? gst_structure_get_name(s) : nullptr;
             if (sname) {
                 QString line = QString("gst element-msg: %1").arg(sname);
                 post_to_qt(call, [call, line]() { emit call->log(line); });
@@ -877,6 +918,16 @@ void MediaCall::set_self_muted(bool muted) {
     emit log(muted ? "outbound audio muted" : "outbound audio un-muted");
 }
 
+void MediaCall::set_playback_muted(bool muted) {
+    if (!impl_->pipeline) return;
+    // `play_volume` only exists once the inbound audio pad is built;
+    // before then this is a no-op (the peer isn't audible yet).
+    GstElement* vol = gst_bin_get_by_name(GST_BIN(impl_->pipeline), "play_volume");
+    if (!vol) return;
+    g_object_set(vol, "mute", muted ? TRUE : FALSE, nullptr);
+    gst_object_unref(vol);
+}
+
 void MediaCall::hangup(bool silent) {
     if (state_ == State::kClosed) return;
     if (!silent) {
@@ -966,6 +1017,7 @@ void MediaCall::receive_answer(const QByteArray&) {}
 void MediaCall::receive_ice(const QByteArray&) {}
 
 void MediaCall::set_self_muted(bool) {}
+void MediaCall::set_playback_muted(bool) {}
 void MediaCall::hangup(bool /*silent*/) {
     set_state(State::kClosed);
 }

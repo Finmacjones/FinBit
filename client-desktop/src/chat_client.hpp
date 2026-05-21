@@ -18,6 +18,8 @@
 
 namespace fb::desktop {
 
+class MediaCall;   // wired by start_call_to_pub; full def in media_call.hpp
+
 class ChatClient : public QObject {
     Q_OBJECT
 
@@ -282,6 +284,11 @@ private:
                            const QString& display_label,
                            bool with_video,
                            const std::string& room_id);
+
+    // Active-speaker (Lever A): connect a new call's audioLevel signal to
+    // the room-wide level map, and recompute who stays audible vs gated.
+    void wire_call_levels(MediaCall* call, const std::string& peer_key);
+    void reselect_active_speakers();
 };
 
 }  // namespace fb::desktop

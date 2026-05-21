@@ -120,9 +120,16 @@ relay you already run) to forward.
 - [x] SFrame E2E frame encryption (forwarders stay blind) — `sframe.cpp`
 - [x] Lazy group-call session bootstrap (dial a never-DM'd roster peer)
 - [x] Headless call-signalling e2e (`tools/e2e/call_signal_roundtrip.sh`)
-- [ ] **Lever A:** Opus DTX in the send pipeline
-- [ ] **Lever A:** active-speaker selection (top-K RMS) — decode/subscribe limit
-- [ ] **Lever A:** raise the mesh cap to ~15–20 for audio + load-test
+- [x] **Lever A:** Opus DTX (+ voice-mode, constrained-VBR, inband-FEC) in
+      the send pipeline — `media_call.cpp`
+- [x] **Lever A:** active-speaker selection — per-peer RMS metering
+      (`level` element → `MediaCall::audioLevel`) + top-K selector
+      (`fb::media::select_active_speakers`, unit-tested) gating playback
+      via `play_volume`
+- [x] **Lever A:** no hard participant cap in code; audio now scales to
+      ~15–20 on the mesh (docs updated). *Note:* real-device load-test
+      and a pre-decoder frame-drop (deeper CPU cap) remain — done on a
+      box with audio hardware.
 - [ ] **Lever B:** forwarder election (uplink/stability probe over PeerNet)
 - [ ] **Lever B:** wire `RoomOffer`/`RoomAnswer`/`RoomIce` participant ↔ forwarder
 - [ ] **Lever B:** SFrame-blind audio forwarding on a peer; audio to ~24

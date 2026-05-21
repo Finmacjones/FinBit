@@ -64,6 +64,7 @@
 #include "identity_log.pb.h"
 #include "fb/store/sqlite_store.hpp"
 #include "fb/store/attachment_frame.hpp"
+#include "fb/media/active_speaker.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
 
@@ -625,6 +626,10 @@ struct ChatClient::Impl {
         std::string                         room_id;
     };
     std::map<std::string, CallEntry> calls_by_peer;
+    // peer-key → most-recent inbound audio RMS (dBFS), fed by each
+    // MediaCall's audioLevel signal; drives active-speaker selection
+    // (Lever A). Entries removed when a call closes.
+    std::map<std::string, double> peer_audio_levels;
     // Per-room set of peer-pubkey strings we've already mesh-dialed (or
     // accepted from). Diffed against incoming RoomRoster broadcasts so
     // re-rosters don't redial existing peers, and departed peers get
@@ -2632,12 +2637,15 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                                              impl_->room_mesh_peers) {
                                                             peers.erase(peer_key);
                                                         }
+                                                        impl_->peer_audio_levels.erase(peer_key);
+                                                        reselect_active_speakers();
                                                     }
                                                 });
                                             QObject::connect(call, &MediaCall::log, this,
                                                 [this](const QString& m) { emit log("[call] " + m); });
                                             QObject::connect(call, &MediaCall::remoteVideoFrame,
                                                 this, &ChatClient::remoteVideoFrame);
+                                            wire_call_levels(call, peer_key);
                                             // SFrame: derive base key from X3DH(shared, peer_x25519).
                                             std::array<std::uint8_t, 32> peer_x{};
                                             if (crypto_sign_ed25519_pk_to_curve25519(
@@ -4787,12 +4795,15 @@ bool ChatClient::start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub_
                 for (auto& [rid, peers] : impl_->room_mesh_peers) {
                     peers.erase(peer_key);
                 }
+                impl_->peer_audio_levels.erase(peer_key);
+                reselect_active_speakers();
             }
         });
     QObject::connect(call, &MediaCall::log, this,
         [this](const QString& m) { emit log("[call] " + m); });
     QObject::connect(call, &MediaCall::remoteVideoFrame, this,
         &ChatClient::remoteVideoFrame);
+    wire_call_levels(call, peer_key);
 
     call->start_outgoing(peer_pub_arr, with_video);
     // Newly-built pipeline starts un-muted; honour the per-client toggle
@@ -4800,6 +4811,32 @@ bool ChatClient::start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub_
     // the new mesh leg too.
     if (impl_->self_muted) call->set_self_muted(true);
     return true;
+}
+
+void ChatClient::wire_call_levels(MediaCall* call, const std::string& peer_key) {
+    QObject::connect(call, &MediaCall::audioLevel, this,
+        [this, peer_key](double rms_db) {
+            impl_->peer_audio_levels[peer_key] = rms_db;
+            reselect_active_speakers();
+        });
+}
+
+void ChatClient::reselect_active_speakers() {
+    // Up to 8 simultaneous talkers stay audible; beyond that the quietest
+    // are gated (cacophony / decode cap). -50 dBFS is the talk floor.
+    const auto audible = fb::media::select_active_speakers(
+        impl_->peer_audio_levels, /*max_active=*/8, /*floor_db=*/-50.0);
+    for (auto& [peer_key, entry] : impl_->calls_by_peer) {
+        if (!entry.call) continue;
+        // Only gate peers we actually have a level for; a call whose first
+        // level message hasn't arrived stays audible (no startup clip).
+        if (impl_->peer_audio_levels.find(peer_key) ==
+                impl_->peer_audio_levels.end()) {
+            entry.call->set_playback_muted(false);
+            continue;
+        }
+        entry.call->set_playback_muted(audible.count(peer_key) == 0);
+    }
 }
 
 void ChatClient::start_call(const QString& peer_username, bool with_video) {

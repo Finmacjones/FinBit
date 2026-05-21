@@ -73,8 +73,15 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
   1:1 PeerConnection (glare-tiebreak by pubkey). Lazy session bootstrap:
   if you've never DM'd a roster member, the client transparently does
   `username_lookup → key_fetch → init_alice → retry`. Self-mute toggle
-  fans out across every leg. Caps around 5–6 participants until the SFU
-  upgrade lands.
+  fans out across every leg.
+  **Scaling (Lever A, no SFU):** Opus DTX means silent participants send
+  ~nothing, so an *audio* mesh is dominated by the number of active
+  talkers, not the head-count — comfortably ~15–20 on ordinary
+  broadband. An active-speaker selector (top-K loudest via per-peer RMS
+  metering) gates the rest in big rooms to cap decode load. Group
+  *video* past a handful still needs forwarding — see
+  [`docs/serverless-group-calls.md`](docs/serverless-group-calls.md) for
+  the peer-forwarder path to ~24 (no dedicated SFU).
 - **Envelope-level integrity** — `Envelope.aad = envelope_id ‖
   u64_be(timestamp_ms)` is bound by the inner ratchet/SenderKeys AEAD
   tag. A relay rewriting either field invalidates the tag; rewriting all
