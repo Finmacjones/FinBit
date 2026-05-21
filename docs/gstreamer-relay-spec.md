@@ -73,8 +73,10 @@ The per-sender derivation **ships now** as
 (pure, unit-tested — see `SFrameRoomKey.*`). `media_call.cpp`'s
 `set_sframe_context` will gain a "room mode" that seals with `K_self` and
 opens each inbound pad with the per-sender `K_sender` (the single-base_key
-1:1 ctx must split into seal-key + per-sender open-keys — that wiring is
-part of the pipeline build, §6).
+1:1 ctx must split into seal-key + per-sender open-keys). The room_secret
+is now sourced for both channel types (MLS exporter / distributed RoomKey,
+both shipped — §9 item 1); the remaining probe-side wiring is **fully
+specified in §6A**.
 
 ## 3. Signalling flow (per leaf joining)
 
@@ -155,8 +157,171 @@ recv track → SDP renegotiation on each. Plan:
   `on_incoming_pad` audio chain — `rtpopusdepay → [sframe_open_probe keyed
   by K_sender] → opusdec → level → play_volume → autoaudiosink` — plus the
   Lever-A `level`/`play_volume` active-speaker gating already shipped.
-  The sender identity per pad comes from the SDP `msid` / a track→pubkey
-  map carried in the `RoomOffer`.
+  The sender identity per pad comes from a track→pubkey map carried in the
+  `RoomOffer`. **The per-sender open-key plumbing this requires is the one
+  piece §2 deferred; it is fully specified in §6A.**
+
+## 6A. Per-sender open-key probe plumbing (detailed recv-side spec)
+
+This is the last keying piece §2/§6 left open. Today's `sframe_open_probe`
+opens *every* inbound buffer with a single `SframeProbeCtx::base_key`
+(`media_call.cpp`). That is correct for 1:1 — both ends share one per-call
+key — but a forwarded room fans **many** senders into one receiver, each
+sealed with a *different* `K_sender = derive_room_sframe_key(room_secret,
+sender_pubkey, epoch)`. So the open probe must pick the key **per inbound
+stream** and survive **epoch rotation** mid-call. Three sub-problems:
+(6A.2) a key registry, (6A.3) binding each pad to its sender, (6A.4)
+splitting the probe + seal ctx.
+
+### 6A.1 Shipped vs changing
+- **Shipped & unchanged:** `fb::media::sframe_seal_v1/open_v1`, the wire
+  format `[u32 BE epoch][u64 BE ctr][AES-256-GCM]`, `derive_room_sframe_key`
+  (unit-tested incl. cross-sender isolation — `SFrameRoomKey.*`), and the
+  `room_secrets` map in `chat_client` (MLS-exporter *or* distributed-RoomKey
+  sourced, epoch-tagged — both now shipped).
+- **Changes:** `SframeProbeCtx` (one `base_key` for seal *and* open) splits
+  into a single **seal ctx** (`K_self`) + **per-pad open ctxs** (one per
+  sender); a room-scoped **`RoomKeyRegistry`** owns the secret + a derived-key
+  cache; `set_sframe_context` gains a room mode; `on_incoming_pad` builds an
+  open ctx from a pad→sender binding.
+
+### 6A.2 RoomKeyRegistry (shared, room-scoped)
+One per active group call, owned by `RoomLeafCall`. Pad probes run on
+GStreamer streaming threads → mutex-guarded; each key is one HKDF, cached.
+
+```cpp
+class RoomKeyRegistry {
+public:
+  // Called by ChatClient whenever room_secrets[room_id] changes (MLS commit
+  // / RoomKey rotation). Shifts current→previous for a grace window so
+  // in-flight frames at the old epoch still open.
+  void set_secret(std::array<std::uint8_t,32> secret, std::uint32_t epoch);
+
+  struct SealKey { std::array<std::uint8_t,32> key; std::uint32_t epoch; };
+  // K_self at the current epoch (= derive_room_sframe_key(secret, my_pub,
+  // epoch)). Seal probe reads key+epoch together.
+  SealKey seal_key() const;
+
+  // Open key for a sender at the epoch carried IN THE FRAME. Derives+caches
+  // on first use. Honors the grace window: accepts current and (briefly
+  // after a rotation) previous epoch; otherwise nullopt.
+  std::optional<std::array<std::uint8_t,32>>
+      open_key(std::string_view sender_pubkey, std::uint32_t frame_epoch);
+
+private:
+  mutable std::mutex mu_;
+  std::array<std::uint8_t,32> my_pubkey_{};
+  std::array<std::uint8_t,32> cur_secret_{}, prev_secret_{};
+  std::uint32_t cur_epoch_=0, prev_epoch_=0;
+  std::chrono::steady_clock::time_point prev_until_{};       // grace deadline
+  std::map<std::pair<std::string,std::uint32_t>,
+           std::array<std::uint8_t,32>> cache_;               // (sender,epoch)→K
+};
+```
+
+`open_key`: select the secret whose epoch == `frame_epoch` (cur, or prev if
+`now < prev_until_`); else nullopt. Then `derive_room_sframe_key(secret,
+sender_pubkey, frame_epoch)`, cache by `(sender,epoch)`, return. Evict
+epochs older than `prev_epoch_`; cap cache size.
+
+### 6A.3 Binding each inbound pad to its sender
+The open probe needs the pad's sender pubkey. The forwarder knows it (each
+forwarded track originates from one leaf whose identity it has from the
+roster), and **labeling identity is metadata, not key material — the
+forwarder stays blind to content.**
+
+**Recommended:** carry it explicitly on the (reserved) `RoomOffer`:
+```proto
+message TrackBinding { string mid = 1; bytes sender_pubkey = 2; }
+// RoomOffer: repeated TrackBinding track_bindings = N;
+```
+The forwarder sets one binding per outbound media section (`mid` →
+originating leaf pubkey). The subscriber, in `on_incoming_pad`, reads the
+pad's transceiver `mid`, looks up `track_bindings[mid] → sender_pubkey`,
+and builds the open ctx. Pure mid→pubkey map: **testable with no media.**
+
+*Alternative (no proto change):* encode the pubkey hex in the track's SDP
+`a=msid:<stream> <track>` and parse it from the pad's `mid`/caps. Workable
+but stringly-typed and fragile — prefer the proto field.
+
+### 6A.4 The reworked probes
+Split the single ctx:
+```cpp
+struct SframeSealCtx {                 // one per call (send branch)
+  RoomKeyRegistry*           reg;
+  std::atomic<std::uint64_t> send_counter{0};
+};
+struct SframeOpenCtx {                 // one PER inbound pad (per sender)
+  RoomKeyRegistry* reg;
+  std::string      sender_pubkey;      // 32 bytes, from §6A.3
+};
+```
+- **seal probe:** `auto sk = reg->seal_key(); auto c = send_counter++;
+  sframe_seal_v1(sk.key, sk.epoch, c, payload)`. On rotation `seal_key()`
+  returns the new key+epoch; the counter may restart at 0 because the AEAD
+  nonce is `(epoch‖counter)` — a fresh epoch makes the pair unique again.
+- **open probe:** read `frame_epoch` (BE u32, first 4 bytes) **before**
+  opening; `auto k = reg->open_key(sender_pubkey, frame_epoch); if(!k)
+  return GST_PAD_PROBE_DROP; sframe_open_v1(*k, frame)`. Add a small
+  `fb::media::sframe_peek_epoch(frame)` helper (4-byte BE read) so the probe
+  selects the key without duplicating the parse; `sframe_open_v1(key, frame)`
+  stays unchanged (it still parses epoch+counter internally to open).
+
+`install_sframe_recv_probe` changes from one shared ctx to **one
+`SframeOpenCtx` per depayloader src pad**, allocated when the pad appears in
+`on_incoming_pad` and freed on `pad-removed`/unlink (own it in the per-pad
+bookkeeping struct so its lifetime tracks the pad).
+
+### 6A.5 Seal side & `set_sframe_context` room mode
+Add a room variant of `set_sframe_context`: instead of HKDF over
+`(shared_secret, call_id)` into one `base_key`, point the seal ctx at the
+`RoomKeyRegistry` (`seal_key()` = `derive_room_sframe_key(room_secret,
+my_pubkey, epoch)`). The existing 1:1 per-call path is untouched.
+
+### 6A.6 Epoch-rotation timeline
+1. Membership change → `RoomRoster.sframe_epoch` bumps (server) and/or an
+   MLS commit bumps `MlsGroup::epoch()`.
+2. `chat_client` updates `room_secrets[room_id]` (already wired) **and**
+   calls `registry.set_secret(secret, new_epoch)` → current shifts to
+   previous; `prev_until_ = now + grace` (≈3 s).
+3. Senders seal at `new_epoch` immediately; receivers open new-epoch frames
+   with the new key and still open trailing old-epoch frames during grace
+   (the frame header disambiguates).
+4. After grace, old keys evict; any late old-epoch frame drops.
+
+### 6A.7 Failure semantics
+- **No secret yet** (call started before the MLS exporter is ready / the
+  RoomKey DM arrives): `open_key` → nullopt → DROP. Brief; resumes on
+  `set_secret`.
+- **Forged / wrong frame / epoch past grace:** `open_key` nullopt or
+  `sframe_open_v1` auth-fail → DROP (current behavior, preserved).
+- **Seal failure:** fail-open (DTLS-SRTP still protects the hop) — as 1:1.
+- **Non-goal:** SFrame-level replay suppression (DTLS-SRTP + AEAD integrity
+  stand; per-call replay is future work).
+
+### 6A.8 Test plan (extends §8)
+- **Pure/unit (CI, no hardware):** `RoomKeyRegistry` — `seal_key` rotates on
+  `set_secret`; `open_key` derives the right per-sender key, honors the grace
+  window (prev epoch opens within it, drops after), caches, rejects unknown
+  senders. `sframe_peek_epoch` round-trips a sealed header. Sits next to
+  `SFrameRoomKey.*`.
+- **Loopback (CI-able, finicky):** two `audiotestsrc` publishers with
+  distinct identities → forwarder → one subscriber holding two
+  `SframeOpenCtx`. Assert it opens *both* streams (right key per pad) and
+  that a deliberately swapped binding fails to open (pipeline-level
+  cross-sender isolation, mirroring the unit-level guarantee).
+- **Hardware:** mid-call join/leave → assert audio continuity across the
+  rotation grace window.
+
+### 6A.9 Build-order delta (refines §9 item 1)
+1. `fb::media::sframe_peek_epoch` + `RoomKeyRegistry` + unit tests —
+   **pure, lands now, no hardware.**
+2. `RoomOffer.track_bindings` proto field + forwarder population + subscriber
+   lookup — pure/testable ahead of media.
+3. Probe split (`SframeSealCtx`/`SframeOpenCtx`) + per-pad open ctx in
+   `on_incoming_pad` — with the pipeline build.
+4. Rotation wiring (`chat_client` → `registry.set_secret`) — with the
+   pipeline.
 
 ## 7. NAT / ICE / capacity
 
@@ -186,15 +351,20 @@ recv track → SDP renegotiation on each. Plan:
 ## 9. Build order
 
 1. **Group keying (§2)** — per-room secret + per-sender derivation +
-   epoch rotation. **[done — derivation]** `fb::media::derive_room_sframe_key`
-   ships with unit tests (`SFrameRoomKey.*`): determinism, per-sender /
-   per-epoch / per-secret separation, and — proving it's a real SFrame
-   base key — seal-with-A's-key/open-with-A's-key plus cross-sender
-   isolation (A's frame won't open with B's key). *Remaining:* source the
-   `room_secret` (MLS `state.do_export("FinBit-room-sframe", …)` exposed
-   via `mls_facade`; or a distributed `RoomKey` for SenderKeys channels),
-   and feed per-sender keys into the media probes (§6) — both land with
-   the pipeline build below.
+   epoch rotation. **[done — derivation + sourcing]**
+   `fb::media::derive_room_sframe_key` ships with unit tests
+   (`SFrameRoomKey.*`): determinism, per-sender / per-epoch / per-secret
+   separation, and — proving it's a real SFrame base key —
+   seal-with-A's-key/open-with-A's-key plus cross-sender isolation (A's
+   frame won't open with B's key). The `room_secret` is now **sourced** for
+   both channel types: MLS via `MlsGroup::export_room_secret()`
+   (`state.do_export`, unit-tested for cross-member agreement + rotation),
+   SenderKeys via the distributed `RoomKey` DM (`roomkey_roundtrip.sh`); both
+   land in `chat_client`'s unified `room_secrets` map. *Remaining:* feed the
+   per-sender keys into the media probes — **fully specified in §6A**
+   (`RoomKeyRegistry`, `sframe_peek_epoch`, the seal/open ctx split, pad→
+   sender binding, epoch grace) — lands with the pipeline build below; the
+   pure pieces (§6A.9 steps 1–2) can land ahead of it.
 2. **Forwarder graph (§4)** for a *fixed* small N (no renegotiation) —
    prove blind relay works for 3 nodes via the loopback test.
 3. **Dynamic join/leave + renegotiation (§5)** — the transceiver pool.

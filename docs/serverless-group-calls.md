@@ -156,13 +156,17 @@ relay you already run) to forward.
       rotation. `chat_client` resolves it on each room roster and unifies
       both sources into one `room_secrets` map the media relay consumes
       identically. *Remaining:* per-sender open-key plumbing in the media
-      probes (lands with the pipeline).
+      probes — **now fully specified** in `docs/gstreamer-relay-spec.md` §6A
+      (`RoomKeyRegistry`, `sframe_peek_epoch`, seal/open ctx split, pad→
+      sender binding, epoch grace); its pure pieces can land ahead of the
+      pipeline.
 - [ ] **Lever B:** GStreamer peer media-relay pipeline — terminate N
       PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
       decoding (forwarder stays blind). *Real-hardware / multi-machine
       build — the election + plan above are the hook it consumes.*
       **Full implementation spec: `docs/gstreamer-relay-spec.md`** (group
-      SFrame keying, the SFU element graph, renegotiation, test plan).
+      SFrame keying + per-sender open-key plumbing §6A, the SFU element
+      graph, renegotiation, test plan).
 - [ ] **Lever B:** wire `RoomOffer`/`RoomAnswer`/`RoomIce` for the
       participant ↔ forwarder media handshake (depends on the relay
       pipeline)
