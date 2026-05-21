@@ -16,6 +16,7 @@
 //   - persist GroupState blobs through fb::store::SqliteStore::save_session()
 // =============================================================================
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -171,6 +172,24 @@ public:
     // ordering, but callers shouldn't depend on a specific index.
     [[nodiscard]] virtual std::vector<std::vector<std::uint8_t>>
         member_identities() const = 0;
+
+    // ---- Group-call keying (RFC 9420 §8.5 exporter) ------------------
+    //
+    // The current MLS epoch. Bumps on every Commit (add/remove/update),
+    // so it doubles as the group call's SFrame rotation epoch — when
+    // membership changes, the room re-keys automatically.
+    [[nodiscard]] virtual std::uint64_t epoch() const = 0;
+
+    // Derive the per-room SFrame base secret for a group call in THIS
+    // channel, straight from the MLS exporter. Every member at the same
+    // epoch derives the identical 32 bytes with no extra message and no
+    // distribution DM (unlike the SenderKeys path, which ships a RoomKey
+    // over the ratchet) — and it rotates for free on every Commit because
+    // the exporter secret does. Feed the result to
+    // `fb::media::derive_room_sframe_key(secret, sender_pubkey, epoch())`
+    // to get each sender's call key; the forwarder stays blind.
+    [[nodiscard]] virtual std::array<std::uint8_t, 32>
+        export_room_secret() const = 0;
 };
 
 // Pure virtuals; the FB_HAVE_MLS=0 build never constructs an MlsGroup

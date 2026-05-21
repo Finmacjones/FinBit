@@ -141,15 +141,22 @@ relay you already run) to forward.
 - [x] **Lever B:** group SFrame keying — per-sender key from a shared
       per-room secret (`fb::media::derive_room_sframe_key`), unit-tested
       incl. seal/open round-trip + cross-sender isolation.
-- [x] **Lever B:** room_secret sourcing via distributed `RoomKey` — the
-      creator/forwarder DMs a random 32-byte secret to each member over the
-      Double Ratchet (`DmPayload.room_key`, epoch-tagged); fb-cli
-      `--send-roomkey`/`--listen` + desktop `chat_client` install it, and
-      `tools/e2e/roomkey_roundtrip.sh` (in CI) proves it arrives
-      byte-identical while the relay log never sees it (forwarder blind).
-      *Remaining:* the MLS-channel source (export the secret from the MLS
-      group secret instead of a DM) + per-sender open-key plumbing in the
-      media probes (lands with the pipeline).
+- [x] **Lever B:** room_secret sourcing for **SenderKeys** channels via
+      distributed `RoomKey` — the creator/forwarder DMs a random 32-byte
+      secret to each member over the Double Ratchet (`DmPayload.room_key`,
+      epoch-tagged); fb-cli `--send-roomkey`/`--listen` + desktop
+      `chat_client` install it, and `tools/e2e/roomkey_roundtrip.sh` (in CI)
+      proves it arrives byte-identical while the relay log never sees it
+      (forwarder blind).
+- [x] **Lever B:** room_secret sourcing for **MLS** channels via the MLS
+      exporter (RFC 9420 §8.5) — `MlsGroup::export_room_secret()` (context =
+      group_id) derives the SAME 32 bytes on every member with **no
+      distribution DM at all**, rotating for free on every Commit
+      (`MlsGroup::epoch()`); unit-tested for cross-member agreement +
+      rotation. `chat_client` resolves it on each room roster and unifies
+      both sources into one `room_secrets` map the media relay consumes
+      identically. *Remaining:* per-sender open-key plumbing in the media
+      probes (lands with the pipeline).
 - [ ] **Lever B:** GStreamer peer media-relay pipeline — terminate N
       PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
       decoding (forwarder stays blind). *Real-hardware / multi-machine

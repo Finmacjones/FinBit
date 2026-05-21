@@ -1761,6 +1761,39 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     }
                 }
 
+                // Source the group-call room_secret (the seed that
+                // fb::media::derive_room_sframe_key turns into each sender's
+                // SFrame key). Two sources, unified into room_secrets so the
+                // media relay consumes them identically regardless of channel
+                // crypto:
+                //   - MLS channels: derive locally from the MLS exporter
+                //     (RFC 9420 §8.5). Every member computes the SAME bytes
+                //     with NO distribution DM, and it rotates automatically on
+                //     every Commit (the epoch below bumps), so join/leave
+                //     re-keys the room for free.
+                //   - SenderKeys channels: the secret arrives out-of-band via
+                //     a distributed RoomKey DM (kRoomKey receive path) — it's
+                //     already in room_secrets, nothing to source here.
+                if (!chan_name.isEmpty()) {
+                    auto cit = impl_->channels.find(chan_name.toStdString());
+                    if (cit != impl_->channels.end() &&
+                        cit->second.crypto ==
+                            fb::store::SqliteStore::ChannelCrypto::kMls &&
+                        cit->second.mls) {
+                        const auto mepoch = static_cast<std::uint32_t>(
+                            cit->second.mls->epoch());
+                        auto secret = cit->second.mls->export_room_secret();
+                        auto& slot = impl_->room_secrets[room_id_str];
+                        if (slot.first != mepoch || slot.second != secret) {
+                            slot = {mepoch, secret};
+                            emit log(QString("room keyed from MLS exporter "
+                                             "(epoch %1) for #%2")
+                                         .arg(mepoch)
+                                         .arg(chan_name));
+                        }
+                    }
+                }
+
                 auto& meshed = impl_->room_mesh_peers[room_id_str];
                 std::vector<std::string> to_drop;
                 for (const auto& peer_key : meshed) {

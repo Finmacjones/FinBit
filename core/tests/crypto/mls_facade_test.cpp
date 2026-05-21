@@ -472,6 +472,78 @@ TEST(MlsFacade, SplitSeedAndLogRoundTrip) {
     EXPECT_EQ(alice2->member_count(), 3u);
 }
 
+// ---------------------------------------------------------------------------
+// MLS exporter → group-call room secret (RFC 9420 §8.5).
+//
+// This is the MLS-channel source for the SFrame room_secret: instead of
+// DMing a RoomKey (the SenderKeys path), every member derives the SAME
+// 32 bytes locally from the group's exporter secret — no extra message —
+// and it rotates for free on every Commit. The properties that make it a
+// valid room_secret source: (1) identical across all members at an epoch,
+// (2) deterministic, (3) bound to the channel (group_id context), and
+// (4) rotates when membership changes.
+// ---------------------------------------------------------------------------
+TEST(MlsFacade, RoomSecretExporterAgreesAcrossMembersAndRotates) {
+    auto alice_id = seed(0xa1);
+    auto bob_id   = seed(0xb2);
+    auto carol_id = seed(0xc3);
+    auto group_id = seed(0x42);
+
+    // alice + bob synced at a shared epoch (add → Welcome → complete).
+    auto alice = fb::crypto::MlsGroup::create(
+        std::span<const std::uint8_t, 32>(alice_id),
+        std::span<const std::uint8_t, 32>(group_id));
+    auto bob_join = fb::crypto::MlsGroup::start_join(
+        std::span<const std::uint8_t, 32>(bob_id));
+    auto bob_kp = bob_join->key_package();
+    auto bob_add = alice->add_member(
+        std::span<const std::uint8_t>(bob_kp.data(), bob_kp.size()));
+    auto bob = bob_join->complete(std::span<const std::uint8_t>(
+        bob_add.welcome.data(), bob_add.welcome.size()));
+
+    // (1) Same epoch, (2) byte-identical secret across members.
+    EXPECT_EQ(alice->epoch(), bob->epoch());
+    auto a_secret = alice->export_room_secret();
+    auto b_secret = bob->export_room_secret();
+    EXPECT_EQ(a_secret, b_secret);
+
+    // (3) Deterministic: re-derivation yields the same bytes; and it's not
+    //     trivially all-zero.
+    EXPECT_EQ(a_secret, alice->export_room_secret());
+    std::array<std::uint8_t, 32> zero{};
+    EXPECT_NE(a_secret, zero);
+
+    // Bound to the channel: a different group_id → a different secret even
+    // at the same (epoch-0) membership.
+    auto other = fb::crypto::MlsGroup::create(
+        std::span<const std::uint8_t, 32>(alice_id),
+        std::span<const std::uint8_t, 32>(seed(0x99)));
+    EXPECT_NE(other->export_room_secret(), a_secret);
+
+    // (4) Membership change re-keys the room for free: add carol (a Commit),
+    //     epoch bumps, secret rotates, and all three still agree.
+    const auto epoch_before = alice->epoch();
+    auto carol_join = fb::crypto::MlsGroup::start_join(
+        std::span<const std::uint8_t, 32>(carol_id));
+    auto carol_kp = carol_join->key_package();
+    auto proposal = alice->propose_add_member(
+        std::span<const std::uint8_t>(carol_kp.data(), carol_kp.size()));
+    bob->handle_proposal(
+        std::span<const std::uint8_t>(proposal.data(), proposal.size()));
+    auto carol_add = alice->commit_pending();
+    auto carol = carol_join->complete(std::span<const std::uint8_t>(
+        carol_add.welcome.data(), carol_add.welcome.size()));
+    bob->apply_commit(std::span<const std::uint8_t>(
+        carol_add.commit.data(), carol_add.commit.size()));
+
+    EXPECT_GT(alice->epoch(), epoch_before);          // epoch advanced
+    auto a_secret2 = alice->export_room_secret();
+    EXPECT_NE(a_secret2, a_secret);                   // rotated
+    EXPECT_EQ(a_secret2, bob->export_room_secret());  // still agree …
+    EXPECT_EQ(a_secret2, carol->export_room_secret());// … all three
+    EXPECT_EQ(alice->epoch(), carol->epoch());
+}
+
 #else  // FB_HAVE_MLS == 0
 
 TEST(MlsFacade, StubBuildThrowsNotImplemented) {

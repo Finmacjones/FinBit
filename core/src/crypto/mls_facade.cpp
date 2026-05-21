@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/crypto/mls_facade.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -458,6 +459,21 @@ public:
                 out.emplace_back();
             }
         }
+        return out;
+    }
+
+    std::uint64_t epoch() const override {
+        return static_cast<std::uint64_t>(state_.epoch());
+    }
+
+    std::array<std::uint8_t, 32> export_room_secret() const override {
+        // RFC 9420 §8.5 MLS exporter. Context = group_id so the secret is
+        // bound to this channel; label namespaces it to the SFrame use.
+        // Every member at this epoch derives the identical 32 bytes.
+        const bytes secret =
+            state_.do_export("FinBit-room-sframe-v1", state_.group_id(), 32);
+        std::array<std::uint8_t, 32> out{};
+        std::copy_n(secret.begin(), 32, out.begin());
         return out;
     }
 
