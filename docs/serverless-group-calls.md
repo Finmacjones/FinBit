@@ -142,6 +142,8 @@ relay you already run) to forward.
       PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
       decoding (forwarder stays blind). *Real-hardware / multi-machine
       build — the election + plan above are the hook it consumes.*
+      **Full implementation spec: `docs/gstreamer-relay-spec.md`** (group
+      SFrame keying, the SFU element graph, renegotiation, test plan).
 - [ ] **Lever B:** wire `RoomOffer`/`RoomAnswer`/`RoomIce` for the
       participant ↔ forwarder media handshake (depends on the relay
       pipeline)
