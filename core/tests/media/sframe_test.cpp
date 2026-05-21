@@ -98,3 +98,78 @@ TEST(SFrame, DeterministicSealForSameInputs) {
                                        std::span<const std::uint8_t>(pt.data(), pt.size()));
     EXPECT_EQ(a, b) << "SFrame seal must be deterministic for fixed (key, epoch, counter)";
 }
+
+// ---------------------------------------------------------------------------
+// Group (forwarded-room) keying — derive_room_sframe_key (Lever B).
+// ---------------------------------------------------------------------------
+namespace {
+std::array<std::uint8_t, 32> demo_room_secret(std::uint8_t seed = 0x11) {
+    std::array<std::uint8_t, 32> s{};
+    for (std::size_t i = 0; i < s.size(); ++i) s[i] = static_cast<std::uint8_t>(seed + i);
+    return s;
+}
+std::vector<std::uint8_t> pub(std::uint8_t tag) {
+    return std::vector<std::uint8_t>(32, tag);  // a 32-byte "pubkey"
+}
+std::array<std::uint8_t, 32> room_key(const std::array<std::uint8_t, 32>& secret,
+                                      const std::vector<std::uint8_t>& sender,
+                                      std::uint32_t epoch) {
+    return fb::media::derive_room_sframe_key(
+        std::span<const std::uint8_t, 32>(secret),
+        std::span<const std::uint8_t>(sender.data(), sender.size()), epoch);
+}
+}  // namespace
+
+TEST(SFrameRoomKey, DeterministicForSameInputs) {
+    auto s = demo_room_secret();
+    EXPECT_EQ(room_key(s, pub(0xAA), 1), room_key(s, pub(0xAA), 1));
+}
+
+TEST(SFrameRoomKey, DistinctPerSender) {
+    auto s = demo_room_secret();
+    EXPECT_NE(room_key(s, pub(0xAA), 1), room_key(s, pub(0xBB), 1));
+}
+
+TEST(SFrameRoomKey, DistinctPerEpoch) {
+    auto s = demo_room_secret();
+    EXPECT_NE(room_key(s, pub(0xAA), 1), room_key(s, pub(0xAA), 2));
+}
+
+TEST(SFrameRoomKey, DistinctPerRoomSecret) {
+    EXPECT_NE(room_key(demo_room_secret(0x11), pub(0xAA), 1),
+              room_key(demo_room_secret(0x22), pub(0xAA), 1));
+}
+
+// The derived per-sender key is a usable SFrame base_key: a frame sealed
+// with sender A's key opens with A's key (any room member can derive it).
+TEST(SFrameRoomKey, DerivedKeySealsAndOpens) {
+    auto s = demo_room_secret();
+    auto kA = room_key(s, pub(0xAA), 3);
+    auto pt = bytes("hello from sender A");
+    auto sealed = fb::media::sframe_seal_v1(
+        std::span<const std::uint8_t, 32>(kA), 3, 0,
+        std::span<const std::uint8_t>(pt.data(), pt.size()));
+    // A different member re-derives A's key from the shared room_secret.
+    auto kA_again = room_key(s, pub(0xAA), 3);
+    auto opened = fb::media::sframe_open_v1(
+        std::span<const std::uint8_t, 32>(kA_again),
+        std::span<const std::uint8_t>(sealed.data(), sealed.size()));
+    ASSERT_TRUE(opened.has_value());
+    EXPECT_EQ(*opened, pt);
+}
+
+// Cross-sender isolation: a frame sealed with A's key does NOT open with
+// B's key, even though both come from the same room_secret.
+TEST(SFrameRoomKey, CrossSenderKeyDoesNotOpen) {
+    auto s = demo_room_secret();
+    auto kA = room_key(s, pub(0xAA), 3);
+    auto kB = room_key(s, pub(0xBB), 3);
+    auto pt = bytes("only A's receivers... well, everyone, but with A's key");
+    auto sealed = fb::media::sframe_seal_v1(
+        std::span<const std::uint8_t, 32>(kA), 3, 0,
+        std::span<const std::uint8_t>(pt.data(), pt.size()));
+    EXPECT_FALSE(fb::media::sframe_open_v1(
+                     std::span<const std::uint8_t, 32>(kB),
+                     std::span<const std::uint8_t>(sealed.data(), sealed.size()))
+                     .has_value());
+}

@@ -64,6 +64,30 @@ std::array<std::uint8_t, Out> hkdf_expand_label(std::span<const std::uint8_t, 32
 
 }  // namespace
 
+std::array<std::uint8_t, 32> derive_room_sframe_key(
+    std::span<const std::uint8_t, 32> room_secret,
+    std::span<const std::uint8_t> sender_pubkey, std::uint32_t epoch) {
+    ensure_sodium();
+    // info = "FinBit-SFrame-room-v1" || sender_pubkey || be32(epoch)
+    constexpr std::string_view kLabel = "FinBit-SFrame-room-v1";
+    std::vector<std::uint8_t> info(kLabel.size() + sender_pubkey.size() + 4);
+    std::memcpy(info.data(), kLabel.data(), kLabel.size());
+    if (!sender_pubkey.empty()) {
+        std::memcpy(info.data() + kLabel.size(), sender_pubkey.data(),
+                    sender_pubkey.size());
+    }
+    be_u32(epoch, info.data() + kLabel.size() + sender_pubkey.size());
+
+    auto prk = fb::crypto::hkdf_extract(
+        std::span<const std::uint8_t>(),
+        std::span<const std::uint8_t>(room_secret.data(), room_secret.size()));
+    auto vec = fb::crypto::hkdf_expand(prk,
+        std::span<const std::uint8_t>(info.data(), info.size()), 32);
+    std::array<std::uint8_t, 32> out{};
+    std::memcpy(out.data(), vec.data(), 32);
+    return out;
+}
+
 std::vector<std::uint8_t> sframe_seal_v1(std::span<const std::uint8_t, 32> base_key,
                                          std::uint32_t epoch, std::uint64_t counter,
                                          std::span<const std::uint8_t> plaintext) {

@@ -138,6 +138,11 @@ relay you already run) to forward.
       relay pipeline lands).
 - [x] **Lever B:** volunteer "relay peer" mode — `FB_FORWARDER_VOLUNTEER=1`
       (class 3) / `FB_FORWARDER_CLASS=0..3`.
+- [x] **Lever B:** group SFrame keying — per-sender key from a shared
+      per-room secret (`fb::media::derive_room_sframe_key`), unit-tested
+      incl. seal/open round-trip + cross-sender isolation. *Remaining:*
+      source the room_secret (MLS exporter / distributed RoomKey) + the
+      per-sender open-key plumbing in the media probes (with the pipeline).
 - [ ] **Lever B:** GStreamer peer media-relay pipeline — terminate N
       PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
       decoding (forwarder stays blind). *Real-hardware / multi-machine

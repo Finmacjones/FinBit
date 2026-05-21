@@ -34,12 +34,38 @@
 // interoperate with other SFrame implementations.
 // =============================================================================
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace fb::media {
+
+// ---------------------------------------------------------------------------
+// Group (forwarded-room) keying — Lever B, docs/serverless-group-calls.md.
+//
+// 1:1 / full-mesh calls key SFrame per *pair* (X3DH(pair) ‖ call_id). That
+// can't work once a peer-forwarder fans ONE sender's sealed frames out to
+// every receiver: all receivers need that sender's key. So a forwarded room
+// shares a 32-byte `room_secret` (from the MLS exporter — mls::State::
+// do_export — or a distributed random key for SenderKeys channels) and every
+// member derives the SAME per-sender base key from it:
+//
+//   K_sender = HKDF-SHA256(extract(salt=nil, room_secret),
+//                          info = "FinBit-SFrame-room-v1" ‖ sender_pubkey
+//                                 ‖ be32(epoch), L = 32)
+//
+// A publisher seals with K_self; any receiver derives K_sender to open that
+// publisher's frames; the forwarder, holding no key, relays sealed bytes
+// blindly. `epoch` is the room membership epoch (RoomRoster.sframe_epoch) —
+// bumping it (with a rotated room_secret) re-keys the room on join/leave.
+// The result plugs straight into sframe_seal_v1 / sframe_open_v1 as base_key.
+// ---------------------------------------------------------------------------
+[[nodiscard]] std::array<std::uint8_t, 32> derive_room_sframe_key(
+    std::span<const std::uint8_t, 32> room_secret,
+    std::span<const std::uint8_t> sender_pubkey,
+    std::uint32_t epoch);
 
 // Seal a single encoded frame. Throws on AEAD failure (which only happens if
 // AES-NI is unavailable on the running CPU — see fb::crypto::aes256gcm_hw_available).

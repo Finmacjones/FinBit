@@ -68,8 +68,13 @@ K_sender     = HKDF-SHA256(room_secret,
   key briefly to decode in-flight frames.
 
 `fb::media::sframe` stays as-is; only the key-derivation input changes.
-`media_call.cpp`'s `set_sframe_context` gains a "room mode" that takes
-`(room_secret, epoch, sender_pubkey)` instead of `(shared, call_id)`.
+The per-sender derivation **ships now** as
+`fb::media::derive_room_sframe_key(room_secret, sender_pubkey, epoch)`
+(pure, unit-tested — see `SFrameRoomKey.*`). `media_call.cpp`'s
+`set_sframe_context` will gain a "room mode" that seals with `K_self` and
+opens each inbound pad with the per-sender `K_sender` (the single-base_key
+1:1 ctx must split into seal-key + per-sender open-keys — that wiring is
+part of the pipeline build, §6).
 
 ## 3. Signalling flow (per leaf joining)
 
@@ -181,7 +186,15 @@ recv track → SDP renegotiation on each. Plan:
 ## 9. Build order
 
 1. **Group keying (§2)** — per-room secret + per-sender derivation +
-   epoch rotation. Unit-test the derivation; gate behind a room flag.
+   epoch rotation. **[done — derivation]** `fb::media::derive_room_sframe_key`
+   ships with unit tests (`SFrameRoomKey.*`): determinism, per-sender /
+   per-epoch / per-secret separation, and — proving it's a real SFrame
+   base key — seal-with-A's-key/open-with-A's-key plus cross-sender
+   isolation (A's frame won't open with B's key). *Remaining:* source the
+   `room_secret` (MLS `state.do_export("FinBit-room-sframe", …)` exposed
+   via `mls_facade`; or a distributed `RoomKey` for SenderKeys channels),
+   and feed per-sender keys into the media probes (§6) — both land with
+   the pipeline build below.
 2. **Forwarder graph (§4)** for a *fixed* small N (no renegotiation) —
    prove blind relay works for 3 nodes via the loopback test.
 3. **Dynamic join/leave + renegotiation (§5)** — the transceiver pool.
