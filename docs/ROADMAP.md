@@ -5,6 +5,11 @@ What's intentionally **not** in v1.0.1, with an honest estimate of what
 each item actually costs to land. Sorted roughly by user-visible impact,
 not by effort.
 
+> **Living checklists** (checkbox task lists, kept current as items land):
+> - `docs/serverless-group-calls.md` — group voice/video to ~24 **without
+>   a dedicated SFU**, large file transfer, screen-share.
+> - `docs/censorship-resistance.md` — transport mimicry tiers 1–4.
+
 ## Polish — quick to add (a few hours each)
 
 ### ~~Remote video widget on desktop~~ — **shipped**
@@ -70,41 +75,39 @@ moving identities between relays needs design.
 
 ## Multi-week — separate workstreams
 
-### Group voice / video (SFU)
-**Cost:** ~3–4 weeks. Stand up a mediasoup or Janus instance, integrate
-its signaling protocol on top of our existing MediaSignal frame, route
-group calls through it, layer SFrame so the SFU sees only ciphertext
-frames. The SFrame primitive is already in `core/src/media/sframe.cpp`.
+### Group voice / video to ~24 — **without a dedicated SFU**
+Direction changed: instead of deploying mediasoup/Janus, FinBit scales
+group calls by relocating the *forwarding* function onto participants /
+volunteer peers (and optionally the already-E2E-blind relay), keeping the
+serverless + E2E posture. Full design, bandwidth math, and a phased
+checkbox checklist live in **`docs/serverless-group-calls.md`**.
+Short version:
+  * **Audio to ~24:** optimized full-mesh (Opus DTX + active-speaker
+    selection) — no forwarder needed.
+  * **Audio to ~24 / small-room video:** a peer-elected forwarder
+    ("relay peer"), SFrame-blind, over the reserved `RoomOffer/Answer/Ice`
+    frames.
+  * **24-way video:** simulcast + active-speaker selective forwarding +
+    a shallow cascade tree so no single node carries O(N²) uplink.
+The SFrame primitive (`core/src/media/sframe.cpp`) means every forwarder
+sees ciphertext only. **Cost:** lever-by-lever; audio levers are days,
+the full 24-way video overlay is multi-week.
 
-### MLS (Messaging Layer Security) for channels
-**Cost:** ~6–8 weeks. Vendor [mlspp](https://github.com/cisco/mlspp)
-(~100k LOC of MLS protocol code), integrate it behind the existing
-`fb::crypto::mls_facade` interface, replace SenderKeys at the channel
-layer. Wire format change — the new `Envelope.ciphertext` for channels
-is an MLS application message instead of a `SenderKeysMessage`.
-**Why MLS over SenderKeys eventually:** SenderKeys has no automatic
-post-removal exclusion (a removed member's stored chain key still
-decrypts old messages); MLS handles add/remove/update via Tree-KEM.
-Doesn't matter at the user counts FinBit handles today.
+### ~~MLS (Messaging Layer Security) for channels~~ — **shipped**
+mlspp is vendored behind `fb::crypto::mls_facade` and selectable
+per-channel (`ChannelCrypto::kMls`); SenderKeys remains the default.
+New MLS channels carry an MLS application message in
+`Envelope.ciphertext`; the receive path branches on the per-channel
+crypto discriminator. Group state persists via the operation-replay
+tables in `sqlite_store`.
 
-### Windows port
-**Status:** server + fb-cli + desktop client are Linux-only today. The
-codebase calls `epoll` / `sys/socket` / `termios` / `ifaddrs` /
-`sigaction` / `posix_openpt` directly. CI builds + ships only Linux
-artifacts (`finbit-linux-x86_64.tar.gz`).
-**Cost:** ~3-5 days for a usable Windows port. Needed:
-  * `fb::net::IoLoop` — swap epoll for WSAPoll or IOCP
-  * `fb::net::Socket` — WinSock2 (`WSAStartup`, `closesocket`,
-    `GetLastError` vs errno)
-  * `SerialBridge` — `CreateFile` + DCB instead of termios (or skip
-    serial on Windows entirely)
-  * `external_addresses()` in server — `GetAdaptersAddresses`
-  * Server signal handlers — `SetConsoleCtrlHandler`
-**Why deferred:** broad surface area, no Windows host on this dev
-machine to test against, and most users wanting "FinBit on Windows"
-can run Linux binaries via WSL2 today (works out of the box,
-fb_server / fb_desktop / fb-cli all run unmodified). A native build
-is nice-to-have, not a blocker.
+### ~~Windows port~~ — **shipped (server + fb-cli + mesh serial; desktop/MLS in CI)**
+`fb::net::IoLoop` (WSAPoll), `Socket` (Winsock2), `SerialBridge`
+(CreateFile + DCB), `external_addresses` (GetAdaptersAddresses) and
+`SetConsoleCtrlHandler` are all ported behind `#ifdef _WIN32`. CI builds
+`finbit-windows-x64.zip` on `windows-latest` (MSVC + vcpkg) with a
+PowerShell DM-roundtrip canary; the desktop + MLS Windows builds run in
+their own workflows. See `docs/windows-port-status.md`.
 
 ### Android client
 **Status:** Kotlin/Compose scaffold + JNI bridge skeleton committed
