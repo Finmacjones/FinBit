@@ -156,9 +156,14 @@ relay you already run) to forward.
       only the forwarder) once the relay pipeline can carry it
 - [ ] **Lever B:** measured uplink probe (today `uplink_class` is a
       declared hint, not a measurement)
-- [ ] **Lever C:** simulcast/SVC layers in the encoder (low thumb + high)
-- [ ] **Lever C:** selective forwarding (active high-res + thumbnails)
-- [ ] **Lever D:** fan-out cascade tree (depth ≤2) + per-hop latency budget
+- [x] **Lever C:** selective-forwarding **plan** — `fb::media::plan_forwarded_video`
+      (top-K talkers → high-res, next tier → thumbnail, rest → drop),
+      pure + unit-tested. *Remaining:* simulcast/SVC layers in the encoder
+      + applying the plan in the forwarder graph (media build).
+- [x] **Lever D:** cascade **tree builder** — `fb::media::build_distribution_tree`
+      (strongest near the root, fan-out-bounded, shallow, deterministic),
+      pure + unit-tested. *Remaining:* establish the per-hop relay media
+      legs along the tree + a per-hop latency budget (media build).
 - [ ] **Optional:** relay-assisted media forwarding for self-hosters
 - [ ] Headless multi-party forwarding e2e (extend the call-signal harness)
 

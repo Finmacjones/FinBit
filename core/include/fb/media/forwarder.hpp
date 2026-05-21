@@ -18,6 +18,7 @@
 // =============================================================================
 
 #include <cstddef>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -59,5 +60,40 @@ struct ForwarderPlan {
     const std::vector<std::string>& participants,
     const std::string& my_pubkey,
     const std::string& forwarder);
+
+// ---------------------------------------------------------------------------
+// Lever C — selective video forwarding plan (docs/serverless-group-calls.md).
+//
+// A forwarder can't relay 24 full-res videos (≈276 Mbps). It doesn't need
+// to: relay HIGH res only for the few active speakers, a low-res THUMBNAIL
+// for the next tier, and DROP the rest (audio is always forwarded — cheap).
+// This decides, from per-sender audio RMS (dBFS; the active-speaker proxy),
+// which quality each sender's *video* gets. Deterministic (ties by key).
+// ---------------------------------------------------------------------------
+enum class VideoQuality { kDrop, kThumbnail, kHigh };
+
+[[nodiscard]] std::map<std::string, VideoQuality> plan_forwarded_video(
+    const std::map<std::string, double>& levels,
+    std::size_t max_high, std::size_t max_thumbnail, double floor_db);
+
+// ---------------------------------------------------------------------------
+// Lever D — cascade distribution tree (docs/serverless-group-calls.md).
+//
+// One forwarder caps out around its uplink; spread the load across a
+// shallow fan-out tree so no node carries O(N²). Each node forwards to at
+// most `fanout` children; strongest nodes (highest uplink_class) sit near
+// the root to keep the tree shallow and reliable. Deterministic: sorted by
+// (uplink_class desc, pubkey asc), assigned breadth-first.
+// ---------------------------------------------------------------------------
+struct TreeNode {
+    std::string pubkey;
+    std::string parent;     // "" for the root
+    int         depth = 0;  // root = 0
+};
+
+// Returns one TreeNode per input candidate (root first, then BFS order).
+// `fanout` is clamped to ≥1. Empty input → empty tree.
+[[nodiscard]] std::vector<TreeNode> build_distribution_tree(
+    const std::vector<ForwarderCandidate>& nodes, std::size_t fanout);
 
 }  // namespace fb::media
