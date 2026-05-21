@@ -23,6 +23,7 @@ add_executable(fb_core_tests
     ratelimit/token_bucket_test.cpp
     media/sframe_test.cpp
     media/active_speaker_test.cpp
+    media/forwarder_test.cpp
     mesh/compression_test.cpp
     mesh/mqtt_bridge_test.cpp
     p2p/kademlia_test.cpp

@@ -65,6 +65,7 @@
 #include "fb/store/sqlite_store.hpp"
 #include "fb/store/attachment_frame.hpp"
 #include "fb/media/active_speaker.hpp"
+#include "fb/media/forwarder.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
 
@@ -258,6 +259,21 @@ std::vector<std::uint8_t> envelope_aad_bytes(
         aad.push_back(static_cast<std::uint8_t>((timestamp_ms >> sh) & 0xff));
     }
     return aad;
+}
+
+// This node's forwarder-election hint (Lever B). FB_FORWARDER_VOLUNTEER=1
+// marks a dedicated relay peer (class 3); FB_FORWARDER_CLASS=0..3 sets it
+// explicitly; default 1 (normal participant). 0 = leaf-only / won't relay.
+std::uint32_t local_uplink_class() {
+    if (const char* v = std::getenv("FB_FORWARDER_VOLUNTEER");
+        v && *v && std::string(v) != "0") {
+        return 3;
+    }
+    if (const char* c = std::getenv("FB_FORWARDER_CLASS"); c && *c) {
+        const int n = std::atoi(c);
+        if (n >= 0 && n <= 3) return static_cast<std::uint32_t>(n);
+    }
+    return 1;
 }
 
 }  // namespace
@@ -1708,6 +1724,38 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         p.identity_pubkey().begin(),
                         p.identity_pubkey().end()));
                 }
+
+                // Lever B (forwarder election). Deterministically pick the
+                // room's relay from the roster's uplink_class hints — every
+                // participant computes the same answer. NOTE: this is
+                // computed + logged only; the mesh dial plan below is
+                // UNCHANGED until the peer media-relay pipeline lands (so a
+                // live call keeps working). It's the hook that pipeline
+                // plugs into. See docs/serverless-group-calls.md.
+                {
+                    std::vector<fb::media::ForwarderCandidate> cands;
+                    for (const auto& p : rr.participants()) {
+                        if (p.identity_pubkey().size() != 32) continue;
+                        cands.push_back({std::string(p.identity_pubkey().begin(),
+                                                     p.identity_pubkey().end()),
+                                         static_cast<int>(p.uplink_class())});
+                    }
+                    const std::string fwd = fb::media::elect_forwarder(
+                        cands, /*mesh_threshold=*/6);
+                    if (!fwd.empty()) {
+                        const std::string my_key(my_pub.begin(), my_pub.end());
+                        fb::crypto::PubKey fk{};
+                        std::memcpy(fk.data(), fwd.data(), 32);
+                        emit log(QString("forwarder elected for #%1: %2%3 "
+                                          "(mesh still active — relay pipeline "
+                                          "pending)")
+                                     .arg(chan_name)
+                                     .arg(QString::fromStdString(
+                                         fb::crypto::Identity::fingerprint(fk)))
+                                     .arg(fwd == my_key ? " (me)" : ""));
+                    }
+                }
+
                 auto& meshed = impl_->room_mesh_peers[room_id_str];
                 std::vector<std::string> to_drop;
                 for (const auto& peer_key : meshed) {
@@ -3364,6 +3412,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             reinterpret_cast<const char*>(cs.id.data()), cs.id.size()));
                         rj->set_want_audio(true);
                         rj->set_want_video(op.want_video);
+                        rj->set_uplink_class(local_uplink_class());
                         blocking_send(impl_->conn, serialize(jf));
                         // V: also subscribe to the room gossip topic
                         // and announce our presence over it. The
@@ -3399,6 +3448,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 impl_->identity->public_key().size()));
                             mem->set_has_audio(true);
                             mem->set_has_video(op.want_video);
+                            mem->set_uplink_class(local_uplink_class());
                             std::vector<std::uint8_t> bw(
                                 beacon.ByteSizeLong());
                             if (beacon.SerializeToArray(

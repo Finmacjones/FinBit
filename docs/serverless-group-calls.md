@@ -130,10 +130,25 @@ relay you already run) to forward.
       ~15–20 on the mesh (docs updated). *Note:* real-device load-test
       and a pre-decoder frame-drop (deeper CPU cap) remain — done on a
       box with audio hardware.
-- [ ] **Lever B:** forwarder election (uplink/stability probe over PeerNet)
-- [ ] **Lever B:** wire `RoomOffer`/`RoomAnswer`/`RoomIce` participant ↔ forwarder
-- [ ] **Lever B:** SFrame-blind audio forwarding on a peer; audio to ~24
-- [ ] **Lever B:** volunteer "relay peer" mode (reuse PeerNet/offline-relay)
+- [x] **Lever B:** deterministic forwarder *election* + topology plan —
+      pure, unit-tested (`fb::media::elect_forwarder` / `plan_topology`),
+      driven by a `uplink_class` hint on `RoomJoin`/`RoomMember` (threaded
+      through the server roster + gossip beacon); computed + logged on every
+      roster change in `chat_client` (mesh dial plan untouched until the
+      relay pipeline lands).
+- [x] **Lever B:** volunteer "relay peer" mode — `FB_FORWARDER_VOLUNTEER=1`
+      (class 3) / `FB_FORWARDER_CLASS=0..3`.
+- [ ] **Lever B:** GStreamer peer media-relay pipeline — terminate N
+      PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
+      decoding (forwarder stays blind). *Real-hardware / multi-machine
+      build — the election + plan above are the hook it consumes.*
+- [ ] **Lever B:** wire `RoomOffer`/`RoomAnswer`/`RoomIce` for the
+      participant ↔ forwarder media handshake (depends on the relay
+      pipeline)
+- [ ] **Lever B:** switch the dial plan to `plan_topology` (leaf → dial
+      only the forwarder) once the relay pipeline can carry it
+- [ ] **Lever B:** measured uplink probe (today `uplink_class` is a
+      declared hint, not a measurement)
 - [ ] **Lever C:** simulcast/SVC layers in the encoder (low thumb + high)
 - [ ] **Lever C:** selective forwarding (active high-res + thumbnails)
 - [ ] **Lever D:** fan-out cascade tree (depth ≤2) + per-hop latency budget

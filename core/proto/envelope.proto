@@ -198,9 +198,10 @@ message ChannelUnsubscribe {
 // =============================================================================
 
 message RoomJoin {
-    bytes  room_id    = 1;   // 32-byte opaque room identifier
-    bool   want_video = 2;
-    bool   want_audio = 3;   // typically true; a participant can join muted
+    bytes  room_id      = 1;   // 32-byte opaque room identifier
+    bool   want_video   = 2;
+    bool   want_audio   = 3;   // typically true; a participant can join muted
+    uint32 uplink_class = 4;   // forwarder-election hint; see RoomMember (Lever B)
 }
 
 message RoomLeave {
@@ -229,6 +230,15 @@ message RoomMember {
     bytes  identity_pubkey = 1;   // 32-byte Ed25519 pubkey of the participant
     bool   has_audio       = 2;
     bool   has_video       = 3;
+    // Forwarder-election hint (Lever B, docs/serverless-group-calls.md):
+    // a coarse "how good a media forwarder am I" class so every
+    // participant can deterministically elect the same relay peer for a
+    // big room without a server picking one.
+    //   0 = unknown / leaf-only (default; can't/won't forward)
+    //   1 = normal
+    //   2 = strong uplink
+    //   3 = explicit volunteer relay peer
+    uint32 uplink_class    = 4;
 }
 
 message RoomRoster {

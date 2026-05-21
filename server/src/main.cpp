@@ -189,6 +189,10 @@ struct Conn {
     bool challenge_issued = false;
     bool authenticated   = false;
     std::string claimed_username;
+    // Forwarder-election hint declared in the member's RoomJoin (Lever B);
+    // echoed back in RoomRoster so peers elect the same forwarder. The
+    // relay neither interprets nor trusts it beyond fan-out.
+    std::uint32_t room_uplink_class = 0;
     bool wants_close = false;
 
 #if FB_HAVE_OPENSSL
@@ -485,6 +489,7 @@ int main(int argc, char** argv) {
                 cit->second->bound_user_pub.size()));
             m->set_has_audio(true);
             m->set_has_video(false);   // refined by client-side capability later
+            m->set_uplink_class(cit->second->room_uplink_class);
         }
         const auto bytes = serialize(f);
         for (int member_fd : fds) {
@@ -720,6 +725,7 @@ int main(int argc, char** argv) {
                 // Group-call signaling rendezvous (full-mesh v0).
                 const auto& rj = f.room_join();
                 if (rj.room_id().size() != 32) break;
+                c.room_uplink_class = rj.uplink_class();
                 relay.room_join(
                     c.sock.fd(),
                     std::span<const std::uint8_t>(
