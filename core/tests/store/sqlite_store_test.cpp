@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/store/sqlite_store.hpp"
+#include "fb/store/attachment_frame.hpp"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -250,6 +251,52 @@ TEST_F(TmpDb, AtRestEncryptionRoundTrip) {
         std::span<const std::uint8_t>(wrong_key.data(), wrong_key.size()));
     EXPECT_TRUE(s->recent_inbox(10).empty());
     EXPECT_TRUE(s->recent_outbox(10).empty());
+}
+
+// An inline attachment persists through the encrypted store as a framed
+// blob and reloads byte-identical (this is the image-history claim). The
+// raw image bytes (incl. a canary) must not leak into the .db file.
+TEST_F(TmpDb, AttachmentFramePersistsThroughEncryptedStore) {
+    std::array<std::uint8_t, 32> master_key{};
+    for (std::size_t i = 0; i < master_key.size(); ++i)
+        master_key[i] = static_cast<std::uint8_t>(i * 3 + 1);
+    const std::string canary = "IMG_CANARY_PNGDATA_QWERTY";
+    std::vector<std::uint8_t> content(canary.begin(), canary.end());
+    content.insert(content.end(), {0x00, 0xff, 0x10, 0x20});  // binary tail
+    auto envid = bytes({0x42, 0x43, 0x44, 0x45});
+    auto peer  = bytes({0x50, 0x51, 0x52, 0x53});
+    const auto framed = fb::store::frame_attachment("image/png", "shot.png",
+        std::span<const std::uint8_t>(content.data(), content.size()));
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        s->append_inbox(span_of(envid), span_of(peer), span_of(framed), 999);
+    }
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        auto rows = s->recent_inbox(10);
+        ASSERT_EQ(rows.size(), 1u);
+        auto at = fb::store::parse_attachment_frame(
+            std::span<const std::uint8_t>(rows[0].plaintext.data(),
+                                          rows[0].plaintext.size()));
+        ASSERT_TRUE(at.has_value());
+        EXPECT_EQ(at->mime, "image/png");
+        EXPECT_EQ(at->filename, "shot.png");
+        EXPECT_EQ(at->content, content);
+    }
+    // The image content canary must not appear on disk in cleartext.
+    FILE* f = std::fopen(path.c_str(), "rb");
+    ASSERT_NE(f, nullptr);
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<char> file(static_cast<std::size_t>(sz));
+    ASSERT_EQ(std::fread(file.data(), 1, file.size(), f), file.size());
+    std::fclose(f);
+    EXPECT_EQ(std::string_view(file.data(), file.size()).find(canary),
+              std::string_view::npos)
+        << "attachment content leaked into the .db file in cleartext";
 }
 
 // At-rest AEAD also covers sessions, channels, and the peer-name

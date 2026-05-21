@@ -76,6 +76,7 @@ add_library(fb_core STATIC
     src/net/ech.cpp
     src/net/websocket.cpp
     src/store/sqlite_store.cpp
+    src/store/attachment_frame.cpp
     src/ratelimit/token_bucket.cpp
     src/media/peer_connection.cpp
     src/media/sframe.cpp

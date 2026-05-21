@@ -86,6 +86,9 @@ private slots:
                              const QByteArray& content, const QString& mime,
                              const QString& filename);
     void appendChannelIncoming(const QString& channel, const QString& sender_fp, const QString& text);
+    void appendChannelIncomingImage(const QString& channel, const QString& sender_fp,
+                                    const QByteArray& content, const QString& mime,
+                                    const QString& filename);
     void onChannelJoined(const QString& channel);
     void onConnected(const QString& my_fp);
     void onError(const QString& detail);
@@ -103,7 +106,7 @@ private:
     void appendImageMessage(const QString& key, const QString& sender_name,
                             const QString& sender_seed,
                             const QByteArray& image_bytes, const QString& mime,
-                            qint64 ts_ms, bool is_self);
+                            qint64 ts_ms, bool is_self, bool is_history = false);
     void rememberDmPeer(const QString& username);
     void updateChatHeader();
 

@@ -16,6 +16,7 @@ add_executable(fb_core_tests
     net/tls_fingerprint_test.cpp
     net/ech_test.cpp
     store/sqlite_store_test.cpp
+    store/attachment_frame_test.cpp
     identity/username_log_test.cpp
     identity/username_gossip_test.cpp
     integration/mls_persistence_integration_test.cpp

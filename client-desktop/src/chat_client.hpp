@@ -83,6 +83,13 @@ public:
     void join_channel(const QString& name, const QString& dist_file_path);
     void send_to_channel(const QString& name, const QString& text);
 
+    // Send an inline image / GIF to a channel. Same 256 KiB cap as DMs.
+    // The image rides the channel's SenderKeys/MLS group encryption as an
+    // attachment-framed body (so the relay stays blind). Returns false +
+    // emits errorOccurred on overflow.
+    bool send_image_to_channel(const QString& name, const QString& mime,
+                               const QString& filename, const QByteArray& content);
+
     // Create a channel locally — generate own SenderKeys chain + subscribe,
     // but DON'T write a distribution file or DM any peer. This is the
     // initial "+" flow in the desktop UI: the user creates the channel,
@@ -188,6 +195,10 @@ public:
         QString     peer_username;
         QString     text;
         std::int64_t timestamp_ms;
+        // Set when the row was a persisted attachment (framed in the
+        // store). image_bytes empty ⇒ a normal text row.
+        QByteArray  image_bytes;
+        QString     image_mime;
     };
 
     // Snapshot of the last `limit` rows from inbox + outbox merged in time
@@ -201,6 +212,8 @@ public:
         bool         is_self;
         QString      text;
         std::int64_t timestamp_ms;
+        QByteArray   image_bytes;   // set for persisted attachment rows
+        QString      image_mime;
     };
     std::vector<ChannelHistoryEntry> load_recent_channel_history(
         const QString& channel_name, std::size_t limit);
@@ -235,6 +248,9 @@ signals:
     void imageReceived(QString peerFingerprint, QString peerUsername,
                        QByteArray content, QString mime, QString filename);
     void channelMessageReceived(QString channelName, QString senderFingerprint, QString text);
+    // Inbound inline attachment in a channel.
+    void channelImageReceived(QString channelName, QString senderFingerprint,
+                              QByteArray content, QString mime, QString filename);
     void channelJoined(QString channelName);
     // Server resolved a sender pubkey to a registered username. Emitted on
     // every UsernameLookupResponse with found=true. UI repaints any rows

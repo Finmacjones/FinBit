@@ -63,6 +63,7 @@
 #include "dht.pb.h"
 #include "identity_log.pb.h"
 #include "fb/store/sqlite_store.hpp"
+#include "fb/store/attachment_frame.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
 
@@ -271,6 +272,10 @@ struct PendingSend {
     // pack_text_payload(text). text is left empty in that case.
     std::vector<std::uint8_t> pre_packed_payload;
     bool has_pre_packed() const { return !pre_packed_payload.empty(); }
+    // Optional bytes to persist to the outbox INSTEAD of `text` — used by
+    // attachment sends, which store a framed mime|filename|content blob
+    // (fb::store::frame_attachment) so the image reloads in history.
+    std::vector<std::uint8_t> persist_blob;
 };
 
 struct PendingChannelOp {
@@ -1874,12 +1879,26 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                             pt->size()),
                                         rx_ms);
                                 }
-                                emit channelMessageReceived(
-                                    QString::fromStdString(nit->second),
-                                    QString::fromStdString(
-                                        fb::crypto::Identity::fingerprint(peer_pub_arr)),
-                                    QString::fromStdString(
-                                        std::string(pt->begin(), pt->end())));
+                                const QString chan_name =
+                                    QString::fromStdString(nit->second);
+                                const QString sender_fp = QString::fromStdString(
+                                    fb::crypto::Identity::fingerprint(peer_pub_arr));
+                                if (auto at = fb::store::parse_attachment_frame(
+                                        std::span<const std::uint8_t>(pt->data(),
+                                                                      pt->size()))) {
+                                    emit channelImageReceived(
+                                        chan_name, sender_fp,
+                                        QByteArray(
+                                            reinterpret_cast<const char*>(at->content.data()),
+                                            static_cast<int>(at->content.size())),
+                                        QString::fromStdString(at->mime),
+                                        QString::fromStdString(at->filename));
+                                } else {
+                                    emit channelMessageReceived(
+                                        chan_name, sender_fp,
+                                        QString::fromStdString(
+                                            std::string(pt->begin(), pt->end())));
+                                }
                                 continue;
                             }
                             // (DM envelope path follows below — unchanged)
@@ -2021,17 +2040,37 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     QString::fromStdString(payload.text()));
                             } else if (payload.body_case() ==
                                        fb::proto::DmPayload::kAttachment) {
-                                // Inline image / GIF / small file. Surface
-                                // it to the UI for inline rendering.
-                                // Persistence across restart is a follow-up
-                                // — for now attachments are live-session.
+                                // Inline image / GIF / small file — surface
+                                // for inline rendering and persist a framed
+                                // copy so it reloads in history.
                                 const auto& at = payload.attachment();
                                 if (at.content().size() <=
                                         fb::config::kMaxInlineAttachmentBytes) {
+                                    const std::string& c = at.content();
+                                    const auto at_rx_ms = static_cast<std::uint64_t>(
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now()
+                                                .time_since_epoch()).count());
+                                    if (impl_->store) {
+                                        std::vector<std::uint8_t> envid(
+                                            env.envelope_id().begin(),
+                                            env.envelope_id().end());
+                                        auto framed = fb::store::frame_attachment(
+                                            at.mime_type(), at.filename(),
+                                            std::span<const std::uint8_t>(
+                                                reinterpret_cast<const std::uint8_t*>(c.data()),
+                                                c.size()));
+                                        impl_->store->append_inbox(
+                                            std::span<const std::uint8_t>(envid.data(),
+                                                                          envid.size()),
+                                            std::span<const std::uint8_t>(peer_pub_arr.data(), 32),
+                                            std::span<const std::uint8_t>(framed.data(),
+                                                                          framed.size()),
+                                            at_rx_ms);
+                                    }
                                     emit imageReceived(
                                         peer_fp, cached_username,
-                                        QByteArray(at.content().data(),
-                                                   static_cast<int>(at.content().size())),
+                                        QByteArray(c.data(), static_cast<int>(c.size())),
                                         QString::fromStdString(at.mime_type()),
                                         QString::fromStdString(at.filename()));
                                 }
@@ -3999,18 +4038,21 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                     env->set_protocol_version(fb::config::kProtocolVersion);
                     blocking_send(impl_->conn, serialize(f));
-                    if (impl_->store && !s.text.empty()) {
-                        // Persist the original text bytes (not the wrapped
-                        // DmPayload blob) so on-disk history is human-
-                        // readable. Skip pre-packed sends entirely —
-                        // those are protocol-internal MLS handshake
-                        // messages, not user chat.
-                        std::vector<std::uint8_t> raw_text(s.text.begin(), s.text.end());
+                    if (impl_->store && (!s.text.empty() || !s.persist_blob.empty())) {
+                        // Persist the original text bytes (human-readable on
+                        // disk) OR, for an attachment, the framed
+                        // mime|filename|content blob. Other pre-packed sends
+                        // (MLS handshake messages) carry neither and are
+                        // skipped — they're protocol-internal, not chat.
+                        std::vector<std::uint8_t> body =
+                            s.persist_blob.empty()
+                                ? std::vector<std::uint8_t>(s.text.begin(), s.text.end())
+                                : s.persist_blob;
                         impl_->store->append_outbox(
                             std::span<const std::uint8_t>(envid.data(), envid.size()),
                             std::span<const std::uint8_t>(sess.peer_pub.data(),
                                                           sess.peer_pub.size()),
-                            std::span<const std::uint8_t>(raw_text.data(), raw_text.size()),
+                            std::span<const std::uint8_t>(body.data(), body.size()),
                             now_ms);
                         // Remember the username we used to send to this pubkey
                         // so the sidebar's DM list survives a restart.
@@ -4386,6 +4428,12 @@ bool ChatClient::send_image_to_peer(const QString& peer, const QString& mime,
     PendingSend ps;
     ps.peer = peer.toStdString();
     ps.pre_packed_payload = std::move(packed);
+    // Persist a framed copy so the image reloads in history after restart.
+    ps.persist_blob = fb::store::frame_attachment(
+        mime.toStdString(), filename.toStdString(),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(content.constData()),
+            static_cast<std::size_t>(content.size())));
     {
         std::lock_guard lk(impl_->mu);
         impl_->queue.push_back(std::move(ps));
@@ -4419,6 +4467,37 @@ void ChatClient::send_to_channel(const QString& name, const QString& text) {
                                       {}, text.toStdString(), {}});
     }
     impl_->cv.notify_all();
+}
+
+bool ChatClient::send_image_to_channel(const QString& name, const QString& mime,
+                                        const QString& filename,
+                                        const QByteArray& content) {
+    if (content.isEmpty()) return false;
+    if (static_cast<std::size_t>(content.size()) >
+            fb::config::kMaxInlineAttachmentBytes) {
+        emit errorOccurred(
+            QString("attachment too large (%1 KB) — inline images are capped "
+                    "at %2 KB")
+                .arg(content.size() / 1024)
+                .arg(fb::config::kMaxInlineAttachmentBytes / 1024));
+        return false;
+    }
+    // The channel message body is opaque bytes inside the group cipher, so
+    // we send (and persist) the same attachment-framed blob DMs use. The
+    // receiver's magic check tells image bodies from text.
+    auto framed = fb::store::frame_attachment(
+        mime.toStdString(), filename.toStdString(),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(content.constData()),
+            static_cast<std::size_t>(content.size())));
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->chan_queue.push_back(
+            {PendingChannelOp::Kind::kSend, name.toStdString(), {},
+             std::string(framed.begin(), framed.end()), {}});
+    }
+    impl_->cv.notify_all();
+    return true;
 }
 
 void ChatClient::create_local_channel(const QString& name, bool use_mls) {
@@ -4780,8 +4859,17 @@ std::vector<ChatClient::ChannelHistoryEntry> ChatClient::load_recent_channel_his
     // Reverse so oldest-first.
     for (auto it = rows.rbegin(); it != rows.rend(); ++it) {
         ChannelHistoryEntry e;
-        e.text = QString::fromStdString(std::string(it->plaintext.begin(),
-                                                     it->plaintext.end()));
+        if (auto at = fb::store::parse_attachment_frame(
+                std::span<const std::uint8_t>(it->plaintext.data(),
+                                              it->plaintext.size()))) {
+            e.image_bytes = QByteArray(
+                reinterpret_cast<const char*>(at->content.data()),
+                static_cast<int>(at->content.size()));
+            e.image_mime = QString::fromStdString(at->mime);
+        } else {
+            e.text = QString::fromStdString(std::string(it->plaintext.begin(),
+                                                         it->plaintext.end()));
+        }
         e.timestamp_ms = static_cast<std::int64_t>(it->timestamp_ms);
         if (it->sender_pub.size() == 32) {
             fb::crypto::PubKey k{};
@@ -4820,7 +4908,17 @@ std::vector<ChatClient::HistoryEntry> ChatClient::load_recent_history(std::size_
     auto build = [&](const auto& r, bool outgoing) {
         HistoryEntry e;
         e.outgoing = outgoing;
-        e.text = QString::fromStdString(std::string(r.plaintext.begin(), r.plaintext.end()));
+        // A framed attachment row → image entry; anything else → text.
+        if (auto at = fb::store::parse_attachment_frame(
+                std::span<const std::uint8_t>(r.plaintext.data(), r.plaintext.size()))) {
+            e.image_bytes = QByteArray(
+                reinterpret_cast<const char*>(at->content.data()),
+                static_cast<int>(at->content.size()));
+            e.image_mime = QString::fromStdString(at->mime);
+        } else {
+            e.text = QString::fromStdString(
+                std::string(r.plaintext.begin(), r.plaintext.end()));
+        }
         e.timestamp_ms = static_cast<std::int64_t>(r.timestamp_ms);
         if (r.peer_pub.size() == 32) {
             fb::crypto::PubKey k{};

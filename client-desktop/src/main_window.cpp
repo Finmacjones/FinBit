@@ -411,6 +411,8 @@ MainWindow::MainWindow(QWidget* parent)
                      &MainWindow::appendIncomingImage);
     QObject::connect(client_.get(), &ChatClient::channelMessageReceived, this,
                      &MainWindow::appendChannelIncoming);
+    QObject::connect(client_.get(), &ChatClient::channelImageReceived, this,
+                     &MainWindow::appendChannelIncomingImage);
     QObject::connect(client_.get(), &ChatClient::channelJoined, this,
                      &MainWindow::onChannelJoined);
     QObject::connect(client_.get(), &ChatClient::connected, this, &MainWindow::onConnected);
@@ -700,10 +702,10 @@ void MainWindow::appendMessage(const QString& key, const QString& sender_name,
 void MainWindow::appendImageMessage(const QString& key, const QString& sender_name,
                                     const QString& sender_seed,
                                     const QByteArray& image_bytes, const QString& mime,
-                                    qint64 ts_ms, bool is_self) {
+                                    qint64 ts_ms, bool is_self, bool is_history) {
     appendLineToConversation(key,
         Line{sender_name, sender_seed, /*body=*/{}, ts_ms, is_self,
-             /*is_history=*/false, image_bytes, mime});
+             is_history, image_bytes, mime});
 }
 
 void MainWindow::selectConversation(const QString& key) {
@@ -775,13 +777,7 @@ void MainWindow::onAttachClicked() {
     const auto target = target_edit_->text().trimmed();
     if (target.isEmpty()) {
         QMessageBox::information(this, "Attach",
-            "Pick a DM peer in the target field first.");
-        return;
-    }
-    if (target.startsWith('#')) {
-        QMessageBox::information(this, "Attach",
-            "Inline images are DM-only for now — channel attachments are a "
-            "follow-up.");
+            "Pick a DM peer or #channel in the target field first.");
         return;
     }
     const QString path = QFileDialog::getOpenFileName(
@@ -798,13 +794,22 @@ void MainWindow::onAttachClicked() {
     const QString mime =
         QMimeDatabase().mimeTypeForFileNameAndData(path, bytes).name();
     const QString filename = QFileInfo(path).fileName();
-    rememberDmPeer(target);
-    // send_image_to_peer enforces the 256 KB cap (emits errorOccurred on
-    // overflow); only echo locally when it accepts the send.
-    if (client_->send_image_to_peer(target, mime, filename, bytes)) {
-        appendImageMessage(ConvKey::dm_user(target), my_username_, my_username_,
-                           bytes, mime, QDateTime::currentMSecsSinceEpoch(),
-                           /*is_self=*/true);
+    const auto ts = QDateTime::currentMSecsSinceEpoch();
+    // send_image_to_* enforces the 256 KB cap (emits errorOccurred on
+    // overflow); only echo locally when the send is accepted.
+    if (target.startsWith('#')) {
+        const auto chan = target.mid(1);
+        if (chan.isEmpty()) return;
+        if (client_->send_image_to_channel(chan, mime, filename, bytes)) {
+            appendImageMessage(ConvKey::chan(chan), my_username_, my_username_,
+                               bytes, mime, ts, /*is_self=*/true);
+        }
+    } else {
+        rememberDmPeer(target);
+        if (client_->send_image_to_peer(target, mime, filename, bytes)) {
+            appendImageMessage(ConvKey::dm_user(target), my_username_, my_username_,
+                               bytes, mime, ts, /*is_self=*/true);
+        }
     }
 }
 
@@ -894,8 +899,14 @@ void MainWindow::onChannelSelectionChanged() {
         const auto rows = client_->load_recent_channel_history(item->text(), 50);
         for (const auto& r : rows) {
             const QString sender = r.is_self ? my_username_ : r.sender_fingerprint;
-            appendMessage(ConvKey::chan(item->text()), sender, r.sender_fingerprint,
-                          r.text, r.timestamp_ms, r.is_self, /*is_history=*/true);
+            if (!r.image_bytes.isEmpty()) {
+                appendImageMessage(ConvKey::chan(item->text()), sender,
+                                   r.sender_fingerprint, r.image_bytes, r.image_mime,
+                                   r.timestamp_ms, r.is_self, /*is_history=*/true);
+            } else {
+                appendMessage(ConvKey::chan(item->text()), sender, r.sender_fingerprint,
+                              r.text, r.timestamp_ms, r.is_self, /*is_history=*/true);
+            }
         }
     }
 }
@@ -974,6 +985,16 @@ void MainWindow::appendChannelIncoming(const QString& channel, const QString& se
                   /*is_self=*/false, /*is_history=*/false);
 }
 
+void MainWindow::appendChannelIncomingImage(const QString& channel,
+                                            const QString& sender_fp,
+                                            const QByteArray& content,
+                                            const QString& mime,
+                                            const QString& filename) {
+    (void)filename;
+    appendImageMessage(ConvKey::chan(channel), sender_fp, sender_fp, content, mime,
+                       QDateTime::currentMSecsSinceEpoch(), /*is_self=*/false);
+}
+
 void MainWindow::onChannelJoined(const QString& channel) {
     for (int i = 0; i < channel_list_->count(); ++i) {
         if (channel_list_->item(i)->text() == channel) return;
@@ -1022,8 +1043,14 @@ void MainWindow::onConnected(const QString& my_fp) {
         // were rendered as if the peer had said them and the user's own
         // history was visually attributed to the other side.
         const QString sender = it->outgoing ? my_username_ : peer_label;
-        appendMessage(key, sender, sender, it->text,
-                      it->timestamp_ms, /*is_self=*/it->outgoing, /*is_history=*/true);
+        if (!it->image_bytes.isEmpty()) {
+            appendImageMessage(key, sender, sender, it->image_bytes, it->image_mime,
+                               it->timestamp_ms, /*is_self=*/it->outgoing,
+                               /*is_history=*/true);
+        } else {
+            appendMessage(key, sender, sender, it->text,
+                          it->timestamp_ms, /*is_self=*/it->outgoing, /*is_history=*/true);
+        }
         // Only invent a fingerprint-labeled sidebar entry as a fallback
         // when we have no username for this peer at all. Username peers
         // are already represented via cached_dm_peers above.
