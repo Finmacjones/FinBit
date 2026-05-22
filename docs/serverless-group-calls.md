@@ -163,12 +163,19 @@ relay you already run) to forward.
       key before opening), and the `RoomOffer.track_bindings` proto field with
       `bind_track`/`sender_for_track` (mid → originating sender). All
       unit-tested (`RoomKeyRegistry.*`, `SFramePeekEpoch.*`, `TrackBindings.*`).
-      *Remaining:* the GStreamer probe split + rotation wiring (§6A.9 steps
-      3–4) land with the pipeline below.
-- [ ] **Lever B:** GStreamer peer media-relay pipeline — terminate N
-      PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
-      decoding (forwarder stays blind). *Real-hardware / multi-machine
-      build — the election + plan above are the hook it consumes.*
+- [x] **Lever B:** per-sender open-key plumbing — **pipeline integration**
+      (§6A.9 steps 3–4, code-complete; compiles in `fb_desktop` against real
+      GStreamer): `media_call.cpp` probe split — seal probe pulls K_self from
+      the registry, the per-pad open probe reads the frame epoch
+      (`sframe_peek_epoch`) and opens with the registry's per-sender key;
+      `on_pad_added` maps each inbound track's transceiver `mid` → sender;
+      `MediaCall::set_room_context` flips a call into room mode (1:1/mesh
+      preserved). `chat_client` owns one `RoomKeyRegistry` per room and
+      `set_secret`s it on every room_secret update (MLS + RoomKey), so a
+      room-mode call re-keys automatically. *Activation gap:* nothing calls
+      `set_room_context` yet — that caller is the §4 forwarder graph (next),
+      so these branches compile but aren't entered at runtime; live
+      verification needs the loopback/hardware tests.
 - [ ] **Lever B:** GStreamer peer media-relay pipeline — terminate N
       PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
       decoding (forwarder stays blind). *Real-hardware / multi-machine

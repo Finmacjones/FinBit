@@ -23,8 +23,14 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <string>
 #include <vector>
+
+namespace fb::media {
+class RoomKeyRegistry;
+}
 
 namespace fb::desktop {
 
@@ -58,6 +64,19 @@ public:
     // matching the web client's media_call.js exactly.
     void set_sframe_context(const std::array<std::uint8_t, 32>& shared_secret,
                             const std::array<std::uint8_t, 16>& call_id);
+
+    // Forwarded-room keying (Lever B, docs/gstreamer-relay-spec.md §6A).
+    // Supersedes the 1:1 set_sframe_context: instead of one shared per-call
+    // base key, the send branch seals with K_self and each inbound track is
+    // opened with that sender's per-room key, both derived on demand from
+    // `reg` (a RoomKeyRegistry owned by ChatClient, fed by room_secrets and
+    // rotated on membership change). `mid_to_sender` maps each forwarded SDP
+    // media section (a=mid:...) to the 32-byte identity pubkey of the member
+    // whose stream it carries — built from RoomOffer.track_bindings. The
+    // registry must outlive the call.
+    void set_room_context(
+        fb::media::RoomKeyRegistry* reg,
+        std::map<std::string, std::array<std::uint8_t, 32>> mid_to_sender);
 
     // Start an outbound call. `peer_pub` is the peer's 32-byte Ed25519
     // pubkey (used as the call's stable peer identifier). `with_video`
@@ -110,6 +129,13 @@ public:
     // so the assertion failed silently and the lambdas got NULL back,
     // which is why ICE never started.
     void* _webrtc_raw() const;
+    // Room-mode accessors used by the pad-probe / pad-added callbacks in the
+    // .cpp's anonymous namespace (parallel to _sframe_ctx_raw). NOT ABI.
+    bool _room_mode() const { return room_mode_; }
+    fb::media::RoomKeyRegistry* _room_registry() const { return room_reg_; }
+    // The originating sender's 32 raw pubkey bytes for an inbound track's SDP
+    // `mid`, or "" if unknown (caller drops/declines to key that pad).
+    std::string _room_sender_for_mid(const std::string& mid) const;
 
 signals:
     // Outbound signal that needs to reach the peer over the ratchet.
@@ -146,6 +172,13 @@ private:
     bool                          sframe_enabled_ = false;
     std::array<std::uint8_t, 32>  sframe_base_key_{};
     std::uint32_t                 sframe_epoch_ = 1;
+
+    // Forwarded-room keying (set_room_context). When room_mode_ is true the
+    // seal/open probes pull keys from room_reg_ instead of a per-call base
+    // key; mid_to_sender_ resolves each inbound track's mid → sender pubkey.
+    bool                          room_mode_ = false;
+    fb::media::RoomKeyRegistry*   room_reg_  = nullptr;   // owned by ChatClient
+    std::map<std::string, std::array<std::uint8_t, 32>> mid_to_sender_;
 
     void set_state(State s);
     void emit_local_ice(const QString& candidate, const QString& mid, int mline);

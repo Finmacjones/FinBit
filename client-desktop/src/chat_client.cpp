@@ -66,6 +66,7 @@
 #include "fb/store/attachment_frame.hpp"
 #include "fb/media/active_speaker.hpp"
 #include "fb/media/forwarder.hpp"
+#include "fb/media/room_keys.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
 
@@ -646,11 +647,31 @@ struct ChatClient::Impl {
     // MediaCall's audioLevel signal; drives active-speaker selection
     // (Lever A). Entries removed when a call closes.
     std::map<std::string, double> peer_audio_levels;
-    // room_id → (epoch, room_secret) received via DmPayload.room_key
-    // (Lever B group keying for SenderKeys rooms). The media relay derives
-    // per-sender SFrame keys from this; until that lands it's stored + logged.
+    // room_id → (epoch, room_secret), sourced from the MLS exporter or a
+    // distributed RoomKey DM (Lever B group keying). Fed into the matching
+    // RoomKeyRegistry below; the media relay derives per-sender SFrame keys
+    // from there.
     std::map<std::string, std::pair<std::uint32_t, std::array<std::uint8_t, 32>>>
         room_secrets;
+    // room_id → per-room SFrame key store (RoomKeyRegistry, §6A). A room-mode
+    // MediaCall (forwarded call) borrows this; set_secret is called on every
+    // room_secret update so rekeys (MLS commit / RoomKey rotation) propagate.
+    // Lives here so it outlives any single call and survives roster churn.
+    std::map<std::string, std::unique_ptr<fb::media::RoomKeyRegistry>>
+        room_registries;
+    // Get-or-create the registry for a room, seeded with our own identity as
+    // the seal pubkey.
+    fb::media::RoomKeyRegistry* room_registry(const std::string& room_id,
+                                              const fb::crypto::Identity& id) {
+        auto it = room_registries.find(room_id);
+        if (it != room_registries.end()) return it->second.get();
+        std::array<std::uint8_t, 32> mypub{};
+        std::memcpy(mypub.data(), id.public_key().data(), 32);
+        auto reg = std::make_unique<fb::media::RoomKeyRegistry>(mypub);
+        auto* raw = reg.get();
+        room_registries.emplace(room_id, std::move(reg));
+        return raw;
+    }
     // Per-room set of peer-pubkey strings we've already mesh-dialed (or
     // accepted from). Diffed against incoming RoomRoster broadcasts so
     // re-rosters don't redial existing peers, and departed peers get
@@ -1786,6 +1807,13 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         auto& slot = impl_->room_secrets[room_id_str];
                         if (slot.first != mepoch || slot.second != secret) {
                             slot = {mepoch, secret};
+                            // Feed the room's key registry so a room-mode call
+                            // derives K_self / K_sender at this epoch (and the
+                            // previous one stays openable across the rekey).
+                            impl_->room_registry(room_id_str, *impl_->identity)
+                                ->set_secret(std::span<const std::uint8_t, 32>(
+                                                 secret.data(), 32),
+                                             mepoch);
                             emit log(QString("room keyed from MLS exporter "
                                              "(epoch %1) for #%2")
                                          .arg(mepoch)
@@ -2181,6 +2209,16 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                                 rk.secret().data(), 32);
                                     impl_->room_secrets[rk.room_id()] = {
                                         rk.epoch(), secret};
+                                    // Feed the room's key registry (SenderKeys
+                                    // path) so a room-mode call keys at this
+                                    // epoch with the same grace semantics as
+                                    // the MLS path above.
+                                    impl_->room_registry(rk.room_id(),
+                                                         *impl_->identity)
+                                        ->set_secret(
+                                            std::span<const std::uint8_t, 32>(
+                                                secret.data(), 32),
+                                            rk.epoch());
                                     QString rid =
                                         QByteArray(rk.room_id().data(),
                                                    static_cast<int>(

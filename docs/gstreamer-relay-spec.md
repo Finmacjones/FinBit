@@ -332,10 +332,28 @@ my_pubkey, epoch)`). The existing 1:1 per-call path is untouched.
 2. **[done]** `RoomOffer.track_bindings` proto field + `fb::media::bind_track`
    / `sender_for_track` (`track_bindings.*`) + unit tests — pure/testable
    ahead of media.
-3. Probe split (`SframeSealCtx`/`SframeOpenCtx`) + per-pad open ctx in
-   `on_incoming_pad` — with the pipeline build.
-4. Rotation wiring (`chat_client` → `registry.set_secret`) — with the
-   pipeline.
+3. **[code-complete — compiles in `fb_desktop`]** Probe split
+   (`SframeSealCtx` / per-pad heap `SframeOpenCtx`, freed via GDestroyNotify)
+   in `media_call.cpp`: the seal probe pulls K_self from `seal_key()`; the
+   open probe reads the frame epoch (`sframe_peek_epoch`) and opens with the
+   per-sender key from `open_key()`; `on_pad_added` resolves each inbound
+   track's sender from its transceiver `mid` → `_room_sender_for_mid`
+   (chat_client builds that map from `RoomOffer.track_bindings`).
+   `MediaCall::set_room_context(reg, mid→sender)` switches a call into room
+   mode. The 1:1 / mesh path is preserved unchanged.
+4. **[code-complete — compiles]** Rotation wiring: `chat_client` owns one
+   `RoomKeyRegistry` per room and calls `set_secret(secret, epoch)` on every
+   `room_secrets` update (MLS exporter *and* distributed RoomKey paths), so a
+   room-mode call re-keys automatically.
+
+   *Activation gap (honest):* `set_room_context` has no caller yet because
+   the node that creates a room-mode call — the **§4 forwarder graph** (a
+   leaf dialing the forwarder and receiving a `RoomOffer` with
+   `track_bindings`) — is the remaining hardware-gated SFU build. Until it
+   (or a deliberate opt-in re-key of the existing mesh path) lands, the
+   room-mode branches compile but aren't entered at runtime. Live
+   verification (a multi-party forwarded call) needs the loopback/hardware
+   tests in §6A.8 + §8.
 
 ## 7. NAT / ICE / capacity
 

@@ -16,6 +16,7 @@
 #include <sodium.h>
 
 #include "fb/crypto/hkdf.hpp"
+#include "fb/media/room_keys.hpp"
 #include "fb/media/sframe.hpp"
 
 #include <atomic>
@@ -191,14 +192,31 @@ GstElement* build_pipeline(bool add_video, GstElement** out_webrtc, QString* err
     return pipe;
 }
 
-// Per-call SFrame state. Held by value in Impl so the GStreamer probe
-// callback (running on a streaming thread) can fetch+atomic-increment
-// the counter without locking back into MediaCall. Wire format docs in
-// the seal/open probe definitions further down.
-struct SframeProbeCtx {
-    std::array<std::uint8_t, 32>  base_key{};
-    std::uint32_t                 epoch = 1;
-    std::atomic<std::uint64_t>    send_counter{0};
+// SFrame send-side state (one per call). Held by value in Impl so the seal
+// probe (on a streaming thread) can atomic-increment the counter without
+// locking back into MediaCall. Two modes:
+//   - 1:1 / mesh: `reg` is null → seal with the fixed per-call `base_key`
+//     + `epoch` from set_sframe_context (unchanged behaviour).
+//   - forwarded room: `reg` is set → seal with K_self pulled from the
+//     RoomKeyRegistry each frame (it tracks the current epoch / rotation).
+// Wire format docs live in the seal/open probe definitions further down.
+struct SframeSealCtx {
+    fb::media::RoomKeyRegistry*    reg = nullptr;   // room mode → K_self
+    std::array<std::uint8_t, 32>   base_key{};      // 1:1 mode
+    std::uint32_t                  epoch = 1;        // 1:1 mode
+    std::atomic<std::uint64_t>     send_counter{0};
+};
+
+// SFrame recv-side state — ONE PER INBOUND PAD (so a forwarded room's many
+// senders each get their own key). Heap-allocated in on_pad_added and freed
+// by the probe's GDestroyNotify when the pad goes away.
+//   - 1:1 / mesh: `reg` null → open with the fixed `base_key`.
+//   - forwarded room: `reg` set → open with the per-sender key the registry
+//     derives for `sender_pubkey` at the frame's own epoch (sframe_peek_epoch).
+struct SframeOpenCtx {
+    fb::media::RoomKeyRegistry*    reg = nullptr;   // room mode → K_sender
+    std::string                   sender_pubkey;    // room mode: 32 raw bytes
+    std::array<std::uint8_t, 32>   base_key{};      // 1:1 mode
 };
 
 }  // namespace
@@ -213,7 +231,7 @@ struct MediaCall::Impl {
     GstBus*     bus      = nullptr;
     guint       bus_watch = 0;
     MediaCall*  owner    = nullptr;
-    SframeProbeCtx sframe_ctx{};   // populated by set_sframe_context
+    SframeSealCtx seal_ctx{};   // populated by set_sframe_context / set_room_context
 
     ~Impl() {
         if (bus_watch) g_source_remove(bus_watch);
@@ -254,16 +272,40 @@ void MediaCall::set_sframe_context(const std::array<std::uint8_t, 32>& shared_se
     auto vec = fb::crypto::hkdf_expand(prk,
         std::span<const std::uint8_t>(
             reinterpret_cast<const std::uint8_t*>(info.data()), info.size()),
-        impl_->sframe_ctx.base_key.size());
-    std::memcpy(impl_->sframe_ctx.base_key.data(), vec.data(),
-                impl_->sframe_ctx.base_key.size());
-    impl_->sframe_ctx.epoch = sframe_epoch_;
-    impl_->sframe_ctx.send_counter.store(0);
+        impl_->seal_ctx.base_key.size());
+    std::memcpy(impl_->seal_ctx.base_key.data(), vec.data(),
+                impl_->seal_ctx.base_key.size());
+    impl_->seal_ctx.reg = nullptr;          // 1:1 fixed-key mode
+    impl_->seal_ctx.epoch = sframe_epoch_;
+    impl_->seal_ctx.send_counter.store(0);
     sframe_enabled_ = true;
     emit log("SFrame enabled (per-call base key derived)");
 }
 
-void* MediaCall::_sframe_ctx_raw() { return &impl_->sframe_ctx; }
+void MediaCall::set_room_context(
+    fb::media::RoomKeyRegistry* reg,
+    std::map<std::string, std::array<std::uint8_t, 32>> mid_to_sender) {
+    // Room mode supersedes the 1:1 per-call key: seal with K_self from the
+    // registry, open each inbound track with its sender's per-room key.
+    impl_->seal_ctx.reg = reg;
+    impl_->seal_ctx.send_counter.store(0);
+    room_reg_       = reg;
+    mid_to_sender_  = std::move(mid_to_sender);
+    room_mode_      = (reg != nullptr);
+    sframe_enabled_ = false;   // the registry now owns keying for this call
+    emit log(QString("SFrame room mode enabled (per-sender keys via "
+                     "RoomKeyRegistry; %1 track binding(s))")
+                 .arg(static_cast<int>(mid_to_sender_.size())));
+}
+
+std::string MediaCall::_room_sender_for_mid(const std::string& mid) const {
+    auto it = mid_to_sender_.find(mid);
+    if (it == mid_to_sender_.end()) return {};
+    return std::string(reinterpret_cast<const char*>(it->second.data()),
+                       it->second.size());
+}
+
+void* MediaCall::_sframe_ctx_raw() { return &impl_->seal_ctx; }
 
 // ----------------- GStreamer ↔ Qt glue ---------------------------------------
 
@@ -330,9 +372,23 @@ void on_negotiation_needed(GstElement* webrtc, gpointer user) {
 
 // Send-side: seal each buffer in place with sframe_seal_v1.
 GstPadProbeReturn sframe_seal_probe(GstPad* /*pad*/, GstPadProbeInfo* info, gpointer user) {
-    auto* ctx = static_cast<SframeProbeCtx*>(user);
+    auto* ctx = static_cast<SframeSealCtx*>(user);
     GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
     if (!buf) return GST_PAD_PROBE_OK;
+
+    // Resolve the seal key + epoch. Room mode pulls K_self from the registry
+    // (which tracks the current epoch / rotation); 1:1 uses the fixed base key.
+    std::array<std::uint8_t, 32> key;
+    std::uint32_t epoch;
+    if (ctx->reg) {
+        auto sk = ctx->reg->seal_key();
+        if (!sk) return GST_PAD_PROBE_OK;   // no room secret yet → DTLS-SRTP only
+        key = sk->key;
+        epoch = sk->epoch;
+    } else {
+        key = ctx->base_key;
+        epoch = ctx->epoch;
+    }
 
     GstMapInfo map{};
     if (!gst_buffer_map(buf, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
@@ -340,8 +396,8 @@ GstPadProbeReturn sframe_seal_probe(GstPad* /*pad*/, GstPadProbeInfo* info, gpoi
     std::vector<std::uint8_t> sealed;
     try {
         sealed = fb::media::sframe_seal_v1(
-            std::span<const std::uint8_t, 32>(ctx->base_key.data(), 32),
-            ctx->epoch, counter,
+            std::span<const std::uint8_t, 32>(key.data(), 32),
+            epoch, counter,
             std::span<const std::uint8_t>(map.data, map.size));
     } catch (...) {
         gst_buffer_unmap(buf, &map);
@@ -370,14 +426,30 @@ GstPadProbeReturn sframe_seal_probe(GstPad* /*pad*/, GstPadProbeInfo* info, gpoi
 // Recv-side: unseal each buffer in place with sframe_open_v1.  On
 // authentication failure (forged or wrong-key frame), drop the buffer.
 GstPadProbeReturn sframe_open_probe(GstPad* /*pad*/, GstPadProbeInfo* info, gpointer user) {
-    auto* ctx = static_cast<SframeProbeCtx*>(user);
+    auto* ctx = static_cast<SframeOpenCtx*>(user);
     GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
     if (!buf) return GST_PAD_PROBE_OK;
 
     GstMapInfo map{};
     if (!gst_buffer_map(buf, &map, GST_MAP_READ)) return GST_PAD_PROBE_OK;
+
+    // Resolve the open key. Room mode: read the frame's own epoch and ask the
+    // registry for this pad's sender key at that epoch (honors the rotation
+    // grace window); a missing key → drop. 1:1: the fixed base key.
+    std::array<std::uint8_t, 32> key;
+    if (ctx->reg) {
+        auto fe = fb::media::sframe_peek_epoch(
+            std::span<const std::uint8_t>(map.data, map.size));
+        std::optional<std::array<std::uint8_t, 32>> k;
+        if (fe) k = ctx->reg->open_key(ctx->sender_pubkey, *fe);
+        if (!k) { gst_buffer_unmap(buf, &map); return GST_PAD_PROBE_DROP; }
+        key = *k;
+    } else {
+        key = ctx->base_key;
+    }
+
     auto opened = fb::media::sframe_open_v1(
-        std::span<const std::uint8_t, 32>(ctx->base_key.data(), 32),
+        std::span<const std::uint8_t, 32>(key.data(), 32),
         std::span<const std::uint8_t>(map.data, map.size));
     gst_buffer_unmap(buf, &map);
     if (!opened) return GST_PAD_PROBE_DROP;   // forged / tampered / wrong key
@@ -421,8 +493,8 @@ GstElement* find_element_by_factory(GstBin* bin, const gchar* factory_name) {
 
 // Walk the pipeline and install the SFrame seal probe on every encoder
 // SRC pad we find (opusenc + vp8enc).  Called once per outbound call
-// after the pipeline reaches PLAYING.
-void install_sframe_send_probes(GstElement* pipeline, SframeProbeCtx* ctx) {
+// after the pipeline reaches PLAYING. `ctx` is owned by Impl (one per call).
+void install_sframe_send_probes(GstElement* pipeline, SframeSealCtx* ctx) {
     for (const gchar* fac : {"opusenc", "vp8enc"}) {
         GstElement* el = find_element_by_factory(GST_BIN(pipeline), fac);
         if (!el) continue;
@@ -434,18 +506,42 @@ void install_sframe_send_probes(GstElement* pipeline, SframeProbeCtx* ctx) {
     }
 }
 
-// Same for the recv side: probe the SRC pad of every depayloader so the
-// next stage (decoder) sees plaintext encoded frames.
-void install_sframe_recv_probe(GstElement* sink_chain, SframeProbeCtx* ctx) {
+void sframe_open_ctx_free(gpointer p) { delete static_cast<SframeOpenCtx*>(p); }
+
+// Recv side: probe the depayloader SRC pad so the decoder sees plaintext
+// encoded frames. Unlike the send ctx, `ctx` is HEAP-OWNED here (one per
+// inbound pad / sender) and handed to the probe with a GDestroyNotify so it
+// frees when the pad/probe goes away. Each sink_chain is single-codec, so
+// exactly one depayloader matches → exactly one owner of `ctx`; if none
+// matches we free it ourselves to avoid a leak.
+void install_sframe_recv_probe(GstElement* sink_chain, SframeOpenCtx* ctx) {
     for (const gchar* fac : {"rtpopusdepay", "rtpvp8depay"}) {
         GstElement* el = find_element_by_factory(GST_BIN(sink_chain), fac);
         if (!el) continue;
         GstPad* src = gst_element_get_static_pad(el, "src");
         if (!src) continue;
         gst_pad_add_probe(src, GST_PAD_PROBE_TYPE_BUFFER,
-                          sframe_open_probe, ctx, nullptr);
+                          sframe_open_probe, ctx, sframe_open_ctx_free);
         gst_object_unref(src);
+        return;   // single owner installed
     }
+    delete ctx;   // no depayloader found → don't leak
+}
+
+// Read the SDP `mid` of an inbound webrtcbin src pad via its transceiver, so
+// a forwarded-room receiver can map the pad → originating sender
+// (RoomOffer.track_bindings). Empty if the transceiver/mid isn't resolvable.
+std::string mid_of_webrtc_pad(GstPad* pad) {
+    std::string out;
+    GstWebRTCRTPTransceiver* trans = nullptr;
+    g_object_get(pad, "transceiver", &trans, nullptr);
+    if (trans) {
+        gchar* m = nullptr;
+        g_object_get(trans, "mid", &m, nullptr);
+        if (m) { out = m; g_free(m); }
+        gst_object_unref(trans);
+    }
+    return out;
 }
 
 // appsink → QImage → MediaCall::remoteVideoFrame. Called on a GStreamer
@@ -541,11 +637,32 @@ void on_pad_added(GstElement* webrtc, GstPad* new_pad, gpointer user) {
         return;
     }
     gst_bin_add(GST_BIN(pipe), sink_chain);
-    // Install SFrame open-probe BEFORE the chain transitions to PLAYING
-    // so the very first buffer through the depayloader gets unsealed.
-    if (call->_sframe_enabled()) {
-        install_sframe_recv_probe(sink_chain,
-            static_cast<SframeProbeCtx*>(call->_sframe_ctx_raw()));
+    // Install the SFrame open-probe BEFORE the chain transitions to PLAYING
+    // so the very first buffer through the depayloader gets unsealed. A fresh
+    // per-pad SframeOpenCtx is heap-allocated and owned by the probe.
+    if (call->_room_mode()) {
+        // Forwarded room: resolve which member this track carries (from the
+        // pad's SDP mid → RoomOffer.track_bindings) and key opens to that
+        // sender via the registry. Unknown sender → still attach (the probe
+        // drops, since open_key has no key) and log it.
+        auto* octx = new SframeOpenCtx();
+        octx->reg = call->_room_registry();
+        const std::string mid = mid_of_webrtc_pad(new_pad);
+        octx->sender_pubkey = call->_room_sender_for_mid(mid);
+        if (octx->sender_pubkey.empty()) {
+            post_to_qt(call, [call, mid]() {
+                emit call->log(QString("inbound track mid=%1 has no sender "
+                                       "binding — frames will drop")
+                                   .arg(QString::fromStdString(mid)));
+            });
+        }
+        install_sframe_recv_probe(sink_chain, octx);
+    } else if (call->_sframe_enabled()) {
+        // 1:1 / mesh: open with the fixed per-call base key.
+        auto* seal = static_cast<SframeSealCtx*>(call->_sframe_ctx_raw());
+        auto* octx = new SframeOpenCtx();
+        octx->base_key = seal->base_key;
+        install_sframe_recv_probe(sink_chain, octx);
     }
     gst_element_sync_state_with_parent(sink_chain);
 
@@ -767,7 +884,7 @@ void MediaCall::start_outgoing(const std::array<std::uint8_t, 32>& peer_pub,
 
     set_state(State::kRinging);
     gst_element_set_state(impl_->pipeline, GST_STATE_PLAYING);
-    if (sframe_enabled_) install_sframe_send_probes(impl_->pipeline, &impl_->sframe_ctx);   /* friend access via member fn scope */
+    if (sframe_enabled_ || room_mode_) install_sframe_send_probes(impl_->pipeline, &impl_->seal_ctx);   /* friend access via member fn scope */
 }
 
 void MediaCall::accept_incoming(bool with_video) {
@@ -801,7 +918,7 @@ void MediaCall::accept_incoming(bool with_video) {
     impl_->bus_watch = gst_bus_add_watch(impl_->bus, on_bus_message, this);
 
     gst_element_set_state(impl_->pipeline, GST_STATE_PLAYING);
-    if (sframe_enabled_) install_sframe_send_probes(impl_->pipeline, &impl_->sframe_ctx);   /* friend access via member fn scope */
+    if (sframe_enabled_ || room_mode_) install_sframe_send_probes(impl_->pipeline, &impl_->seal_ctx);   /* friend access via member fn scope */
 
     // Apply the buffered offer + create answer.
     GstSDPMessage* sdp_msg = nullptr;
@@ -993,6 +1110,19 @@ MediaCall::~MediaCall() = default;
 void MediaCall::set_sframe_context(
     const std::array<std::uint8_t, 32>&,
     const std::array<std::uint8_t, 16>&) {}
+void MediaCall::set_room_context(
+    fb::media::RoomKeyRegistry* reg,
+    std::map<std::string, std::array<std::uint8_t, 32>> mid_to_sender) {
+    room_reg_      = reg;
+    mid_to_sender_ = std::move(mid_to_sender);
+    room_mode_     = (reg != nullptr);
+}
+std::string MediaCall::_room_sender_for_mid(const std::string& mid) const {
+    auto it = mid_to_sender_.find(mid);
+    if (it == mid_to_sender_.end()) return {};
+    return std::string(reinterpret_cast<const char*>(it->second.data()),
+                       it->second.size());
+}
 void* MediaCall::_sframe_ctx_raw() { return nullptr; }
 void* MediaCall::_webrtc_raw() const { return nullptr; }
 void MediaCall::_on_connection_state(int) {}
