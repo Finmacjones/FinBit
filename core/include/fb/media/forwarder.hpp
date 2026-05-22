@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -95,5 +96,61 @@ struct TreeNode {
 // `fanout` is clamped to ≥1. Empty input → empty tree.
 [[nodiscard]] std::vector<TreeNode> build_distribution_tree(
     const std::vector<ForwarderCandidate>& nodes, std::size_t fanout);
+
+// ---------------------------------------------------------------------------
+// Forwarder wiring plan (§4, docs/gstreamer-relay-spec.md).
+//
+// The elected forwarder receives each leaf's single audio stream and fans it
+// to every OTHER leaf — i.e. the forwarding set is all ordered pairs of
+// distinct leaves. `ForwarderRouting` tracks the live leaf set and yields the
+// EDGE DELTAS to wire/tear-down on each join/leave, which is exactly what the
+// dynamic GStreamer graph (tees + per-subscriber payloader branches) needs.
+//
+// This is the pure, deterministic brain of the SFU graph — separated from the
+// GStreamer "muscle" (RoomForwarder) so the routing can be unit-tested without
+// media hardware.
+// ---------------------------------------------------------------------------
+
+// A directed forwarding edge: leaf `src`'s inbound stream is relayed out to
+// leaf `sub`'s connection. (`src` != `sub`; audio is bidirectional, so a pair
+// of leaves yields two edges.)
+struct ForwardEdge {
+    std::string src;
+    std::string sub;
+    bool operator==(const ForwardEdge& o) const {
+        return src == o.src && sub == o.sub;
+    }
+    // Deterministic ordering (src, then sub) for stable delta vectors.
+    bool operator<(const ForwardEdge& o) const {
+        return src != o.src ? src < o.src : sub < o.sub;
+    }
+};
+
+class ForwarderRouting {
+public:
+    // Add a leaf. Returns the NEW edges to wire up: {leaf→s : existing s} ∪
+    // {p→leaf : existing p} (sorted, deterministic). Re-adding an existing
+    // leaf is a no-op and returns {}.
+    std::vector<ForwardEdge> add_leaf(const std::string& leaf);
+
+    // Remove a leaf. Returns the edges to TEAR DOWN: every edge whose src or
+    // sub is `leaf` (sorted). Removing an unknown leaf returns {}.
+    std::vector<ForwardEdge> remove_leaf(const std::string& leaf);
+
+    // The full current edge set = all ordered pairs of distinct leaves.
+    [[nodiscard]] std::vector<ForwardEdge> edges() const;
+
+    // Leaves that receive `src`'s stream (everyone but `src`); empty if `src`
+    // isn't a leaf. Sorted.
+    [[nodiscard]] std::vector<std::string> subscribers_of(
+        const std::string& src) const;
+
+    [[nodiscard]] std::vector<std::string> leaves() const;   // sorted
+    [[nodiscard]] std::size_t leaf_count() const;
+    [[nodiscard]] bool has_leaf(const std::string& leaf) const;
+
+private:
+    std::set<std::string> leaves_;
+};
 
 }  // namespace fb::media

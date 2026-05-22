@@ -3,6 +3,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <initializer_list>
+#include <utility>
+
 using fb::media::ForwarderCandidate;
 using fb::media::elect_forwarder;
 using fb::media::plan_topology;
@@ -166,4 +170,69 @@ TEST(DistTree, DeterministicAcrossOrderings) {
         EXPECT_EQ(t1[i].parent, t2[i].parent);
     }
     EXPECT_EQ(t1[0].pubkey, "b");   // class 2 → root
+}
+
+// ---------------------------------------------------------------------------
+// ForwarderRouting — the SFU graph's wiring brain (§4)
+// ---------------------------------------------------------------------------
+using fb::media::ForwarderRouting;
+using fb::media::ForwardEdge;
+
+namespace {
+std::vector<ForwardEdge> E(std::initializer_list<std::pair<std::string,std::string>> il) {
+    std::vector<ForwardEdge> v;
+    for (auto& [s, d] : il) v.push_back({s, d});
+    std::sort(v.begin(), v.end());
+    return v;
+}
+}
+
+TEST(ForwarderRouting, FirstLeafHasNoEdges) {
+    ForwarderRouting r;
+    EXPECT_TRUE(r.add_leaf("a").empty());     // alone → nobody to forward to
+    EXPECT_EQ(r.leaf_count(), 1u);
+    EXPECT_TRUE(r.edges().empty());
+}
+
+TEST(ForwarderRouting, SecondLeafAddsBidirectionalPair) {
+    ForwarderRouting r;
+    r.add_leaf("a");
+    auto add = r.add_leaf("b");
+    EXPECT_EQ(add, E({{"a","b"}, {"b","a"}}));
+    EXPECT_EQ(r.edges(), E({{"a","b"}, {"b","a"}}));
+}
+
+TEST(ForwarderRouting, ThirdLeafFansToFromEveryone) {
+    ForwarderRouting r;
+    r.add_leaf("a"); r.add_leaf("b");
+    auto add = r.add_leaf("c");
+    // c↔a and c↔b (four directed edges), nothing among a,b touched.
+    EXPECT_EQ(add, E({{"c","a"}, {"a","c"}, {"c","b"}, {"b","c"}}));
+    EXPECT_EQ(r.edges().size(), 6u);          // all ordered pairs of 3
+    EXPECT_EQ(r.subscribers_of("a"), (std::vector<std::string>{"b", "c"}));
+}
+
+TEST(ForwarderRouting, RemoveLeafTearsDownEveryTouchingEdge) {
+    ForwarderRouting r;
+    r.add_leaf("a"); r.add_leaf("b"); r.add_leaf("c");
+    auto removed = r.remove_leaf("b");
+    EXPECT_EQ(removed, E({{"b","a"}, {"a","b"}, {"b","c"}, {"c","b"}}));
+    EXPECT_EQ(r.edges(), E({{"a","c"}, {"c","a"}}));
+    EXPECT_FALSE(r.has_leaf("b"));
+}
+
+TEST(ForwarderRouting, AddIsIdempotentRemoveUnknownIsNoop) {
+    ForwarderRouting r;
+    r.add_leaf("a"); r.add_leaf("b");
+    EXPECT_TRUE(r.add_leaf("a").empty());     // already present
+    EXPECT_EQ(r.leaf_count(), 2u);
+    EXPECT_TRUE(r.remove_leaf("z").empty());  // never joined
+    EXPECT_EQ(r.edges(), E({{"a","b"}, {"b","a"}}));
+}
+
+TEST(ForwarderRouting, EmptySubscribersForUnknownOrLoneLeaf) {
+    ForwarderRouting r;
+    EXPECT_TRUE(r.subscribers_of("a").empty());   // unknown
+    r.add_leaf("a");
+    EXPECT_TRUE(r.subscribers_of("a").empty());   // alone
 }

@@ -176,13 +176,20 @@ relay you already run) to forward.
       `set_room_context` yet — that caller is the §4 forwarder graph (next),
       so these branches compile but aren't entered at runtime; live
       verification needs the loopback/hardware tests.
-- [ ] **Lever B:** GStreamer peer media-relay pipeline — terminate N
-      PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
-      decoding (forwarder stays blind). *Real-hardware / multi-machine
-      build — the election + plan above are the hook it consumes.*
-      **Full implementation spec: `docs/gstreamer-relay-spec.md`** (group
-      SFrame keying + per-sender open-key plumbing §6A, the SFU element
-      graph, renegotiation, test plan).
+- [x] **Lever B:** GStreamer peer media-relay graph — **built, code-complete
+      (compiles in `fb_desktop`; not yet runtime-verified)**. Brain:
+      `fb::media::ForwarderRouting` (leaf set → per-join/leave edge deltas;
+      who relays to whom), pure + unit-tested (`ForwarderRouting.*`). Muscle:
+      `client-desktop/src/room_forwarder.{hpp,cpp}` (`RoomForwarder`) — one
+      `webrtcbin` per leaf, `rtpjitterbuffer → rtpopusdepay → tee` per source
+      (NO decoder → forwarder stays blind), a `queue → rtpopuspay →
+      subscriber` branch per edge, offer/answer/ICE + renegotiation, and a
+      `trackBinding` signal feeding each subscriber's `RoomOffer.track_bindings`
+      (§6A.3). *Remaining:* chat_client wiring (instantiate on the elected
+      node; route `RoomOffer`/`RoomAnswer`/`RoomIce`; switch the dial plan to
+      `plan_topology`), the §5 transceiver-pool optimisation, and live
+      multi-machine verification (loopback + hardware tests, §8).
+      **Full spec: `docs/gstreamer-relay-spec.md`.**
 - [ ] **Lever B:** wire `RoomOffer`/`RoomAnswer`/`RoomIce` for the
       participant ↔ forwarder media handshake (depends on the relay
       pipeline)

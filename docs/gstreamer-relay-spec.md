@@ -104,8 +104,23 @@ ratchet), keyed by `room_id`.
 
 ## 4. Forwarder pipeline (the SFU graph, audio)
 
+> **Status: built — code-complete, compiles in `fb_desktop`, not yet
+> runtime-verified.** The wiring brain is `fb::media::ForwarderRouting`
+> (pure, unit-tested — `ForwarderRouting.*`): it tracks the leaf set and
+> yields the edge deltas (who relays to whom) on each join/leave. The
+> GStreamer muscle is `client-desktop/src/room_forwarder.{hpp,cpp}`
+> (`RoomForwarder`): a `webrtcbin` per leaf, `rtpjitterbuffer → rtpopusdepay
+> → tee` per source (no decoder), a `queue → rtpopuspay → subscriber.webrtc`
+> branch per edge, offer/answer/ICE + renegotiation, and a `trackBinding`
+> signal feeding `RoomOffer.track_bindings` (§6A.3). **Remaining:** chat_client
+> wiring (instantiate it when `elect_forwarder` picks us; route
+> `RoomOffer`/`RoomAnswer`/`RoomIce` to it; switch the dial plan to
+> `plan_topology`), the §5 transceiver-pool optimisation (it currently
+> renegotiates once per membership change), and live multi-machine
+> verification (§8).
+
 One `webrtcbin` per leaf connection. When leaf **P**'s webrtcbin exposes
-P's inbound audio src pad (extend `on_incoming_pad`), bridge it to every
+P's inbound audio src pad (`on_fwd_pad_added`), bridge it to every
 *other* leaf's webrtcbin **without decoding**:
 
 ```
@@ -397,13 +412,20 @@ my_pubkey, epoch)`). The existing 1:1 per-call path is untouched.
    (`RoomKeyRegistry`, `sframe_peek_epoch`, the seal/open ctx split, pad→
    sender binding, epoch grace) — lands with the pipeline build below; the
    pure pieces (§6A.9 steps 1–2) can land ahead of it.
-2. **Forwarder graph (§4)** for a *fixed* small N (no renegotiation) —
-   prove blind relay works for 3 nodes via the loopback test.
-3. **Dynamic join/leave + renegotiation (§5)** — the transceiver pool.
+2. **Forwarder graph (§4)** — **[built, code-complete; compiles, not
+   runtime-verified]** `fb::media::ForwarderRouting` (pure, unit-tested) +
+   `RoomForwarder` (the webrtcbin-per-leaf + tee + per-edge repay graph, no
+   decoder). Proving blind relay for 3 nodes is the loopback test (§8), still
+   to run on hardware.
+3. **Dynamic join/leave + renegotiation (§5)** — `RoomForwarder` does the
+   simple "one renegotiation per membership change" form today; the
+   pre-allocated transceiver pool is the remaining optimisation.
 4. **Switch the dial plan** to `plan_topology` (leaf → forwarder only)
-   behind a flag; keep mesh as fallback.
+   behind a flag; keep mesh as fallback. Includes the chat_client wiring that
+   instantiates `RoomForwarder` on the elected node and routes
+   `RoomOffer`/`RoomAnswer`/`RoomIce` to it.
 5. **Active-speaker forwarding (Lever C)** — only relay top-K publishers;
-   reuse the shipped `select_active_speakers`.
+   reuse the shipped `select_active_speakers` + `plan_forwarded_video`.
 
 ## 10. Reuse map (don't rebuild)
 - SFrame seal/open: `sframe_seal_probe` / `sframe_open_probe`,

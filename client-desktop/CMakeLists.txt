@@ -52,6 +52,7 @@ add_executable(fb_desktop
     src/identity_vault.cpp
     src/login_dialog.cpp
     src/media_call.cpp
+    src/room_forwarder.cpp
     src/bip39.cpp
     src/bip39_wordlist.cpp
 )

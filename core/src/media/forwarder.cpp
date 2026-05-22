@@ -119,4 +119,59 @@ std::vector<TreeNode> build_distribution_tree(
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// ForwarderRouting
+// ---------------------------------------------------------------------------
+std::vector<ForwardEdge> ForwarderRouting::add_leaf(const std::string& leaf) {
+    std::vector<ForwardEdge> added;
+    if (leaf.empty() || leaves_.count(leaf)) return added;   // no-op
+    // New leaf both sends to and receives from every existing leaf.
+    for (const auto& other : leaves_) {
+        added.push_back({leaf, other});   // leaf's stream → other
+        added.push_back({other, leaf});   // other's stream → leaf
+    }
+    leaves_.insert(leaf);
+    std::sort(added.begin(), added.end());
+    return added;
+}
+
+std::vector<ForwardEdge> ForwarderRouting::remove_leaf(const std::string& leaf) {
+    std::vector<ForwardEdge> removed;
+    if (!leaves_.erase(leaf)) return removed;   // wasn't a leaf
+    for (const auto& other : leaves_) {
+        removed.push_back({leaf, other});   // leaf's stream → other (gone)
+        removed.push_back({other, leaf});   // other's stream → leaf (gone)
+    }
+    std::sort(removed.begin(), removed.end());
+    return removed;
+}
+
+std::vector<ForwardEdge> ForwarderRouting::edges() const {
+    std::vector<ForwardEdge> all;
+    for (const auto& a : leaves_)
+        for (const auto& b : leaves_)
+            if (a != b) all.push_back({a, b});
+    std::sort(all.begin(), all.end());     // leaves_ is sorted; this is belt+braces
+    return all;
+}
+
+std::vector<std::string> ForwarderRouting::subscribers_of(
+    const std::string& src) const {
+    std::vector<std::string> subs;
+    if (!leaves_.count(src)) return subs;
+    for (const auto& other : leaves_)
+        if (other != src) subs.push_back(other);
+    return subs;                            // already sorted (std::set order)
+}
+
+std::vector<std::string> ForwarderRouting::leaves() const {
+    return std::vector<std::string>(leaves_.begin(), leaves_.end());
+}
+
+std::size_t ForwarderRouting::leaf_count() const { return leaves_.size(); }
+
+bool ForwarderRouting::has_leaf(const std::string& leaf) const {
+    return leaves_.count(leaf) != 0;
+}
+
 }  // namespace fb::media
