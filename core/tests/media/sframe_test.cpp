@@ -173,3 +173,31 @@ TEST(SFrameRoomKey, CrossSenderKeyDoesNotOpen) {
                      std::span<const std::uint8_t>(sealed.data(), sealed.size()))
                      .has_value());
 }
+
+// sframe_peek_epoch reads the wire epoch WITHOUT opening the frame — the
+// forwarded-room receiver uses it to pick the per-sender/epoch key first.
+TEST(SFramePeekEpoch, MatchesSealedEpoch) {
+    auto s = demo_room_secret();
+    auto pt = bytes("pick the right key before opening");
+    for (std::uint32_t epoch : {0u, 1u, 9u, 4242u}) {
+        auto k = room_key(s, pub(0xAA), epoch);
+        auto sealed = fb::media::sframe_seal_v1(
+            std::span<const std::uint8_t, 32>(k), epoch, 7,
+            std::span<const std::uint8_t>(pt.data(), pt.size()));
+        auto peeked = fb::media::sframe_peek_epoch(
+            std::span<const std::uint8_t>(sealed.data(), sealed.size()));
+        ASSERT_TRUE(peeked.has_value());
+        EXPECT_EQ(*peeked, epoch);
+    }
+}
+
+TEST(SFramePeekEpoch, ShortFrameReturnsNullopt) {
+    std::vector<std::uint8_t> too_short(11, 0xff);   // header is 12 bytes
+    EXPECT_FALSE(fb::media::sframe_peek_epoch(
+                     std::span<const std::uint8_t>(too_short.data(), too_short.size()))
+                     .has_value());
+    std::vector<std::uint8_t> empty;
+    EXPECT_FALSE(fb::media::sframe_peek_epoch(
+                     std::span<const std::uint8_t>(empty.data(), empty.size()))
+                     .has_value());
+}

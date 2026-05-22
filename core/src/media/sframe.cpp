@@ -141,4 +141,11 @@ std::optional<std::vector<std::uint8_t>> sframe_open_v1(std::span<const std::uin
         std::span<const std::uint8_t>(aad.data(), aad.size()));
 }
 
+std::optional<std::uint32_t> sframe_peek_epoch(std::span<const std::uint8_t> sealed) {
+    // Header is [u32 BE epoch][u64 BE counter] = 12 bytes; a frame shorter
+    // than that can't be valid (matches sframe_open_v1's minimum).
+    if (sealed.size() < 12) return std::nullopt;
+    return rd_u32(sealed.data());
+}
+
 }  // namespace fb::media

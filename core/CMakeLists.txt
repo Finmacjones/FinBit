@@ -82,6 +82,8 @@ add_library(fb_core STATIC
     src/media/sframe.cpp
     src/media/active_speaker.cpp
     src/media/forwarder.cpp
+    src/media/room_keys.cpp
+    src/media/track_bindings.cpp
     src/mesh/mqtt_bridge.cpp
     src/mesh/compression.cpp
     src/mesh/serial_bridge.cpp

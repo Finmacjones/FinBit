@@ -208,9 +208,23 @@ message RoomLeave {
     bytes room_id = 1;
 }
 
+// Maps an SDP media section (`mid`) in a forwarded offer to the room member
+// whose sealed media that track carries — so a subscriber knows which
+// sender's per-room SFrame key to open each inbound track with
+// (docs/gstreamer-relay-spec.md §6A). This is identity *metadata*, not key
+// material: the forwarder fills it in from the room roster while holding no
+// SFrame key, so it stays end-to-end blind to the content it relays.
+message TrackBinding {
+    string mid           = 1;   // SDP media-section id (a=mid:...)
+    bytes  sender_pubkey = 2;   // 32-byte identity pubkey of the originating member
+}
+
 message RoomOffer {
     bytes  room_id = 1;
     string sdp     = 2;      // SFU's SDP offer for this participant
+    // One entry per forwarded media section: which member's stream it carries
+    // (Lever B per-sender open-key plumbing, §6A.3). Empty for 1:1 / mesh.
+    repeated TrackBinding track_bindings = 3;
 }
 
 message RoomAnswer {

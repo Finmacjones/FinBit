@@ -178,12 +178,19 @@ splitting the probe + seal ctx.
   format `[u32 BE epoch][u64 BE ctr][AES-256-GCM]`, `derive_room_sframe_key`
   (unit-tested incl. cross-sender isolation — `SFrameRoomKey.*`), and the
   `room_secrets` map in `chat_client` (MLS-exporter *or* distributed-RoomKey
-  sourced, epoch-tagged — both now shipped).
-- **Changes:** `SframeProbeCtx` (one `base_key` for seal *and* open) splits
-  into a single **seal ctx** (`K_self`) + **per-pad open ctxs** (one per
-  sender); a room-scoped **`RoomKeyRegistry`** owns the secret + a derived-key
-  cache; `set_sframe_context` gains a room mode; `on_incoming_pad` builds an
-  open ctx from a pad→sender binding.
+  sourced, epoch-tagged — both shipped).
+- **Shipped (the pure half of this section — §6A.9 steps 1–2):**
+  `fb::media::sframe_peek_epoch`, the room-scoped **`RoomKeyRegistry`** (owns
+  the secret + a derived-key cache + the epoch grace window;
+  `core/{include,src}/fb/media/room_keys.*`), and the
+  `RoomOffer.track_bindings` proto field with `fb::media::bind_track` /
+  `sender_for_track` — all unit-tested.
+- **Still to change (with the pipeline — §6A.9 steps 3–4):** `SframeProbeCtx`
+  (one `base_key` for seal *and* open) splits into a single **seal ctx**
+  (`K_self`, from `RoomKeyRegistry::seal_key`) + **per-pad open ctxs** (one
+  per sender, calling `RoomKeyRegistry::open_key`); `set_sframe_context`
+  gains a room mode; `on_incoming_pad` builds an open ctx from a pad→sender
+  binding (`sender_for_track`).
 
 ### 6A.2 RoomKeyRegistry (shared, room-scoped)
 One per active group call, owned by `RoomLeafCall`. Pad probes run on
@@ -300,10 +307,15 @@ my_pubkey, epoch)`). The existing 1:1 per-call path is untouched.
   stand; per-call replay is future work).
 
 ### 6A.8 Test plan (extends §8)
-- **Pure/unit (CI, no hardware):** `RoomKeyRegistry` — `seal_key` rotates on
-  `set_secret`; `open_key` derives the right per-sender key, honors the grace
-  window (prev epoch opens within it, drops after), caches, rejects unknown
-  senders. `sframe_peek_epoch` round-trips a sealed header. Sits next to
+- **Pure/unit (CI, no hardware) — [shipped]:** `RoomKeyRegistry` tests
+  (`RoomKeyRegistry.*`) — `seal_key` rotates on `set_secret`; `open_key`
+  derives the right per-sender key, isolates senders (different sender ⇒
+  different key), honors the grace window (prev epoch opens within it, drops
+  after — driven by an injected clock), caches, and rejects unknown/expired
+  epochs; stale/duplicate `set_secret` epochs are ignored; two registries
+  agree (cross-member). `sframe_peek_epoch` round-trips the sealed epoch and
+  rejects short frames (`SFramePeekEpoch.*`). `TrackBindings.*` covers
+  bind/lookup, missing/empty mid, and first-match. All sit next to
   `SFrameRoomKey.*`.
 - **Loopback (CI-able, finicky):** two `audiotestsrc` publishers with
   distinct identities → forwarder → one subscriber holding two
@@ -314,10 +326,12 @@ my_pubkey, epoch)`). The existing 1:1 per-call path is untouched.
   rotation grace window.
 
 ### 6A.9 Build-order delta (refines §9 item 1)
-1. `fb::media::sframe_peek_epoch` + `RoomKeyRegistry` + unit tests —
-   **pure, lands now, no hardware.**
-2. `RoomOffer.track_bindings` proto field + forwarder population + subscriber
-   lookup — pure/testable ahead of media.
+1. **[done]** `fb::media::sframe_peek_epoch` + `RoomKeyRegistry`
+   (`core/{include,src}/fb/media/room_keys.*`) + unit tests — pure, no
+   hardware.
+2. **[done]** `RoomOffer.track_bindings` proto field + `fb::media::bind_track`
+   / `sender_for_track` (`track_bindings.*`) + unit tests — pure/testable
+   ahead of media.
 3. Probe split (`SframeSealCtx`/`SframeOpenCtx`) + per-pad open ctx in
    `on_incoming_pad` — with the pipeline build.
 4. Rotation wiring (`chat_client` → `registry.set_secret`) — with the

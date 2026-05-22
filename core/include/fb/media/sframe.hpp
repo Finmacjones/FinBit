@@ -78,4 +78,12 @@ namespace fb::media {
 [[nodiscard]] std::optional<std::vector<std::uint8_t>> sframe_open_v1(
     std::span<const std::uint8_t, 32> base_key, std::span<const std::uint8_t> sealed);
 
+// Read just the epoch (the leading u32 BE of the wire header) WITHOUT
+// opening the frame. A forwarded-room receiver uses this to pick which
+// sender/epoch key to open with before doing the AEAD work
+// (docs/gstreamer-relay-spec.md §6A — RoomKeyRegistry::open_key). Returns
+// std::nullopt if the buffer is too short to hold a valid header.
+[[nodiscard]] std::optional<std::uint32_t> sframe_peek_epoch(
+    std::span<const std::uint8_t> sealed);
+
 }  // namespace fb::media

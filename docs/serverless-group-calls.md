@@ -155,11 +155,20 @@ relay you already run) to forward.
       (`MlsGroup::epoch()`); unit-tested for cross-member agreement +
       rotation. `chat_client` resolves it on each room roster and unifies
       both sources into one `room_secrets` map the media relay consumes
-      identically. *Remaining:* per-sender open-key plumbing in the media
-      probes — **now fully specified** in `docs/gstreamer-relay-spec.md` §6A
-      (`RoomKeyRegistry`, `sframe_peek_epoch`, seal/open ctx split, pad→
-      sender binding, epoch grace); its pure pieces can land ahead of the
-      pipeline.
+      identically.
+- [x] **Lever B:** per-sender open-key plumbing — **pure half** (`docs/
+      gstreamer-relay-spec.md` §6A.9 steps 1–2): `fb::media::RoomKeyRegistry`
+      (per-room secret + per-sender derived-key cache + previous-epoch grace
+      window, clock-injected tests), `fb::media::sframe_peek_epoch` (pick the
+      key before opening), and the `RoomOffer.track_bindings` proto field with
+      `bind_track`/`sender_for_track` (mid → originating sender). All
+      unit-tested (`RoomKeyRegistry.*`, `SFramePeekEpoch.*`, `TrackBindings.*`).
+      *Remaining:* the GStreamer probe split + rotation wiring (§6A.9 steps
+      3–4) land with the pipeline below.
+- [ ] **Lever B:** GStreamer peer media-relay pipeline — terminate N
+      PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
+      decoding (forwarder stays blind). *Real-hardware / multi-machine
+      build — the election + plan above are the hook it consumes.*
 - [ ] **Lever B:** GStreamer peer media-relay pipeline — terminate N
       PeerConnections, re-pay SFrame-sealed RTP to subscribers WITHOUT
       decoding (forwarder stays blind). *Real-hardware / multi-machine
