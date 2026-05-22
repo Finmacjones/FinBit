@@ -64,3 +64,6 @@ third_party/mlspp/
 # WASM build outputs.
 client-web/build/
 third_party/protobuf/
+
+# Design mockups live in the dev repo only — never publish to this mirror.
+design/
