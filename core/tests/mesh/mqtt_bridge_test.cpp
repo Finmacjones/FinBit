@@ -26,6 +26,13 @@
 #include <thread>
 #include <vector>
 
+// Path to tools/mesh-loopback, normally injected by CMake. Fallback keeps the
+// TU compilable in tooling/other build setups (the test resolves the broker
+// at runtime, preferring $FB_MQTT_BROKER_PY anyway).
+#ifndef FB_MESH_LOOPBACK_DIR
+#define FB_MESH_LOOPBACK_DIR "tools/mesh-loopback"
+#endif
+
 #if !FB_HAVE_PAHO
 TEST(MqttBridge, BuiltWithoutPaho_SkipReal) { GTEST_SKIP() << "FB_HAVE_PAHO=0"; }
 #else
@@ -69,10 +76,15 @@ class BrokerProc {
 public:
     explicit BrokerProc(std::uint16_t port) : port_(port) {
         const auto bind = std::string("127.0.0.1:") + std::to_string(port);
-        const auto cmd = std::string(
-                             "python3 /home/finmac/Documents/Discordclone/tools/"
-                             "mesh-loopback/mqtt_broker.py ") +
-                         bind + " >/tmp/fb_mqtt_broker.log 2>&1 &echo $!";
+        // Resolve the loopback broker script: FB_MQTT_BROKER_PY override, else
+        // the repo path baked in by CMake (FB_MESH_LOOPBACK_DIR). No hardcoded
+        // absolute path — portable across machines / clones.
+        const char* env = std::getenv("FB_MQTT_BROKER_PY");
+        const std::string script =
+            env ? std::string(env)
+                : std::string(FB_MESH_LOOPBACK_DIR) + "/mqtt_broker.py";
+        const auto cmd = std::string("python3 ") + script + " " + bind +
+                         " >/tmp/fb_mqtt_broker.log 2>&1 &echo $!";
         FILE* f = ::popen(cmd.c_str(), "r");
         if (!f) return;
         char buf[32]{};

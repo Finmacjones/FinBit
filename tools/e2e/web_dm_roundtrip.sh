@@ -11,11 +11,12 @@ BUILD="${1:-${REPO_ROOT}/build/system}"
 MARKER="${2:-FBWEB-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')-MAGIC}"
 SERVER="${BUILD}/server/fb_server"
 CLI="${BUILD}/tools/fb-cli/fb-cli"
-NODE="/home/finmac/emsdk/node/22.16.0_64bit/bin/node"
+# Node from $FB_NODE if set, else whatever's on PATH (emsdk ships one).
+NODE="${FB_NODE:-$(command -v node || true)}"
 
 [[ -x "${SERVER}" ]] || { echo "FAIL: server not built" >&2; exit 1; }
 [[ -x "${CLI}"    ]] || { echo "FAIL: fb-cli not built" >&2; exit 1; }
-[[ -x "${NODE}"   ]] || { echo "FAIL: node not at ${NODE}" >&2; exit 1; }
+[[ -n "${NODE}" && -x "${NODE}" ]] || { echo "FAIL: node not found — set FB_NODE or add node to PATH" >&2; exit 1; }
 [[ -f "${REPO_ROOT}/client-web/build/finbit.mjs" ]] || {
     echo "FAIL: WASM not built — run scripts/build-wasm.sh" >&2; exit 1; }
 

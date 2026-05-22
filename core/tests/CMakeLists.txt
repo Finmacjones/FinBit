@@ -55,4 +55,10 @@ target_link_libraries(fb_core_tests
         GTest::gtest_main
 )
 
+# The MQTT-bridge test spawns the loopback broker from tools/mesh-loopback.
+# Bake the repo's path in at build time (overridable at runtime via
+# FB_MQTT_BROKER_PY) so the test is portable — no hardcoded absolute path.
+target_compile_definitions(fb_core_tests PRIVATE
+    FB_MESH_LOOPBACK_DIR="${CMAKE_SOURCE_DIR}/tools/mesh-loopback")
+
 gtest_discover_tests(fb_core_tests)
