@@ -67,6 +67,7 @@
 #include "fb/media/active_speaker.hpp"
 #include "fb/media/forwarder.hpp"
 #include "fb/media/room_keys.hpp"
+#include "room_forwarder.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
 
@@ -319,6 +320,9 @@ struct PendingMediaSignal {
     std::uint32_t kind  = 0;
     std::uint32_t epoch = 0;
     std::vector<std::uint8_t> payload;
+    // Forwarded-room only: forwarder→leaf track→sender bindings carried on an
+    // OFFER (mid → 32-byte sender pubkey). Empty for 1:1 / mesh.
+    std::vector<std::pair<std::string, std::array<std::uint8_t, 32>>> track_bindings;
 };
 
 std::vector<std::uint8_t> pack_text_payload(const std::string& text) {
@@ -355,13 +359,20 @@ QString peer_label_for(std::span<const std::uint8_t> pub) {
 
 std::vector<std::uint8_t> pack_media_signal_payload(
     std::span<const std::uint8_t, 16> call_id, std::uint32_t kind,
-    std::span<const std::uint8_t> payload, std::uint32_t epoch) {
+    std::span<const std::uint8_t> payload, std::uint32_t epoch,
+    const std::vector<std::pair<std::string, std::array<std::uint8_t, 32>>>&
+        track_bindings = {}) {
     fb::proto::DmPayload p;
     auto* ms = p.mutable_media_signal();
     ms->set_call_id(std::string(call_id.begin(), call_id.end()));
     ms->set_kind(kind);
     ms->set_payload(std::string(payload.begin(), payload.end()));
     ms->set_epoch(epoch);
+    for (const auto& [mid, sender] : track_bindings) {
+        auto* tb = ms->add_track_bindings();
+        tb->set_mid(mid);
+        tb->set_sender_pubkey(sender.data(), sender.size());
+    }
     std::vector<std::uint8_t> out(p.ByteSizeLong());
     if (!p.SerializeToArray(out.data(), static_cast<int>(out.size()))) out.clear();
     return out;
@@ -659,6 +670,34 @@ struct ChatClient::Impl {
     // Lives here so it outlives any single call and survives roster churn.
     std::map<std::string, std::unique_ptr<fb::media::RoomKeyRegistry>>
         room_registries;
+
+    // ---- Forwarder dial plan (Lever B §4, FB_FORWARDER_DIAL) -------------
+    // Off by default: group calls stay full-mesh (the proven path). When set,
+    // a room with an elected forwarder routes through it instead — leaves dial
+    // only the forwarder, the elected node runs a RoomForwarder. Compile-ready
+    // integration; live operation also needs MediaCall mid-call renegotiation
+    // (§5) + multi-machine verification.
+    bool forwarder_dial = false;
+    // room_id → RoomForwarder we run because we were elected its forwarder.
+    std::map<std::string, std::unique_ptr<RoomForwarder>> room_forwarders;
+    // room_id → the forwarder we're a LEAF to (its 32-byte pubkey, raw).
+    std::map<std::string, std::string> leaf_forwarder_of;
+    // room_id → current member set (raw pubkeys), from the roster — lets the
+    // media-signal handler tell "a leaf in the room I forward" from a 1:1 peer.
+    std::map<std::string, std::set<std::string>> room_members;
+    // room_id → (mid → sender pubkey) accumulated from forwarder OFFERs, fed
+    // to the leaf's room-mode MediaCall::set_room_context.
+    std::map<std::string, std::map<std::string, std::array<std::uint8_t, 32>>>
+        room_track_map;
+    // subscriber pubkey → bindings queued for its NEXT forwarder OFFER
+    // (RoomForwarder::trackBinding fires as branches are wired; drained onto
+    // the matching renegotiateOffer).
+    std::map<std::string,
+             std::vector<std::pair<std::string, std::array<std::uint8_t, 32>>>>
+        pending_track_bindings;
+    // leaf pubkey → its call_id (from the leaf's OFFER), so our forwarder
+    // replies (ANSWER / renegotiation OFFER / ICE) echo the right call_id.
+    std::map<std::string, std::array<std::uint8_t, 16>> forwarder_leaf_callid;
     // Get-or-create the registry for a room, seeded with our own identity as
     // the seal pubkey.
     fb::media::RoomKeyRegistry* room_registry(const std::string& room_id,
@@ -782,6 +821,9 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
         if (auto ecl = fb::net::ech::decode_ech_config_list_b64(e)) {
             impl_->ech_config_list = std::move(*ecl);
         }
+    }
+    if (const char* fd = std::getenv("FB_FORWARDER_DIAL"); fd && *fd && *fd != '0') {
+        impl_->forwarder_dial = true;
     }
     impl_->worker = std::thread([this]() {
         try {
@@ -1758,6 +1800,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 // UNCHANGED until the peer media-relay pipeline lands (so a
                 // live call keeps working). It's the hook that pipeline
                 // plugs into. See docs/serverless-group-calls.md.
+                std::string fwd;   // elected forwarder ("" = mesh); used below
                 {
                     std::vector<fb::media::ForwarderCandidate> cands;
                     for (const auto& p : rr.participants()) {
@@ -1766,21 +1809,24 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                                      p.identity_pubkey().end()),
                                          static_cast<int>(p.uplink_class())});
                     }
-                    const std::string fwd = fb::media::elect_forwarder(
-                        cands, /*mesh_threshold=*/6);
+                    fwd = fb::media::elect_forwarder(cands, /*mesh_threshold=*/6);
                     if (!fwd.empty()) {
                         const std::string my_key(my_pub.begin(), my_pub.end());
                         fb::crypto::PubKey fk{};
                         std::memcpy(fk.data(), fwd.data(), 32);
-                        emit log(QString("forwarder elected for #%1: %2%3 "
-                                          "(mesh still active — relay pipeline "
-                                          "pending)")
+                        emit log(QString("forwarder elected for #%1: %2%3%4")
                                      .arg(chan_name)
                                      .arg(QString::fromStdString(
                                          fb::crypto::Identity::fingerprint(fk)))
-                                     .arg(fwd == my_key ? " (me)" : ""));
+                                     .arg(fwd == my_key ? " (me)" : "")
+                                     .arg(impl_->forwarder_dial
+                                              ? " (forwarder-dial)"
+                                              : " (mesh still active)"));
                     }
                 }
+                // Remember the room's current members (used by the media-signal
+                // handler to tell a leaf of a room we forward from a 1:1 peer).
+                impl_->room_members[room_id_str] = roster_peer_keys;
 
                 // Source the group-call room_secret (the seed that
                 // fb::media::derive_room_sframe_key turns into each sender's
@@ -1820,6 +1866,43 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                          .arg(chan_name));
                         }
                     }
+                }
+
+                // Forwarder-dial plan (Lever B §4, FB_FORWARDER_DIAL). When a
+                // forwarder is elected and the flag is on, route through it
+                // instead of full mesh: the elected node runs a RoomForwarder;
+                // everyone else dials ONLY the forwarder (room-mode call).
+                // Default (flag off) falls through to the proven mesh below.
+                if (impl_->forwarder_dial && !fwd.empty()) {
+                    const std::string my_key(my_pub.begin(), my_pub.end());
+                    if (fwd == my_key) {
+                        // We're the forwarder: stand up the relay graph. Leaves
+                        // will offer to us (routed to it in the media-signal
+                        // handler). RoomForwarder lives on the UI thread.
+                        QMetaObject::invokeMethod(this, [this, room_id_str]() {
+                            ensure_room_forwarder(room_id_str);
+                        }, Qt::QueuedConnection);
+                    } else {
+                        // We're a leaf: dial only the forwarder, once.
+                        impl_->leaf_forwarder_of[room_id_str] = fwd;
+                        auto& dialed = impl_->room_mesh_peers[room_id_str];
+                        if (!dialed.count(fwd)) {
+                            dialed.insert(fwd);
+                            std::array<std::uint8_t, 32> fpub{};
+                            std::memcpy(fpub.data(), fwd.data(), 32);
+                            fb::crypto::PubKey arr{};
+                            std::memcpy(arr.data(), fwd.data(), 32);
+                            const QString fp = QString::fromStdString(
+                                fb::crypto::Identity::fingerprint(arr));
+                            bool rv = false;
+                            if (auto rit = impl_->active_voice_rooms.find(room_id_str);
+                                rit != impl_->active_voice_rooms.end()) rv = rit->second;
+                            emit log(QString("forwarder-dial: room #%1 → forwarder %2")
+                                         .arg(chan_name).arg(fp));
+                            mesh_bootstrap_or_dial(fpub, room_id_str, rv, fp);
+                        }
+                    }
+                    return;   // skip the mesh dial below
                 }
 
                 auto& meshed = impl_->room_mesh_peers[room_id_str];
@@ -2713,10 +2796,21 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                                  .arg(static_cast<int>(sig_payload.size())));
                                 }
 
+                                // Forwarded-room track→sender bindings carried
+                                // on a forwarder OFFER (mid → 32-byte sender).
+                                std::vector<std::pair<std::string,
+                                    std::array<std::uint8_t, 32>>> tbs;
+                                for (const auto& tb : ms.track_bindings()) {
+                                    if (tb.sender_pubkey().size() != 32) continue;
+                                    std::array<std::uint8_t, 32> s{};
+                                    std::memcpy(s.data(), tb.sender_pubkey().data(), 32);
+                                    tbs.push_back({tb.mid(), s});
+                                }
+
                                 // Marshal the inbound dispatch onto the Qt
                                 // main thread — MediaCall lives there.
                                 QMetaObject::invokeMethod(this,
-                                    [this, peer_pub, kind, sig_payload, ms_call_id =
+                                    [this, peer_pub, kind, sig_payload, tbs, ms_call_id =
                                      std::array<std::uint8_t, 16>([&]{
                                         std::array<std::uint8_t, 16> a{};
                                         std::memcpy(a.data(), ms.call_id().data(), 16);
@@ -2730,6 +2824,50 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                         const std::string peer_key(
                                             reinterpret_cast<const char*>(peer_pub.data()),
                                             peer_pub.size());
+
+                                        // Forwarder role (Lever B §4): if this
+                                        // peer is a leaf in a room we forward,
+                                        // the signal is leaf↔forwarder media —
+                                        // route it into the RoomForwarder, not a
+                                        // 1:1 MediaCall.
+                                        for (auto& [rid, F] : impl_->room_forwarders) {
+                                            auto mit = impl_->room_members.find(rid);
+                                            if (mit == impl_->room_members.end() ||
+                                                !mit->second.count(peer_key)) continue;
+                                            impl_->forwarder_leaf_callid[peer_key] = ms_call_id;
+                                            if (kind == MediaCall::SignalKind::kOffer)
+                                                F->add_leaf(peer_pub, sig_payload);
+                                            else if (kind == MediaCall::SignalKind::kAnswer)
+                                                F->leaf_answer(peer_pub, sig_payload);
+                                            else if (kind == MediaCall::SignalKind::kIce)
+                                                F->leaf_ice(peer_pub, sig_payload);
+                                            else if (kind == MediaCall::SignalKind::kHangup)
+                                                F->remove_leaf(peer_pub);
+                                            return;
+                                        }
+
+                                        // Leaf role: bindings on a forwarder
+                                        // signal update which sender each inbound
+                                        // track carries; refresh the room-mode
+                                        // call's key map. (Applying the SDP
+                                        // renegotiation itself needs §5.)
+                                        if (!tbs.empty()) {
+                                            for (auto& [rid, fpub] :
+                                                 impl_->leaf_forwarder_of) {
+                                                if (fpub != peer_key) continue;
+                                                auto& m = impl_->room_track_map[rid];
+                                                for (const auto& [mid, s] : tbs) m[mid] = s;
+                                                auto cit = impl_->calls_by_peer.find(peer_key);
+                                                if (cit != impl_->calls_by_peer.end() &&
+                                                    cit->second.call) {
+                                                    cit->second.call->set_room_context(
+                                                        impl_->room_registry(
+                                                            rid, *impl_->identity),
+                                                        m);
+                                                }
+                                                break;
+                                            }
+                                        }
                                         if (kind == MediaCall::SignalKind::kOffer) {
                                             // Glare at the per-peer level only:
                                             // we already have a call going with
@@ -3764,7 +3902,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             std::span<const std::uint8_t, 16>(sig.call_id.data(), 16),
                             sig.kind,
                             std::span<const std::uint8_t>(sig.payload.data(), sig.payload.size()),
-                            sig.epoch);
+                            sig.epoch, sig.track_bindings);
                         std::vector<std::uint8_t> envid(16);
                         randombytes_buf(envid.data(), envid.size());
                         const auto now_ms = static_cast<std::uint64_t>(
@@ -4859,6 +4997,73 @@ void ChatClient::disconnect() {
 // calls produce N-1 entries, one per other participant in the room.
 // =============================================================================
 
+void ChatClient::ensure_room_forwarder(const std::string& room_id) {
+    if (impl_->room_forwarders.count(room_id)) return;   // already running
+    std::array<std::uint8_t, 32> rid{};
+    std::memcpy(rid.data(), room_id.data(),
+                std::min<std::size_t>(room_id.size(), rid.size()));
+    auto fwd = std::make_unique<RoomForwarder>(rid, this);
+    RoomForwarder* F = fwd.get();
+
+    // Helper: enqueue a forwarder→leaf media signal, echoing the leaf's
+    // call_id so it lands on the right call. Runs on the UI thread; the
+    // worker drains media_queue and seals each via the ratchet.
+    auto enqueue = [this](const std::array<std::uint8_t, 32>& leaf,
+                          std::uint32_t kind, const QByteArray& bytes,
+                          std::vector<std::pair<std::string,
+                              std::array<std::uint8_t, 32>>> tbs) {
+        const std::string lk(reinterpret_cast<const char*>(leaf.data()), 32);
+        PendingMediaSignal pms;
+        pms.peer_pub = leaf;
+        auto it = impl_->forwarder_leaf_callid.find(lk);
+        if (it != impl_->forwarder_leaf_callid.end()) pms.call_id = it->second;
+        pms.kind = kind;
+        pms.payload.assign(bytes.constBegin(), bytes.constEnd());
+        pms.track_bindings = std::move(tbs);
+        {
+            std::lock_guard lock(impl_->mu);
+            impl_->media_queue.push_back(std::move(pms));
+        }
+        impl_->cv.notify_all();
+    };
+
+    QObject::connect(F, &RoomForwarder::answerReady, this,
+        [enqueue](const std::array<std::uint8_t, 32>& leaf, const QByteArray& sdp) {
+            enqueue(leaf, static_cast<std::uint32_t>(MediaCall::SignalKind::kAnswer),
+                    sdp, {});
+        });
+    QObject::connect(F, &RoomForwarder::renegotiateOffer, this,
+        [this, enqueue](const std::array<std::uint8_t, 32>& leaf, const QByteArray& sdp) {
+            // Attach the bindings accumulated for this subscriber to the offer.
+            const std::string lk(reinterpret_cast<const char*>(leaf.data()), 32);
+            std::vector<std::pair<std::string, std::array<std::uint8_t, 32>>> tbs;
+            if (auto it = impl_->pending_track_bindings.find(lk);
+                it != impl_->pending_track_bindings.end()) {
+                tbs.swap(it->second);
+                impl_->pending_track_bindings.erase(it);
+            }
+            enqueue(leaf, static_cast<std::uint32_t>(MediaCall::SignalKind::kOffer),
+                    sdp, std::move(tbs));
+        });
+    QObject::connect(F, &RoomForwarder::localIce, this,
+        [enqueue](const std::array<std::uint8_t, 32>& leaf, const QByteArray& cand) {
+            enqueue(leaf, static_cast<std::uint32_t>(MediaCall::SignalKind::kIce),
+                    cand, {});
+        });
+    QObject::connect(F, &RoomForwarder::trackBinding, this,
+        [this](const std::array<std::uint8_t, 32>& sub, const QString& mid,
+               const std::array<std::uint8_t, 32>& source) {
+            const std::string sk(reinterpret_cast<const char*>(sub.data()), 32);
+            impl_->pending_track_bindings[sk].push_back(
+                {mid.toStdString(), source});
+        });
+    QObject::connect(F, &RoomForwarder::log, this,
+        [this](const QString& m) { emit log("[forwarder] " + m); });
+
+    impl_->room_forwarders.emplace(room_id, std::move(fwd));
+    emit log("running as room forwarder (Lever B §4)");
+}
+
 bool ChatClient::start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub_arr,
                                     const QString& display_label,
                                     bool with_video,
@@ -4904,12 +5109,26 @@ bool ChatClient::start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub_
     impl_->calls_by_peer[peer_key] = entry;
     const QString label = display_label;
 
-    // Derive the SFrame base key from the X3DH-shared secret + the fresh
-    // call_id and hand it to MediaCall before start_outgoing — this turns
-    // on the encoded-frame seal/open probes around opusenc / vp8enc /
-    // rtpopusdepay / rtpvp8depay so an SFU (when one lands) can't read
-    // frames. Wire-compatible with media_call.js on the web client.
-    {
+    // Keying. If this is a LEAF→forwarder dial (forwarder_dial path), the
+    // call runs in room mode: seal with K_self and open each inbound track
+    // with its sender's per-room key, both from the room's RoomKeyRegistry
+    // (§6A). Otherwise it's a 1:1 / mesh call: derive a per-call SFrame base
+    // key from the X3DH-shared secret + the fresh call_id (wire-compatible
+    // with media_call.js).
+    bool room_mode = false;
+    if (!room_id.empty()) {
+        auto lf = impl_->leaf_forwarder_of.find(room_id);
+        room_mode = (lf != impl_->leaf_forwarder_of.end() && lf->second == peer_key);
+    }
+    if (room_mode) {
+        auto* reg = impl_->room_registry(room_id, *impl_->identity);
+        std::map<std::string, std::array<std::uint8_t, 32>> m2s;
+        if (auto it = impl_->room_track_map.find(room_id);
+            it != impl_->room_track_map.end()) {
+            m2s = it->second;
+        }
+        call->set_room_context(reg, std::move(m2s));
+    } else {
         std::array<std::uint8_t, 32> peer_x{};
         if (crypto_sign_ed25519_pk_to_curve25519(
                 peer_x.data(), peer_pub_arr.data()) == 0) {

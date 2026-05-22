@@ -48,6 +48,16 @@ message MediaSignal {
     uint32 kind    = 2;
     bytes  payload = 3;
     uint32 epoch   = 4;   // for SFRAME_KEY rotations; ignored otherwise
+
+    // Forwarded-room (Lever B §4/§6A) only: when an elected forwarder sends a
+    // leaf an OFFER, this maps each outbound SDP media section (`mid`) to the
+    // member whose stream it carries, so the leaf opens that track with the
+    // right per-sender SFrame key (fb::media::sender_for_track →
+    // RoomKeyRegistry). It rides inside the ratchet-sealed MediaSignal, so the
+    // relay never sees it (the plaintext top-level RoomOffer.track_bindings is
+    // not used on the wire — it would leak room topology to the server).
+    message TrackBinding { string mid = 1; bytes sender_pubkey = 2; }
+    repeated TrackBinding track_bindings = 5;
 }
 
 // MLS (RFC 9420) handshake bytes wrapped for delivery via the Double

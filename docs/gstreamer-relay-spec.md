@@ -420,10 +420,16 @@ my_pubkey, epoch)`). The existing 1:1 per-call path is untouched.
 3. **Dynamic join/leave + renegotiation (§5)** — `RoomForwarder` does the
    simple "one renegotiation per membership change" form today; the
    pre-allocated transceiver pool is the remaining optimisation.
-4. **Switch the dial plan** to `plan_topology` (leaf → forwarder only)
-   behind a flag; keep mesh as fallback. Includes the chat_client wiring that
-   instantiates `RoomForwarder` on the elected node and routes
-   `RoomOffer`/`RoomAnswer`/`RoomIce` to it.
+4. **Switch the dial plan** to forwarder-routing — **[built, code-complete;
+   compiles, flag-gated `FB_FORWARDER_DIAL`, not runtime-verified]**.
+   `chat_client::apply_room_roster` picks the role from `elect_forwarder`:
+   elected node → `ensure_room_forwarder` (runs `RoomForwarder`); others →
+   dial only the forwarder as a room-mode `MediaCall`. Forwarder↔leaf SDP/ICE
+   rides the ratchet-sealed `DmPayload.media_signal` (never plaintext to the
+   relay), with track→sender bindings inline on `MediaSignal.track_bindings`.
+   *Remaining:* the leaf applying a mid-call renegotiation OFFER needs the §5
+   transceiver/renegotiation work (today it refreshes the key map but not the
+   SDP); keep mesh as the default until verified on hardware.
 5. **Active-speaker forwarding (Lever C)** — only relay top-K publishers;
    reuse the shipped `select_active_speakers` + `plan_forwarded_video`.
 

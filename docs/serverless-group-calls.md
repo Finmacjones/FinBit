@@ -185,16 +185,22 @@ relay you already run) to forward.
       (NO decoder → forwarder stays blind), a `queue → rtpopuspay →
       subscriber` branch per edge, offer/answer/ICE + renegotiation, and a
       `trackBinding` signal feeding each subscriber's `RoomOffer.track_bindings`
-      (§6A.3). *Remaining:* chat_client wiring (instantiate on the elected
-      node; route `RoomOffer`/`RoomAnswer`/`RoomIce`; switch the dial plan to
-      `plan_topology`), the §5 transceiver-pool optimisation, and live
+      (§6A.3). *Remaining:* the §5 transceiver-pool optimisation and live
       multi-machine verification (loopback + hardware tests, §8).
       **Full spec: `docs/gstreamer-relay-spec.md`.**
-- [ ] **Lever B:** wire `RoomOffer`/`RoomAnswer`/`RoomIce` for the
-      participant ↔ forwarder media handshake (depends on the relay
-      pipeline)
-- [ ] **Lever B:** switch the dial plan to `plan_topology` (leaf → dial
-      only the forwarder) once the relay pipeline can carry it
+- [x] **Lever B:** chat_client wiring — **built, code-complete (compiles;
+      flag-gated, not runtime-verified)**. Behind `FB_FORWARDER_DIAL` (mesh
+      stays the default), `apply_room_roster` switches the dial plan on the
+      election result: the elected node calls `ensure_room_forwarder` (runs a
+      `RoomForwarder`), everyone else dials ONLY the forwarder as a room-mode
+      `MediaCall` (`set_room_context` with the room's `RoomKeyRegistry`). The
+      forwarder↔leaf SDP/ICE rides the existing **ratchet-sealed**
+      `DmPayload.media_signal` (so the relay never sees it — the plaintext
+      top-level `RoomOffer`/`Answer`/`Ice` frames are *not* used), with
+      track→sender bindings carried inline on `MediaSignal.track_bindings`;
+      the leaf feeds them into its key map. *Remaining:* the leaf applying a
+      mid-call renegotiation OFFER needs §5 (today it updates the key map but
+      not the SDP), plus live verification.
 - [ ] **Lever B:** measured uplink probe (today `uplink_class` is a
       declared hint, not a measurement)
 - [x] **Lever C:** selective-forwarding **plan** — `fb::media::plan_forwarded_video`

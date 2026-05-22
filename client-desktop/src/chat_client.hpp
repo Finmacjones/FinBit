@@ -289,6 +289,11 @@ private:
     // the room-wide level map, and recompute who stays audible vs gated.
     void wire_call_levels(MediaCall* call, const std::string& peer_key);
     void reselect_active_speakers();
+
+    // Forwarder role (Lever B §4): create (once) the RoomForwarder we run for
+    // `room_id` because we were elected its forwarder, and connect its
+    // signals to the media-signal queue. Runs on the UI thread.
+    void ensure_room_forwarder(const std::string& room_id);
 };
 
 }  // namespace fb::desktop
