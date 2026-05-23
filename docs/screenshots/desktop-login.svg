@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 460" width="640" height="460" font-family="'IBM Plex Mono','SFMono-Regular',Consolas,monospace">
+  <defs>
+    <pattern id="scanL" width="3" height="3" patternUnits="userSpaceOnUse">
+      <rect width="3" height="1" fill="#00ff9d" opacity="0.04"/>
+    </pattern>
+    <radialGradient id="vigL" cx="50%" cy="50%" r="70%">
+      <stop offset="50%" stop-color="#000" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#000" stop-opacity="0.6"/>
+    </radialGradient>
+    <style>
+      text{fill:#9fd9b8}
+      .brand{fill:#00ff9d}.muted{fill:#4f8568}.dimtxt{fill:#2f5a44}
+      .b{font-weight:600}
+    </style>
+  </defs>
+
+  <rect width="640" height="460" fill="#050807"/>
+
+  <!-- modal -->
+  <g>
+    <rect x="140" y="86" width="360" height="288" fill="#0a0f0c" stroke="#00ff9d"/>
+    <!-- terminal chrome -->
+    <rect x="140" y="86" width="360" height="26" fill="#050807"/>
+    <line x1="140" y1="112" x2="500" y2="112" stroke="#163322"/>
+    <circle cx="156" cy="99" r="4" fill="#163322"/>
+    <circle cx="170" cy="99" r="4" fill="#163322"/>
+    <circle cx="184" cy="99" r="4" fill="#163322"/>
+    <text x="206" y="103" class="brand" font-size="10">~/finbit/connect</text>
+    <text x="486" y="103" text-anchor="end" class="muted" font-size="11">x</text>
+
+    <!-- title -->
+    <text x="164" y="146" font-size="11" class="muted" letter-spacing="1px">FINBIT // SEALED-BY-DEFAULT</text>
+    <text x="164" y="172" font-size="20"><tspan class="muted">// </tspan><tspan class="brand b">CONNECT</tspan></text>
+
+    <!-- server field -->
+    <text x="164" y="200" font-size="10" class="muted"><tspan class="brand">$ </tspan>SERVER</text>
+    <rect x="164" y="208" width="312" height="30" fill="#000" stroke="#00ff9d"/>
+    <text x="176" y="228" class="brand" font-size="12">wss://relay.finbit.chat:443</text>
+
+    <!-- user field -->
+    <text x="164" y="258" font-size="10" class="muted"><tspan class="brand">$ </tspan>USER</text>
+    <rect x="164" y="266" width="312" height="30" fill="#000" stroke="#163322"/>
+    <text x="176" y="286" class="brand" font-size="12">bob<tspan class="brand">▮</tspan></text>
+
+    <!-- checks -->
+    <rect x="164" y="312" width="16" height="16" fill="#112019" stroke="#00ff9d"/>
+    <text x="172" y="324" text-anchor="middle" class="brand" font-size="10">x</text>
+    <text x="188" y="324" class="muted" font-size="12">WSS</text>
+    <rect x="252" y="312" width="16" height="16" fill="#000" stroke="#1f5036"/>
+    <text x="276" y="324" class="muted" font-size="12">Pin a TLS CA</text>
+
+    <!-- footer -->
+    <text x="164" y="358" class="brand" font-size="11">&gt; I have a recovery code</text>
+    <rect x="386" y="342" width="90" height="24" fill="#00ff9d" stroke="#00ff9d"/>
+    <text x="431" y="358" text-anchor="middle" font-size="11" fill="#001b10" class="b">[ CONNECT ]</text>
+  </g>
+
+  <!-- CRT scanlines + vignette -->
+  <rect width="640" height="460" fill="url(#scanL)"/>
+  <rect width="640" height="460" fill="url(#vigL)"/>
+</svg>

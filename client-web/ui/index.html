@@ -4,7 +4,19 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>FinBit</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
+    <!-- Set the CRT effect state before paint to avoid a flash. 'off'/'on'
+         persisted in localStorage; unset = default (effects on, but the OS
+         reduced-motion preference still calms the animated bits via CSS). -->
+    <script>
+      try {
+        var c = localStorage.getItem("fb-crt");
+        if (c === "off" || c === "on") document.documentElement.dataset.crt = c;
+      } catch (e) {}
+    </script>
 </head>
 <body>
     <!-- Login overlay — gates the chat UI until the user unlocks an
@@ -237,6 +249,13 @@
                 <div id="notifications-status" class="kv">disabled</div>
             </div>
             <div class="settings-block">
+                <div class="settings-block-title">Appearance</div>
+                <div class="crt-toggle is-on" id="crt-toggle" role="switch" aria-checked="true">
+                    <span class="box"></span> CRT effects
+                </div>
+                <div class="kv">scanlines · phosphor flicker · glitch-in</div>
+            </div>
+            <div class="settings-block">
                 <div class="settings-block-title">TURN server (optional, for symmetric NATs)</div>
                 <input id="turn-url"  placeholder="turn:turn.example.com:3478">
                 <input id="turn-user" placeholder="username">
@@ -259,6 +278,40 @@
         </aside>
     </div>
 
+    <!-- CRT scanline + vignette overlay (covers the whole app; pointer-transparent) -->
+    <div id="crt-overlay" aria-hidden="true"></div>
+
+    <!-- CRT toggle wiring (classic script; runs after the toggle exists). -->
+    <script>
+      (function () {
+        var el = document.getElementById("crt-toggle");
+        if (!el) return;
+        var root = document.documentElement;
+        function reduced() {
+          return window.matchMedia &&
+                 window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        }
+        // Effective on/off: explicit data-crt wins; else off when reduced-motion.
+        function isOn() {
+          var d = root.dataset.crt;
+          if (d === "on") return true;
+          if (d === "off") return false;
+          return !reduced();
+        }
+        function sync() {
+          var on = isOn();
+          el.classList.toggle("is-on", on);
+          el.setAttribute("aria-checked", on ? "true" : "false");
+        }
+        el.addEventListener("click", function () {
+          var on = !isOn();
+          root.dataset.crt = on ? "on" : "off";
+          try { localStorage.setItem("fb-crt", on ? "on" : "off"); } catch (e) {}
+          sync();
+        });
+        sync();
+      })();
+    </script>
     <script type="module" src="app.js"></script>
 </body>
 </html>

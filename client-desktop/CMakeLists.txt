@@ -53,6 +53,7 @@ add_executable(fb_desktop
     src/login_dialog.cpp
     src/media_call.cpp
     src/room_forwarder.cpp
+    src/crt_overlay.cpp
     src/bip39.cpp
     src/bip39_wordlist.cpp
 )

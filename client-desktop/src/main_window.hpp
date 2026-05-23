@@ -28,6 +28,8 @@ struct ConvKey {
     static QString chan(const QString& channel_name)  { return "chan:" + channel_name; }
 };
 
+class CrtOverlay;   // animated CRT scanline/flicker layer (crt_overlay.hpp)
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
@@ -96,6 +98,10 @@ private slots:
     void onChannelCallRoster(const QString& channel, const QStringList& fingerprints);
     void onMuteToggled();
     void onToggleLog();
+
+protected:
+    // Keep the click-through CRT overlay sized to + on top of the window.
+    void resizeEvent(QResizeEvent* e) override;
 
 private:
     void selectConversation(const QString& key);
@@ -176,6 +182,10 @@ private:
     // Log pane (toggle).
     QWidget*        log_panel_   = nullptr;
     QPlainTextEdit* log_view_    = nullptr;
+
+    // Animated CRT layer (scanlines + flicker), painted over everything.
+    // Toggled via View ▸ CRT effects; persisted in QSettings.
+    CrtOverlay*     crt_overlay_ = nullptr;
 
     QString my_fingerprint_;
     QString my_username_;

@@ -42,10 +42,16 @@ let currentConv = "dm:alice";
 // Map channelHex -> friendly name for the sidebar / chat header.
 const channelNames = new Map();
 
+// Tracks the last-rendered conversation + length so we only play the CRT
+// glitch-in on a genuinely new message (not on conversation switches or
+// unrelated re-renders).
+let _crtLastConv = null, _crtLastLen = 0;
+
 function renderMessages() {
     const ul = $("messages");
     ul.innerHTML = "";
     const convo = conversations[currentConv] || [];
+    const isNewMsg = currentConv === _crtLastConv && convo.length > _crtLastLen;
     for (const m of convo) {
         const li = document.createElement("li");
         li.className = "message-row";
@@ -60,6 +66,12 @@ function renderMessages() {
             <div class="message-body">${escapeHtml(m.body)}</div>`;
         ul.appendChild(li);
     }
+    // CRT glitch-in for the newest row (CSS gates it on data-crt / reduced-motion).
+    if (isNewMsg && ul.lastElementChild) {
+        ul.lastElementChild.classList.add("crt-glitch-in");
+    }
+    _crtLastConv = currentConv;
+    _crtLastLen = convo.length;
     paintAvatars(ul);
     ul.scrollTop = ul.scrollHeight;
 }

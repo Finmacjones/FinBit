@@ -1,8 +1,9 @@
 # FinBit
 
 End-to-end encrypted, mesh-bridged, eventually-decentralized chat. Discord-style
-UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
-+ server) and to WebAssembly (browser). Voice + video over real WebRTC.
+layout in a phosphor-terminal (CRT) theme, Signal-grade crypto, your own relay.
+**C++20** core compiled native (desktop + server) and to WebAssembly (browser).
+Voice + video over real WebRTC.
 
 > **Status:** prototype. The cryptography uses well-vetted primitives
 > (libsodium Ed25519 / X25519 / XChaCha20-Poly1305 / Argon2id, signal Double
@@ -12,8 +13,13 @@ UI, Signal-grade crypto, your own relay. **C++20** core compiled native (desktop
 
 |  | desktop (Qt6) | web (WASM) |
 |---|---|---|
-| Login dialog | <img src="docs/screenshots/desktop-login.png" width="320"/> | (similar — `client-web/ui/login_ui.js`) |
-| Main UI | <img src="docs/screenshots/desktop-main.png" width="640"/> | Discord-style HTML/CSS/JS in `client-web/ui/` |
+| Login / connect | <img src="docs/screenshots/desktop-login.svg" width="320"/> | (similar — `client-web/ui/login_ui.js`) |
+| Main UI | <img src="docs/screenshots/desktop-main.svg" width="640"/> | phosphor-terminal HTML/CSS/JS in `client-web/ui/` |
+
+*Shown in the **phosphor / CRT "terminal"** theme. Toggle the scanline + flicker
+effects in **View ▸ CRT effects** (desktop) or **Settings ▸ Appearance** (web) —
+"off" also respects `prefers-reduced-motion`. (Vector UI mockups; swap in live
+captures anytime.)*
 
 > The connect bar's `TLS / (insecure) / CA…` trio drives a direct
 > `wss://` to the relay (no reverse proxy needed). The channel-create
@@ -484,7 +490,7 @@ core/                         shared C++20 library (crypto, proto, net,
                               p2p, media SFrame, mesh, store, ratelimit)
 server/                       fb_server — single-process epoll relay
 client-desktop/               fb_desktop — Qt6 client with login + calls
-client-web/                   WASM module + Discord-style HTML/CSS/JS UI
+client-web/                   WASM module + phosphor-terminal HTML/CSS/JS UI
 client-mobile-android/        Kotlin/Compose scaffold (NDK pending)
 tools/                        fb-cli, mesh-loopback, e2e shell demos
 docs/                         architecture, protocol-spec, threat-model,

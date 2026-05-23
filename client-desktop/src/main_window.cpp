@@ -21,13 +21,17 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPixmap>
+#include <QResizeEvent>
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QVBoxLayout>
 #include <QWidget>
 
+#include <QSettings>
+
 #include "avatar.hpp"
+#include "crt_overlay.hpp"
 #include "discord_theme.hpp"
 #include "bip39.hpp"
 #include "identity_vault.hpp"
@@ -431,6 +435,23 @@ MainWindow::MainWindow(QWidget* parent)
     QObject::connect(recover_act, &QAction::triggered, this, &MainWindow::onShowRecoveryCode);
     QObject::connect(signout_act, &QAction::triggered, this, &MainWindow::onSignOut);
 
+    // CRT effects: a click-through scanline/flicker overlay over the whole
+    // window, toggled from View ▸ CRT effects and persisted in QSettings.
+    crt_overlay_ = new CrtOverlay(this);
+    crt_overlay_->setGeometry(rect());
+    crt_overlay_->raise();
+    QSettings settings("FinBit", "FinBit");
+    const bool crt_on = settings.value("ui/crt_effects", true).toBool();
+    auto* view_menu = menuBar()->addMenu("&View");
+    auto* crt_act = view_menu->addAction("&CRT effects");
+    crt_act->setCheckable(true);
+    crt_act->setChecked(crt_on);
+    crt_overlay_->setEffectsEnabled(crt_on);
+    QObject::connect(crt_act, &QAction::toggled, this, [this](bool on) {
+        crt_overlay_->setEffectsEnabled(on);
+        QSettings("FinBit", "FinBit").setValue("ui/crt_effects", on);
+    });
+
     QObject::connect(call_voice_btn_, &QPushButton::clicked, this,
                      &MainWindow::onCallVoiceClicked);
     QObject::connect(call_video_btn_, &QPushButton::clicked, this,
@@ -449,6 +470,14 @@ MainWindow::MainWindow(QWidget* parent)
             remote_video_->show();
             remote_video_->setPixmap(QPixmap::fromImage(f));
         });
+}
+
+void MainWindow::resizeEvent(QResizeEvent* e) {
+    QMainWindow::resizeEvent(e);
+    if (crt_overlay_) {
+        crt_overlay_->setGeometry(rect());   // cover the whole window
+        crt_overlay_->raise();               // stay above all panes
+    }
 }
 
 // ============================================================================
