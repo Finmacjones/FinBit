@@ -57,6 +57,7 @@
 #include "fb/p2p/channel_gossip.hpp"
 #include "fb/p2p/dht_node.hpp"
 #include "fb/p2p/gossip.hpp"
+#include "fb/p2p/lan_discovery.hpp"
 #include "fb/p2p/offline_relay.hpp"
 #include "fb/p2p/peer_net.hpp"
 #include "fb/p2p/provider_records.hpp"
@@ -597,6 +598,14 @@ struct ChatClient::Impl {
     // (or instead of) the central server's chan_subscribe path.
     std::unique_ptr<fb::p2p::P2PNode>             gossip;
 
+    // Zero-config LAN federation: a multicast beacon discovers other FinBit
+    // nodes on the same network and queues their gossip address for the worker
+    // to dial. Default-on (disable with FB_NO_OVERLAY / FB_NO_LAN_DISCOVERY).
+    std::unique_ptr<fb::p2p::LanDiscovery>        lan_discovery;
+    std::mutex                                     lan_mu;
+    std::vector<std::pair<std::string, std::uint16_t>> lan_dial_queue;  // guarded by lan_mu
+    std::set<std::string>                          lan_dialed;          // "ip:port" already dialed
+
     // Periodic overlay maintenance state.
     std::uint64_t                                  last_self_publish_ms = 0;
     std::uint64_t                                  last_gossip_pull_ms  = 0;
@@ -1069,10 +1078,21 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // topic messages route through try_decrypt_dm_text
             // (channel envelopes are also wire-form Envelope; the
             // helper handles the same crypto path).
+            // Serverless overlay — ON BY DEFAULT for zero-config federation:
+            // a gossip node on a default port + LAN multicast discovery, so
+            // launching the desktop joins the mesh with no env vars and no
+            // addresses to type. FB_NO_OVERLAY disables it; FB_GOSSIP_PORT
+            // overrides the listen port ("0" also disables). Wrapped in
+            // try/catch so an overlay failure (e.g. port in use) never breaks
+            // the core relay connection.
             const std::string gport_str = env("FB_GOSSIP_PORT");
-            if (!gport_str.empty()) {
-                const auto gport = static_cast<std::uint16_t>(
-                    std::atoi(gport_str.c_str()));
+            const bool overlay_enabled =
+                env("FB_NO_OVERLAY").empty() && gport_str != "0";
+            if (overlay_enabled) {
+              const std::uint16_t gport = gport_str.empty()
+                  ? std::uint16_t{47475}
+                  : static_cast<std::uint16_t>(std::atoi(gport_str.c_str()));
+              try {
                 impl_->gossip = std::make_unique<fb::p2p::P2PNode>(
                     "0.0.0.0", gport,
                     std::span<const std::uint8_t>(
@@ -1114,7 +1134,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 impl_->gossip->start();
                 emit log(QString("gossip P2PNode started on :%1")
                              .arg(gport));
-                // Bootstrap: dial out to FB_GOSSIP_DIAL peers (CSV).
+                // Manual bootstrap peers (CSV) — still honored for WAN seeding.
                 const std::string dials = env("FB_GOSSIP_DIAL");
                 std::size_t pos = 0;
                 while (pos < dials.size()) {
@@ -1129,6 +1149,35 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         static_cast<std::uint16_t>(
                             std::atoi(pair.c_str() + colon + 1)));
                 }
+
+                // Zero-config LAN federation: announce ourselves + discover
+                // peers on the local network via multicast, and queue each for
+                // the worker to gossip-dial (same thread as the dials above).
+                if (env("FB_NO_LAN_DISCOVERY").empty()) {
+                    std::array<std::uint8_t, 32> selfpub{};
+                    std::memcpy(selfpub.data(),
+                                impl_->identity->public_key().data(), 32);
+                    impl_->lan_discovery =
+                        std::make_unique<fb::p2p::LanDiscovery>(
+                            selfpub, gport, /*relay_port=*/8765,
+                            [this](const fb::p2p::LanPeer& peer) {
+                                if (peer.gossip_port == 0) return;
+                                std::lock_guard lk(impl_->lan_mu);
+                                impl_->lan_dial_queue.push_back(
+                                    {peer.ip, peer.gossip_port});
+                                impl_->cv.notify_all();
+                            });
+                    if (impl_->lan_discovery->start()) {
+                        emit log("LAN discovery on "
+                                 "(multicast 239.255.77.77:47474)");
+                    } else {
+                        emit log("LAN discovery unavailable (no multicast)");
+                    }
+                }
+              } catch (const std::exception& e) {
+                emit log(QString("overlay disabled — startup failed: %1")
+                             .arg(e.what()));
+              }
             }
             const bool any_peer_env =
                 !peer_port_str.empty() || !peer_cert.empty() ||
@@ -3880,6 +3929,25 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     }
                 }
 
+                // 1-pre-b. Dial LAN-discovered gossip peers (queued by the
+                // multicast discovery thread). gossip->dial is called here on
+                // the worker — same context as the bootstrap dials above — and
+                // de-duped so we don't redial a peer we already know.
+                if (impl_->gossip) {
+                    std::vector<std::pair<std::string, std::uint16_t>> dials;
+                    {
+                        std::lock_guard lk(impl_->lan_mu);
+                        dials.swap(impl_->lan_dial_queue);
+                    }
+                    for (auto& [ip, gport] : dials) {
+                        const std::string key = ip + ":" + std::to_string(gport);
+                        if (!impl_->lan_dialed.insert(key).second) continue;  // already
+                        impl_->gossip->dial(ip, gport);
+                        emit log(QString("LAN peer discovered → gossip-dial %1")
+                                     .arg(QString::fromStdString(key)));
+                    }
+                }
+
                 // 1a. Drain pending media-signal sends.
                 {
                     std::deque<PendingMediaSignal> ms;
@@ -4986,6 +5054,10 @@ void ChatClient::disconnect() {
     }
     impl_->calls_by_peer.clear();
     impl_->room_mesh_peers.clear();
+    // Stop the LAN beacon first (it only feeds the dial queue), then the
+    // gossip node, before joining the worker. Each stop() joins its own thread.
+    if (impl_->lan_discovery) impl_->lan_discovery->stop();
+    if (impl_->gossip) impl_->gossip->stop();
     impl_->running = false;
     impl_->cv.notify_all();
     if (impl_->worker.joinable()) impl_->worker.join();

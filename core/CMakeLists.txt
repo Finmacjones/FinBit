@@ -96,6 +96,7 @@ add_library(fb_core STATIC
     src/p2p/peer_net.cpp
     src/p2p/offline_relay.cpp
     src/p2p/channel_gossip.cpp
+    src/p2p/lan_discovery.cpp
     src/identity/username_log.cpp
     src/identity/username_gossip.cpp
     src/net/tls_client.cpp

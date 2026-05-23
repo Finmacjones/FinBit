@@ -37,6 +37,7 @@ add_executable(fb_core_tests
     p2p/offline_relay_test.cpp
     p2p/channel_gossip_test.cpp
     p2p/room_beacon_leak_test.cpp
+    p2p/lan_discovery_test.cpp
 )
 
 # Serial-bridge test uses posix_openpt + ptmx PTY plumbing — POSIX
