@@ -35,6 +35,9 @@
 #include "discord_theme.hpp"
 #include "bip39.hpp"
 #include "identity_vault.hpp"
+#if FB_HAVE_EMBEDDED_RELAY
+#  include "embedded_relay.hpp"
+#endif
 #include "login_dialog.hpp"
 #include "message_delegate.hpp"
 
@@ -452,6 +455,45 @@ MainWindow::MainWindow(QWidget* parent)
         QSettings("FinBit", "FinBit").setValue("ui/crt_effects", on);
     });
 
+#if FB_HAVE_EMBEDDED_RELAY
+    // In-app relay: launching the desktop also hosts a network node, so the
+    // connect fields (default 127.0.0.1:8765) point straight at it — users
+    // just start the client and they're on the network. Default-on, persisted,
+    // and bound to all interfaces so other devices can connect too. A relay is
+    // a public listener by design; the View toggle turns it off.
+    embedded_relay_ = std::make_unique<EmbeddedRelay>();
+    QSettings relay_settings("FinBit", "FinBit");
+    const bool relay_on = relay_settings.value("relay/host_in_app", true).toBool();
+    const auto relay_port =
+        static_cast<std::uint16_t>(relay_settings.value("relay/port", 8765).toUInt());
+    auto start_embedded = [this, relay_port]() {
+        fb::server::RelayConfig cfg;
+        cfg.bind_host = "0.0.0.0";   // reachable by other devices on the network
+        cfg.port = relay_port;
+        embedded_relay_->start(cfg);
+        // Point the connect fields at our own relay (loopback).
+        host_edit_->setText("127.0.0.1");
+        port_spin_->setValue(relay_port);
+        appendLog(QString("in-app relay hosting on 0.0.0.0:%1 — others can "
+                          "connect to <your-ip>:%1; you're on 127.0.0.1:%1")
+                      .arg(relay_port));
+    };
+    auto* relay_act = view_menu->addAction("Host &relay in-app");
+    relay_act->setCheckable(true);
+    relay_act->setChecked(relay_on);
+    if (relay_on) start_embedded();
+    QObject::connect(relay_act, &QAction::toggled, this,
+                     [this, start_embedded](bool on) {
+        QSettings("FinBit", "FinBit").setValue("relay/host_in_app", on);
+        if (on) {
+            start_embedded();
+        } else {
+            embedded_relay_->stop();
+            appendLog("in-app relay stopped");
+        }
+    });
+#endif
+
     QObject::connect(call_voice_btn_, &QPushButton::clicked, this,
                      &MainWindow::onCallVoiceClicked);
     QObject::connect(call_video_btn_, &QPushButton::clicked, this,
@@ -479,6 +521,10 @@ void MainWindow::resizeEvent(QResizeEvent* e) {
         crt_overlay_->raise();               // stay above all panes
     }
 }
+
+// Out-of-line so unique_ptr<EmbeddedRelay> sees the complete type here (the
+// relay thread is stopped + joined in EmbeddedRelay's destructor).
+MainWindow::~MainWindow() = default;
 
 // ============================================================================
 // Slots & helpers

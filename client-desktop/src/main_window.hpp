@@ -28,12 +28,14 @@ struct ConvKey {
     static QString chan(const QString& channel_name)  { return "chan:" + channel_name; }
 };
 
-class CrtOverlay;   // animated CRT scanline/flicker layer (crt_overlay.hpp)
+class CrtOverlay;     // animated CRT scanline/flicker layer (crt_overlay.hpp)
+class EmbeddedRelay;  // in-app relay on a background thread (embedded_relay.hpp)
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     explicit MainWindow(QWidget* parent = nullptr);
+    ~MainWindow() override;   // out-of-line for unique_ptr<EmbeddedRelay>
 
     // One rendered line in a conversation buffer. Public so the message
     // delegate / item-fill helper can name it. image_bytes empty = text.
@@ -186,6 +188,10 @@ private:
     // Animated CRT layer (scanlines + flicker), painted over everything.
     // Toggled via View ▸ CRT effects; persisted in QSettings.
     CrtOverlay*     crt_overlay_ = nullptr;
+
+    // In-app relay: runs the network node on a background thread so launching
+    // the desktop also hosts the relay. Null when the feature is compiled out.
+    std::unique_ptr<EmbeddedRelay> embedded_relay_;
 
     QString my_fingerprint_;
     QString my_username_;

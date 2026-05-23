@@ -83,4 +83,18 @@ target_link_libraries(fb_desktop
 if(FB_HAVE_GSTREAMER)
     target_link_libraries(fb_desktop PRIVATE PkgConfig::GSTREAMER)
 endif()
+
+# In-app relay: if the relay library was built (FB_BUILD_SERVER on, on a
+# platform where it compiles), link it so the desktop can host the network
+# alongside the client (Settings ▸ host a relay). Otherwise the desktop is a
+# pure client and the feature compiles out.
+if(TARGET fb_relay)
+    target_link_libraries(fb_desktop PRIVATE fb_relay)
+    target_compile_definitions(fb_desktop PRIVATE FB_HAVE_EMBEDDED_RELAY=1)
+    message(STATUS "fb_desktop: in-app relay enabled (links fb_relay)")
+else()
+    target_compile_definitions(fb_desktop PRIVATE FB_HAVE_EMBEDDED_RELAY=0)
+    message(STATUS "fb_desktop: in-app relay unavailable (fb_relay not built)")
+endif()
+
 target_compile_features(fb_desktop PRIVATE cxx_std_20)
