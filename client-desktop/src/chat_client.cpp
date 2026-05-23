@@ -793,6 +793,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                               const QString& sni_hostname,
                               bool use_wss) {
     if (impl_->running.exchange(true)) return;
+    // A previous attempt's worker may have finished (it sets running=false on
+    // exit) yet its std::thread is still joinable — assigning a new thread over
+    // a joinable one calls std::terminate(), which is exactly the crash seen
+    // when retrying after a failed connect. Reap the finished worker first;
+    // since running was false it has already exited, so this returns at once.
+    if (impl_->worker.joinable()) impl_->worker.join();
     impl_->host = host;
     impl_->port = port;
     impl_->username = user;

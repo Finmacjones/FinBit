@@ -75,6 +75,11 @@ public:
     ~SerialBridge() override { stop(); }
 
     bool start() override {
+        // Already started: reader_ holds a live thread. Reassigning it below
+        // would destroy a joinable std::thread → std::terminate(). running_ is
+        // set only on a *successful* start, so a prior failed start (running_
+        // still false) correctly falls through and retries.
+        if (running_) return true;
 #if defined(_WIN32)
         const std::string winp = normalise_com_path(path_);
         handle_ = ::CreateFileA(winp.c_str(),
