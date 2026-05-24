@@ -29,7 +29,9 @@ struct ConvKey {
 };
 
 class CrtOverlay;     // animated CRT scanline/flicker layer (crt_overlay.hpp)
+#if FB_HAVE_EMBEDDED_RELAY
 class EmbeddedRelay;  // in-app relay on a background thread (embedded_relay.hpp)
+#endif
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -190,8 +192,12 @@ private:
     CrtOverlay*     crt_overlay_ = nullptr;
 
     // In-app relay: runs the network node on a background thread so launching
-    // the desktop also hosts the relay. Null when the feature is compiled out.
+    // the desktop also hosts the relay. Only present where the relay library is
+    // available (FB_HAVE_EMBEDDED_RELAY); pure-client builds (e.g. Windows
+    // without fb_relay) compile it out entirely.
+#if FB_HAVE_EMBEDDED_RELAY
     std::unique_ptr<EmbeddedRelay> embedded_relay_;
+#endif
 
     QString my_fingerprint_;
     QString my_username_;
