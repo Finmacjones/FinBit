@@ -999,22 +999,22 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             //                         still works for OTHERS to
             //                         find us if they get our addr
             //                         out-of-band (bootstrap file).
-            auto env = [](const char* k) -> std::string {
+            auto env_of = [](const char* k) -> std::string {
                 const char* v = std::getenv(k);
                 return v ? v : std::string();
             };
-            const std::string peer_port_str = env("FB_PEER_LISTEN_PORT");
-            const std::string peer_cert     = env("FB_PEER_LISTEN_CERT");
-            const std::string peer_key      = env("FB_PEER_LISTEN_KEY");
-            const std::string peer_host     = env("FB_PEER_LISTEN_HOST");
-            const std::string dialer_ca     = env("FB_PEER_DIALER_CA");
-            const bool dialer_insecure      = !env("FB_PEER_DIALER_INSECURE").empty();
-            const bool dialer_wss           = !env("FB_PEER_WSS").empty() &&
-                                              env("FB_PEER_WSS") != "0";
-            const std::string dialer_front  = env("FB_PEER_FRONT_SNI");
-            const std::string dialer_wshost = env("FB_PEER_WS_HOST");
-            const std::string dialer_mimic  = env("FB_PEER_TLS_MIMIC");
-            impl_->own_p2p_addr             = env("FB_PEER_PUBLIC_ADDR");
+            const std::string peer_port_str = env_of("FB_PEER_LISTEN_PORT");
+            const std::string peer_cert     = env_of("FB_PEER_LISTEN_CERT");
+            const std::string peer_key      = env_of("FB_PEER_LISTEN_KEY");
+            const std::string peer_host     = env_of("FB_PEER_LISTEN_HOST");
+            const std::string dialer_ca     = env_of("FB_PEER_DIALER_CA");
+            const bool dialer_insecure      = !env_of("FB_PEER_DIALER_INSECURE").empty();
+            const bool dialer_wss           = !env_of("FB_PEER_WSS").empty() &&
+                                              env_of("FB_PEER_WSS") != "0";
+            const std::string dialer_front  = env_of("FB_PEER_FRONT_SNI");
+            const std::string dialer_wshost = env_of("FB_PEER_WS_HOST");
+            const std::string dialer_mimic  = env_of("FB_PEER_TLS_MIMIC");
+            impl_->own_p2p_addr             = env_of("FB_PEER_PUBLIC_ADDR");
 
             // I4: parse FB_OFFLINE_RELAYS as a comma-separated list
             // of hex pubkeys (64 hex chars each). Each declared
@@ -1023,7 +1023,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // offline. Quietly skip malformed entries — bad CSV
             // shouldn't break startup.
             {
-                const std::string csv = env("FB_OFFLINE_RELAYS");
+                const std::string csv = env_of("FB_OFFLINE_RELAYS");
                 std::size_t pos = 0;
                 while (pos < csv.size()) {
                     auto end = csv.find(',', pos);
@@ -1085,9 +1085,9 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // overrides the listen port ("0" also disables). Wrapped in
             // try/catch so an overlay failure (e.g. port in use) never breaks
             // the core relay connection.
-            const std::string gport_str = env("FB_GOSSIP_PORT");
+            const std::string gport_str = env_of("FB_GOSSIP_PORT");
             const bool overlay_enabled =
-                env("FB_NO_OVERLAY").empty() && gport_str != "0";
+                env_of("FB_NO_OVERLAY").empty() && gport_str != "0";
             if (overlay_enabled) {
               const std::uint16_t gport = gport_str.empty()
                   ? std::uint16_t{47475}
@@ -1135,7 +1135,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 emit log(QString("gossip P2PNode started on :%1")
                              .arg(gport));
                 // Manual bootstrap peers (CSV) — still honored for WAN seeding.
-                const std::string dials = env("FB_GOSSIP_DIAL");
+                const std::string dials = env_of("FB_GOSSIP_DIAL");
                 std::size_t pos = 0;
                 while (pos < dials.size()) {
                     auto end = dials.find(',', pos);
@@ -1153,7 +1153,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 // Zero-config LAN federation: announce ourselves + discover
                 // peers on the local network via multicast, and queue each for
                 // the worker to gossip-dial (same thread as the dials above).
-                if (env("FB_NO_LAN_DISCOVERY").empty()) {
+                if (env_of("FB_NO_LAN_DISCOVERY").empty()) {
                     std::array<std::uint8_t, 32> selfpub{};
                     std::memcpy(selfpub.data(),
                                 impl_->identity->public_key().data(), 32);
@@ -1609,7 +1609,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // Cheap (one Frame{room_roster} per active room per cycle)
             // and bounded — no per-peer pairing.
             constexpr std::uint64_t kRoomPresenceRepublishMs = 25 * 1000;
-            auto now_ms = []() {
+            auto now_ms_fn = []() {
                 return static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now()
@@ -1633,7 +1633,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         auto rec = fb::p2p::build_record(
                             sig_pub, sig_priv,
                             std::vector<std::string>{impl_->own_p2p_addr},
-                            now_ms(),
+                            now_ms_fn(),
                             fb::p2p::kDefaultProviderTtlMs,
                             impl_->own_offline_relays);
                         auto sent = impl_->dht->publish(rec);
@@ -1674,7 +1674,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             impl_->x25519.pub.data(), 32),
                         std::span<const std::uint8_t>(
                             spk_sig.data(), spk_sig_len),
-                        now_ms(),
+                        now_ms_fn(),
                         fb::p2p::kDefaultProviderTtlMs);
                     auto pksent = impl_->dht->publish_prekey(pkrec);
                     emit log(QString("DHT prekey republish: sent_to=%1")
@@ -1695,8 +1695,10 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     auto it = impl_->gossip_watermark.find(key);
                     const std::uint64_t since =
                         (it != impl_->gossip_watermark.end()) ? it->second : 0;
-                    impl_->username_gossip->sync_with(p, since);
-                    impl_->gossip_watermark[key] = now_ms();
+                    // Fire-and-forget: sync_with already sends via its callback;
+                    // the returned request_id is only for optional correlation.
+                    (void)impl_->username_gossip->sync_with(p, since);
+                    impl_->gossip_watermark[key] = now_ms_fn();
                     ++pulled;
                 }
                 if (pulled > 0) {
@@ -3407,7 +3409,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
 
                 // 0b. Periodic maintenance ticks.
                 {
-                    const auto t = now_ms();
+                    const auto t = now_ms_fn();
                     if (t - impl_->last_self_publish_ms
                             >= kRepublishIntervalMs) {
                         impl_->last_self_publish_ms = t;
@@ -3654,11 +3656,10 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             // survives a restart (own_next_index, own_chain_key).
                             persist_chan_session(op.channel_name, cs);
                             // Persist sent channel message for history replay.
+                            // Reuses the now_ms computed above (same send) — so
+                            // the stored copy and the wire envelope share one
+                            // timestamp, and no inner shadow of now_ms.
                             if (impl_->store) {
-                                const auto now_ms = static_cast<std::uint64_t>(
-                                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::system_clock::now().time_since_epoch())
-                                        .count());
                                 impl_->store->chan_append_inbox(
                                     std::span<const std::uint8_t>(cs.id.data(), cs.id.size()),
                                     std::span<const std::uint8_t>(
