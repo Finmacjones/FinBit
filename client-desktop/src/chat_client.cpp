@@ -68,6 +68,7 @@
 #include "fb/media/active_speaker.hpp"
 #include "fb/media/forwarder.hpp"
 #include "fb/media/room_keys.hpp"
+#include "fb/mesh/bridge.hpp"
 #include "room_forwarder.hpp"
 #include "handshake.pb.h"
 #include "sender_keys.pb.h"
@@ -607,6 +608,11 @@ struct ChatClient::Impl {
     // nodes on the same network and queues their gossip address for the worker
     // to dial. Default-on (disable with FB_NO_OVERLAY / FB_NO_LAN_DISCOVERY).
     std::unique_ptr<fb::p2p::LanDiscovery>        lan_discovery;
+
+    // LoRa / MeshCore companion bridge. Active when a serial device opens;
+    // null otherwise. Default-on (FB_NO_MESH disables; FB_LORA_DEVICE /
+    // FB_LORA_BAUD override). Off-internet transport — the lifeline tier.
+    std::unique_ptr<fb::mesh::IBridge>            mesh_bridge;
     std::mutex                                     lan_mu;
     std::vector<std::pair<std::string, std::uint16_t>> lan_dial_queue;  // guarded by lan_mu
     std::set<std::string>                          lan_dialed;          // "ip:port" already dialed
@@ -1192,6 +1198,54 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                              .arg(e.what()));
               }
             }
+
+            // MeshCore / Meshtastic LoRa companion bridge — ON BY DEFAULT.
+            // The ultimate anti-censorship transport: radio frames don't
+            // traverse the ISP at all. Tries the standard companion-node
+            // device path; absent hardware → silently skipped (start()
+            // returns false on a failed ::open). FB_NO_MESH disables it;
+            // FB_LORA_DEVICE / FB_LORA_BAUD override the defaults.
+            if (env_of("FB_NO_MESH").empty()) {
+                std::string dev = env_of("FB_LORA_DEVICE");
+                if (dev.empty()) {
+#if defined(_WIN32)
+                    dev = "COM3";
+#else
+                    dev = "/dev/ttyUSB0";
+#endif
+                }
+                std::uint32_t baud = 115200;
+                if (const std::string b = env_of("FB_LORA_BAUD"); !b.empty()) {
+                    baud = static_cast<std::uint32_t>(std::atoi(b.c_str()));
+                }
+                try {
+                    auto br = fb::mesh::make_serial_bridge(dev, baud);
+                    if (br && br->start()) {
+                        br->set_on_frame(
+                            [this](const fb::mesh::MeshFrame& mf) {
+                                emit log(QString(
+                                    "mesh: origin=%1 topic=%2 %3B snr=%4 hops=%5")
+                                    .arg(QString::fromStdString(mf.origin))
+                                    .arg(QString::fromStdString(mf.topic))
+                                    .arg(static_cast<int>(mf.payload.size()))
+                                    .arg(mf.snr_db).arg(mf.hop_limit));
+                            });
+                        impl_->mesh_bridge = std::move(br);
+                        emit log(QString("LoRa mesh bridge on (%1 @ %2 baud)")
+                                     .arg(QString::fromStdString(dev))
+                                     .arg(baud));
+                    } else {
+                        emit log(QString("no LoRa device at %1 — mesh bridge off "
+                                         "(set FB_LORA_DEVICE or plug in a "
+                                         "MeshCore/Meshtastic companion)")
+                                     .arg(QString::fromStdString(dev)));
+                    }
+                } catch (const std::exception& e) {
+                    emit log(QString("mesh bridge init failed: %1")
+                                 .arg(e.what()));
+                }
+            }
+
             const bool any_peer_env =
                 !peer_port_str.empty() || !peer_cert.empty() ||
                 !peer_key.empty() || !dialer_ca.empty() ||
@@ -5070,9 +5124,11 @@ void ChatClient::disconnect() {
     impl_->calls_by_peer.clear();
     impl_->room_mesh_peers.clear();
     // Stop the LAN beacon first (it only feeds the dial queue), then the
-    // gossip node, before joining the worker. Each stop() joins its own thread.
+    // gossip node, then the mesh bridge, before joining the worker. Each
+    // stop() joins its own thread.
     if (impl_->lan_discovery) impl_->lan_discovery->stop();
     if (impl_->gossip) impl_->gossip->stop();
+    if (impl_->mesh_bridge) impl_->mesh_bridge->stop();
     impl_->running = false;
     impl_->cv.notify_all();
     if (impl_->worker.joinable()) impl_->worker.join();
