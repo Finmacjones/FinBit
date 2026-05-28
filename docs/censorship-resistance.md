@@ -378,9 +378,25 @@ Breaking the hybrid root requires breaking BOTH halves; an adversary with
 unbounded classical compute who recovers `ss_x25519` learns nothing about
 `hyb`, and an adversary with a CRQC who recovers nothing about
 `ss_mlkem768` (which requires Bob's PQ secret key — itself PQ-secret)
-learns nothing about `hyb`. Foundation + PQXDH-style end-to-end derivation
-proven by `HybridKem.EndToEndPqxdhStyleMatch`; production wire-up across
-the prekey-bundle/envelope path is the documented follow-on.
+learns nothing about `hyb`.
+
+**Wire-up (fb-cli, live on the wire):**
+* Identity gains a deterministic ML-KEM-768 keypair derived from the
+  long-term Ed25519 seed via HKDF-SHA256 ("FinBit-PQ-seed-v1" info) →
+  64-byte ML-KEM seed → OpenSSL `OSSL_PARAM "seed"` → byte-identical
+  keypair across invocations.
+* `PreKeyBundle.pq_pubkey` + `pq_pubkey_sig` (Ed25519 sig binding the PQ
+  pubkey to the identity) ship in every key upload.
+* Senders verify the binding sig (a relay/MITM that swaps the PQ key is
+  rejected, not silently downgraded), encapsulate against the bundle's
+  `pq_pubkey`, ship the 1088-byte ciphertext in `Envelope.pq_ct`.
+* Receivers decapsulate with their own PQ secret key and HKDF-combine
+  with the X25519 share. Empty `pq_ct` → falls back to pure X25519 (no
+  security loss vs. the pre-PQ codebase; just no PQ harvest-now defense
+  for that one envelope), so old↔new client interop is preserved.
+* Verified end-to-end: `tools/e2e/dm_roundtrip.sh` exercises a real
+  Alice→Bob DM with the hybrid handshake on the live wire, AEAD decrypts,
+  and the server stays blind to the plaintext.
 
 ### Tier 8 — Reproducible builds + signed releases  ✅ shipped
 

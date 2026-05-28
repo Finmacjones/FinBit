@@ -75,18 +75,9 @@ bool ml_kem_768_available() noexcept {
     return ctx != nullptr;
 }
 
-MlKem768Keypair keygen_ml_kem_768() {
-    EvpPkeyCtxPtr ctx{EVP_PKEY_CTX_new_from_name(nullptr, "ML-KEM-768", nullptr)};
-    if (!ctx) throw PqError("EVP_PKEY_CTX_new_from_name(ML-KEM-768): " + openssl_err_msg());
-    if (EVP_PKEY_keygen_init(ctx.get()) <= 0) {
-        throw PqError("EVP_PKEY_keygen_init: " + openssl_err_msg());
-    }
-    EVP_PKEY* pkey_raw = nullptr;
-    if (EVP_PKEY_keygen(ctx.get(), &pkey_raw) <= 0) {
-        throw PqError("EVP_PKEY_keygen(ML-KEM-768): " + openssl_err_msg());
-    }
-    EvpPkeyPtr pkey{pkey_raw};
+namespace {
 
+MlKem768Keypair keygen_from_pkey(EvpPkeyPtr pkey) {
     MlKem768Keypair kp{};
     std::size_t pub_len = kMlKem768PubBytes;
     std::size_t sec_len = kMlKem768SecBytes;
@@ -105,6 +96,44 @@ MlKem768Keypair keygen_ml_kem_768() {
         throw PqError("ML-KEM-768 sec length unexpected");
     }
     return kp;
+}
+
+}  // namespace
+
+MlKem768Keypair keygen_ml_kem_768() {
+    EvpPkeyCtxPtr ctx{EVP_PKEY_CTX_new_from_name(nullptr, "ML-KEM-768", nullptr)};
+    if (!ctx) throw PqError("EVP_PKEY_CTX_new_from_name(ML-KEM-768): " + openssl_err_msg());
+    if (EVP_PKEY_keygen_init(ctx.get()) <= 0) {
+        throw PqError("EVP_PKEY_keygen_init: " + openssl_err_msg());
+    }
+    EVP_PKEY* pkey_raw = nullptr;
+    if (EVP_PKEY_keygen(ctx.get(), &pkey_raw) <= 0) {
+        throw PqError("EVP_PKEY_keygen(ML-KEM-768): " + openssl_err_msg());
+    }
+    return keygen_from_pkey(EvpPkeyPtr{pkey_raw});
+}
+
+MlKem768Keypair keygen_ml_kem_768_from_seed(
+    std::span<const std::uint8_t, kMlKem768SeedBytes> seed) {
+    EvpPkeyCtxPtr ctx{EVP_PKEY_CTX_new_from_name(nullptr, "ML-KEM-768", nullptr)};
+    if (!ctx) throw PqError("EVP_PKEY_CTX_new_from_name(ML-KEM-768): " + openssl_err_msg());
+    if (EVP_PKEY_keygen_init(ctx.get()) <= 0) {
+        throw PqError("EVP_PKEY_keygen_init: " + openssl_err_msg());
+    }
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_octet_string(
+        "seed",
+        const_cast<std::uint8_t*>(seed.data()),
+        kMlKem768SeedBytes);
+    params[1] = OSSL_PARAM_construct_end();
+    if (EVP_PKEY_CTX_set_params(ctx.get(), params) <= 0) {
+        throw PqError("EVP_PKEY_CTX_set_params(seed): " + openssl_err_msg());
+    }
+    EVP_PKEY* pkey_raw = nullptr;
+    if (EVP_PKEY_keygen(ctx.get(), &pkey_raw) <= 0) {
+        throw PqError("EVP_PKEY_keygen(ML-KEM-768, seeded): " + openssl_err_msg());
+    }
+    return keygen_from_pkey(EvpPkeyPtr{pkey_raw});
 }
 
 MlKem768Encap encap_ml_kem_768(std::span<const std::uint8_t, kMlKem768PubBytes> peer_pub) {
@@ -161,6 +190,11 @@ namespace {
 bool ml_kem_768_available() noexcept { return false; }
 
 MlKem768Keypair keygen_ml_kem_768() { unavailable(); }
+
+MlKem768Keypair keygen_ml_kem_768_from_seed(
+    std::span<const std::uint8_t, kMlKem768SeedBytes>) {
+    unavailable();
+}
 
 MlKem768Encap encap_ml_kem_768(std::span<const std::uint8_t, kMlKem768PubBytes>) {
     unavailable();

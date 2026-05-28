@@ -71,6 +71,16 @@ class PqError : public std::runtime_error {
 // or RNG failure). Uses the OS CSPRNG via OpenSSL's RAND_bytes.
 [[nodiscard]] MlKem768Keypair keygen_ml_kem_768();
 
+// Deterministic ML-KEM-768 keypair derived from a 64-byte seed (FIPS-203
+// §6.1 d || z). Same seed → byte-identical keypair across builds / hosts /
+// invocations. The OpenSSL provider exposes this via OSSL_PKEY_PARAM
+// "seed". Used to derive PQ identity material from FinBit's existing
+// long-term Ed25519 seed — see fb::crypto::derive_pq_keypair_from_seed.
+// Throws PqError on unsupported provider / OpenSSL failure.
+inline constexpr std::size_t kMlKem768SeedBytes = 64;
+[[nodiscard]] MlKem768Keypair keygen_ml_kem_768_from_seed(
+    std::span<const std::uint8_t, kMlKem768SeedBytes> seed);
+
 // Encapsulate against `peer_pub`. Returns (ciphertext, shared_secret).
 // The ciphertext is shipped to the peer; the shared_secret is the local
 // half of the KEM agreement (the peer recovers an identical ss via decap).

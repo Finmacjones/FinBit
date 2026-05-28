@@ -49,6 +49,16 @@ message Envelope {
     uint32 protocol_version = 7;   // see fb::config::kProtocolVersion
     bytes  signature        = 8;   // Ed25519(aad || ciphertext), optional
 
+    // Post-quantum hybrid ciphertext (Tier 7). When non-empty, the sender
+    // performed ML-KEM-768 encapsulation against the recipient's pq_pubkey
+    // (published in their PreKeyBundle); the recipient decapsulates with
+    // their PQ secret key to recover the PQ shared secret and HKDF-combines
+    // it with the classical X25519 ECDH into the hybrid root used to seed
+    // the ratchet. 1088 bytes per FIPS-203. Empty = legacy / non-PQ sender
+    // (recipient falls back to pure X25519 — no security loss vs the
+    // pre-PQ codebase, just no PQ harvest-now defense for this envelope).
+    bytes  pq_ct            = 9;
+
     oneof recipient {
         bytes user_pubkey       = 16;  // 32 bytes, for DMs
         bytes channel_group_id  = 17;  // MLS group ID, for channels

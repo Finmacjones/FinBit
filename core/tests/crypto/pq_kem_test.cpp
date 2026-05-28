@@ -61,6 +61,40 @@ TEST(PqKem, EncapIsProbabilistic) {
     EXPECT_NE(e1.ss, e2.ss);
 }
 
+TEST(PqKem, SeededKeygenIsDeterministic) {
+    std::array<std::uint8_t, pq::kMlKem768SeedBytes> seed{};
+    for (std::size_t i = 0; i < seed.size(); ++i) {
+        seed[i] = static_cast<std::uint8_t>(i * 7 + 3);
+    }
+    auto a = pq::keygen_ml_kem_768_from_seed(
+        std::span<const std::uint8_t, pq::kMlKem768SeedBytes>(seed));
+    auto b = pq::keygen_ml_kem_768_from_seed(
+        std::span<const std::uint8_t, pq::kMlKem768SeedBytes>(seed));
+    EXPECT_EQ(a.pub, b.pub);
+    EXPECT_EQ(a.sec, b.sec);
+
+    seed[0] ^= 0xFF;
+    auto c = pq::keygen_ml_kem_768_from_seed(
+        std::span<const std::uint8_t, pq::kMlKem768SeedBytes>(seed));
+    EXPECT_NE(a.pub, c.pub);
+    EXPECT_NE(a.sec, c.sec);
+}
+
+TEST(PqKem, SeededKeyEncapDecapRoundTrip) {
+    // The same seed must produce a working keypair (catches a future
+    // upstream change that silently turns seeded keygen into "ignore seed").
+    std::array<std::uint8_t, pq::kMlKem768SeedBytes> seed{};
+    for (std::size_t i = 0; i < seed.size(); ++i) seed[i] = static_cast<std::uint8_t>(0x80 ^ i);
+    auto kp = pq::keygen_ml_kem_768_from_seed(
+        std::span<const std::uint8_t, pq::kMlKem768SeedBytes>(seed));
+    auto enc = pq::encap_ml_kem_768(
+        std::span<const std::uint8_t, pq::kMlKem768PubBytes>(kp.pub));
+    auto ss = pq::decap_ml_kem_768(
+        std::span<const std::uint8_t, pq::kMlKem768CtBytes>(enc.ct),
+        std::span<const std::uint8_t, pq::kMlKem768SecBytes>(kp.sec));
+    EXPECT_EQ(enc.ss, ss);
+}
+
 TEST(PqKem, IndependentKeypairsDoNotInteract) {
     auto a = pq::keygen_ml_kem_768();
     auto b = pq::keygen_ml_kem_768();

@@ -66,4 +66,15 @@ private:
 [[nodiscard]] std::string         pubkey_to_base64(const PubKey& pubkey);
 [[nodiscard]] bool                pubkey_from_base64(std::string_view encoded, PubKey& out) noexcept;
 
+// Derive a 64-byte ML-KEM seed deterministically from a 32-byte Ed25519
+// identity seed. Used to give every identity a stable post-quantum keypair
+// without persisting a separate file: the PQ keypair is recomputable from
+// the same seed material the rest of the identity flows from.
+//
+// HKDF-SHA256 extract-then-expand with a FinBit-versioned info string
+// ("FinBit-PQ-seed-v1") so a future bump (e.g. ML-KEM-1024) gets a
+// distinct derivation and doesn't collide with the v1 keypair.
+[[nodiscard]] std::array<std::uint8_t, 64> derive_pq_seed_from_identity_seed(
+    std::span<const std::uint8_t, kIdentitySeedBytes> seed);
+
 }  // namespace fb::crypto

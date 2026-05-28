@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/crypto/identity.hpp"
 
+#include "fb/crypto/hkdf.hpp"
+
 #include <sodium.h>
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -158,6 +161,22 @@ bool pubkey_from_base64(std::string_view encoded, PubKey& out) noexcept {
                                      /*ignore=*/nullptr, &bin_len, /*end=*/nullptr,
                                      sodium_base64_VARIANT_URLSAFE_NO_PADDING);
     return rc == 0 && bin_len == out.size();
+}
+
+std::array<std::uint8_t, 64> derive_pq_seed_from_identity_seed(
+    std::span<const std::uint8_t, kIdentitySeedBytes> seed) {
+    constexpr char kInfo[] = "FinBit-PQ-seed-v1";
+    auto prk = hkdf_extract(
+        std::span<const std::uint8_t>(),
+        std::span<const std::uint8_t>(seed.data(), seed.size()));
+    auto okm = hkdf_expand(
+        prk,
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(kInfo), sizeof(kInfo) - 1),
+        64);
+    std::array<std::uint8_t, 64> out{};
+    std::memcpy(out.data(), okm.data(), 64);
+    return out;
 }
 
 }  // namespace fb::crypto

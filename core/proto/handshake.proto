@@ -43,6 +43,20 @@ message PreKeyBundle {
     bytes  one_time_prekey      = 4;  // X25519 one-shot, consumed on use
     uint32 one_time_prekey_id   = 5;
     uint64 published_at_ms      = 6;
+
+    // Post-quantum hybrid (Tier 7). When non-empty, the publisher supports
+    // ML-KEM-768 + X25519 hybrid key exchange (PQXDH-style). 1184 bytes per
+    // FIPS-203. Senders that see this MUST encapsulate against it and ship
+    // the resulting ciphertext as Envelope.pq_ct so the recipient can
+    // combine it with the X25519 share into a hybrid root.
+    bytes  pq_pubkey            = 7;
+
+    // Ed25519 signature over `pq_pubkey` by the identity key — binds the
+    // PQ pubkey to the long-term identity. Senders MUST verify before use
+    // or a relay/MITM could swap a different PQ key into the bundle (the
+    // classical X25519 share is already identity-bound; binding the PQ
+    // share too is what makes the hybrid genuinely two-factor).
+    bytes  pq_pubkey_sig        = 8;
 }
 
 // User registration / identity claim posted to the server. Server verifies
