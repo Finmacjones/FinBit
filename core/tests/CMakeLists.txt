@@ -11,6 +11,7 @@ add_executable(fb_core_tests
     crypto/mls_facade_test.cpp
     crypto/pq_kem_test.cpp
     crypto/padding_test.cpp
+    handshake/hybrid_test.cpp
     net/frame_codec_test.cpp
     net/websocket_test.cpp
     net/ws_client_test.cpp

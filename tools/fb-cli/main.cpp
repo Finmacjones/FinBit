@@ -58,12 +58,10 @@
 #include "dm_payload.pb.h"
 #include "envelope.pb.h"
 #include "fb/config/build_config.hpp"
-#include "fb/crypto/hkdf.hpp"
-#include "fb/crypto/hybrid_kem.hpp"
 #include "fb/crypto/identity.hpp"
-#include "fb/crypto/pq_kem.hpp"
 #include "fb/crypto/ratchet.hpp"
 #include "fb/crypto/sender_keys.hpp"
+#include "fb/handshake/hybrid.hpp"
 #include "fb/net/ech.hpp"
 #include "fb/net/frame_codec.hpp"
 #include "fb/net/tcp.hpp"
@@ -76,8 +74,6 @@
 #include <fstream>
 
 namespace {
-
-constexpr std::string_view kX3dhInfo = "FinBit-X3DH-v0";
 
 // Envelope-level AAD bound by the inner ratchet/SenderKeys AEAD tag —
 // `envelope_id (16) || timestamp_ms (8 BE)`. Sender computes once
@@ -366,170 +362,14 @@ void write_file(const std::string& path, std::span<const std::uint8_t> bytes) {
 // which converts Ed25519 secret to X25519 private; pair with sk_to_pk + the
 // matching pub conversion.) This is a Phase-0 shortcut; production rotates a
 // separate signed prekey.
-struct X25519Pair {
-    std::array<std::uint8_t, 32> pub{};
-    std::array<std::uint8_t, 32> priv{};
-};
-
-X25519Pair derive_x25519(const fb::crypto::Identity& id) {
-    X25519Pair k;
-    auto sec = id.secret_key();
-    if (crypto_sign_ed25519_sk_to_curve25519(k.priv.data(), sec.data()) != 0) {
-        throw std::runtime_error("ed25519_sk_to_curve25519 failed");
-    }
-    if (crypto_sign_ed25519_pk_to_curve25519(k.pub.data(), id.public_key().data()) != 0) {
-        throw std::runtime_error("ed25519_pk_to_curve25519 failed");
-    }
-    return k;
-}
-
-std::array<std::uint8_t, 32> derive_shared_secret(const X25519Pair& mine,
-                                                  std::span<const std::uint8_t, 32> peer_pub) {
-    std::array<std::uint8_t, 32> dh{};
-    if (crypto_scalarmult(dh.data(), mine.priv.data(), peer_pub.data()) != 0) {
-        throw std::runtime_error("scalarmult low-order");
-    }
-    auto prk = fb::crypto::hkdf_extract(
-        std::span<const std::uint8_t>(),
-        std::span<const std::uint8_t>(dh.data(), dh.size()));
-    auto vec = fb::crypto::hkdf_expand(prk,
-        std::span<const std::uint8_t>(
-            reinterpret_cast<const std::uint8_t*>(kX3dhInfo.data()), kX3dhInfo.size()),
-        32);
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), vec.data(), 32);
-    return out;
-}
-
-// ============================================================================
-// PQ-hybrid (Tier 7) — wire-up of ML-KEM-768 + X25519 hybrid key exchange.
-//
-// PqIdentity carries the deterministic ML-KEM-768 keypair derived from the
-// long-term Ed25519 identity seed. Same `args.user` → same Ed25519 seed →
-// same ML-KEM seed → same PQ keypair across invocations — so the bundle
-// published to the relay matches the secret used to decapsulate.
-//
-// derive_hybrid_send / derive_hybrid_recv are drop-in replacements for
-// derive_shared_secret that *also* (when both sides advertise PQ) mix in
-// the ML-KEM shared secret via HKDF. When the peer hasn't published a
-// pq_pubkey, OR an inbound Envelope arrives without pq_ct, the helpers
-// return the bit-identical pre-PQ behavior — guaranteeing wire-format
-// compatibility with old clients while giving new↔new sessions the
-// harvest-now-decrypt-later defense.
-// ============================================================================
-struct PqIdentity {
-    fb::crypto::pq::MlKem768Pub  pub{};
-    fb::crypto::pq::MlKem768Sec  sec{};
-    fb::crypto::Sig              pubkey_sig{};   // Ed25519 sig over pub
-};
-
-PqIdentity derive_pq_identity(const fb::crypto::Identity& id,
-                              std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes> seed) {
-    PqIdentity p;
-    auto pq_seed = fb::crypto::derive_pq_seed_from_identity_seed(seed);
-    auto kp = fb::crypto::pq::keygen_ml_kem_768_from_seed(
-        std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SeedBytes>(pq_seed));
-    p.pub = kp.pub;
-    p.sec = kp.sec;
-    p.pubkey_sig = id.sign(std::span<const std::uint8_t>(p.pub.data(), p.pub.size()));
-    return p;
-}
-
-struct HybridSendResult {
-    std::array<std::uint8_t, 32> shared{};
-    std::vector<std::uint8_t>    pq_ct;   // empty if peer didn't publish a pq_pubkey
-};
-
-HybridSendResult derive_hybrid_send(const X25519Pair& mine,
-                                    std::span<const std::uint8_t, 32> peer_x,
-                                    std::span<const std::uint8_t> peer_pq_pub) {
-    HybridSendResult out{};
-    out.shared = derive_shared_secret(mine, peer_x);
-    if (peer_pq_pub.empty()) {
-        return out;   // peer is pre-PQ — wire-compatible fallback.
-    }
-    if (peer_pq_pub.size() != fb::crypto::pq::kMlKem768PubBytes) {
-        throw std::runtime_error("hybrid_send: pq_pubkey wrong size");
-    }
-    std::array<std::uint8_t, fb::crypto::pq::kMlKem768PubBytes> peer_arr{};
-    std::memcpy(peer_arr.data(), peer_pq_pub.data(), peer_pq_pub.size());
-    auto enc = fb::crypto::pq::encap_ml_kem_768(
-        std::span<const std::uint8_t, fb::crypto::pq::kMlKem768PubBytes>(peer_arr));
-    auto hyb = fb::crypto::hybrid::combine_x25519_mlkem768(
-        std::span<const std::uint8_t, 32>(out.shared),
-        std::span<const std::uint8_t, 32>(enc.ss));
-    std::memcpy(out.shared.data(), hyb.data(), 32);
-    out.pq_ct.assign(enc.ct.begin(), enc.ct.end());
-    return out;
-}
-
-std::array<std::uint8_t, 32> derive_hybrid_recv(
-    const X25519Pair& mine,
-    std::span<const std::uint8_t, 32> peer_x,
-    std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SecBytes> my_pq_sec,
-    std::span<const std::uint8_t> pq_ct_bytes) {
-    auto ss_x = derive_shared_secret(mine, peer_x);
-    if (pq_ct_bytes.empty()) {
-        return ss_x;   // pre-PQ sender — wire-compatible fallback.
-    }
-    if (pq_ct_bytes.size() != fb::crypto::pq::kMlKem768CtBytes) {
-        throw std::runtime_error("hybrid_recv: pq_ct wrong size");
-    }
-    std::array<std::uint8_t, fb::crypto::pq::kMlKem768CtBytes> ct_arr{};
-    std::memcpy(ct_arr.data(), pq_ct_bytes.data(), pq_ct_bytes.size());
-    auto ss_pq = fb::crypto::pq::decap_ml_kem_768(
-        std::span<const std::uint8_t, fb::crypto::pq::kMlKem768CtBytes>(ct_arr),
-        my_pq_sec);
-    auto hyb = fb::crypto::hybrid::combine_x25519_mlkem768(
-        std::span<const std::uint8_t, 32>(ss_x),
-        std::span<const std::uint8_t, 32>(ss_pq));
-    std::array<std::uint8_t, 32> out{};
-    std::memcpy(out.data(), hyb.data(), 32);
-    return out;
-}
-
-// Convenience: extract + verify the PQ pubkey binding sig from a peer's
-// PreKeyBundle, then do the hybrid send. Throws on a bad sig (caller is
-// expected to surface the error rather than silently downgrade — a relay
-// that strips the PQ fields cleanly is fine [empty pq_pubkey → falls back
-// to X25519] but a relay that PROVIDES a tampered PQ pubkey + bad sig is
-// an active MITM attempt that we must not paper over).
-HybridSendResult derive_hybrid_send_from_bundle(
-    const X25519Pair& mine,
-    std::span<const std::uint8_t, 32> peer_x,
-    const fb::proto::PreKeyBundle& bundle) {
-    std::span<const std::uint8_t> pq_pub(
-        reinterpret_cast<const std::uint8_t*>(bundle.pq_pubkey().data()),
-        bundle.pq_pubkey().size());
-    if (!pq_pub.empty()) {
-        if (bundle.identity_pubkey().size() != fb::crypto::kIdentityPubKeyBytes) {
-            throw std::runtime_error("hybrid_send_from_bundle: identity_pubkey size");
-        }
-        if (bundle.pq_pubkey_sig().size() != fb::crypto::kIdentitySigBytes) {
-            throw std::runtime_error("hybrid_send_from_bundle: missing pq_pubkey_sig");
-        }
-        fb::crypto::PubKey id_pub{};
-        std::memcpy(id_pub.data(), bundle.identity_pubkey().data(), id_pub.size());
-        fb::crypto::Sig sig{};
-        std::memcpy(sig.data(), bundle.pq_pubkey_sig().data(), sig.size());
-        if (!fb::crypto::Identity::verify(id_pub, pq_pub, sig)) {
-            throw std::runtime_error(
-                "hybrid_send_from_bundle: pq_pubkey signature invalid — possible MITM");
-        }
-    }
-    return derive_hybrid_send(mine, peer_x, pq_pub);
-}
-
-std::array<std::uint8_t, 32> derive_hybrid_recv_from_env(
-    const X25519Pair& mine,
-    std::span<const std::uint8_t, 32> peer_x,
-    std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SecBytes> my_pq_sec,
-    const fb::proto::Envelope& env) {
-    std::span<const std::uint8_t> ct_span(
-        reinterpret_cast<const std::uint8_t*>(env.pq_ct().data()),
-        env.pq_ct().size());
-    return derive_hybrid_recv(mine, peer_x, my_pq_sec, ct_span);
-}
+// Tier-7 PQ-hybrid + X3DH handshake primitives live in fb::handshake
+// (core/include/fb/handshake/hybrid.hpp). Only the names actually called
+// from this TU are pulled in — auto-typed locals (e.g. `auto hyb = ...`)
+// don't need a using for the type.
+using fb::handshake::derive_x25519;
+using fb::handshake::derive_pq_identity;
+using fb::handshake::derive_hybrid_send_from_bundle;
+using fb::handshake::derive_hybrid_recv_from_env;
 
 std::vector<std::uint8_t> serialize(const google::protobuf::MessageLite& m) {
     std::vector<std::uint8_t> out(m.ByteSizeLong());

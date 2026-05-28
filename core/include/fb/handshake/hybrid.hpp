@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+#pragma once
+
+// =============================================================================
+// fb::handshake — the canonical home for FinBit's session-bootstrap primitives.
+//
+// Lifted out of tools/fb-cli/main.cpp and client-desktop/src/chat_client.cpp,
+// which previously duplicated the same ~120-line block: the X25519Pair, its
+// derivation from an Ed25519 identity, the X3DH ECDH (`derive_shared_secret`),
+// and the Tier-7 PQ-hybrid extension (`derive_hybrid_send_from_bundle`,
+// `derive_hybrid_recv_from_env`).
+//
+// The wire format owned by these helpers:
+//   * Classical X25519 ECDH → HKDF-SHA256(info = "FinBit-X3DH-v0") → 32-byte
+//     shared secret.
+//   * Tier-7 PQ extension: when the peer published a PreKeyBundle.pq_pubkey
+//     or DhtPrekeyRecord.pq_pubkey (1184B ML-KEM-768), the sender encaps,
+//     ships the 1088B Envelope.pq_ct, and HKDF-combines both halves via
+//     fb::crypto::hybrid::combine_x25519_mlkem768 — a single hybrid root
+//     that's secure as long as EITHER half is secure (PQXDH-style).
+//   * Identity-bound PQ keypair: the PQ secret is NOT persisted — it's
+//     re-derived from the existing Ed25519 identity seed via HKDF +
+//     OpenSSL's ML-KEM-768 seeded keygen. Same user → same long-term PQ
+//     keypair across runs, zero extra at-rest state.
+//
+// Backward compat: every helper falls back to pure X25519 when the peer's
+// pq_pubkey is empty OR the inbound envelope's pq_ct is empty. New clients
+// interoperate with pre-PQ peers without losing functionality (they just
+// don't get harvest-now defense for THAT envelope).
+// =============================================================================
+
+#include "fb/crypto/identity.hpp"
+#include "fb/crypto/pq_kem.hpp"
+
+#include <array>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+// Forward-declare the proto types so the header doesn't require every
+// consumer to include the generated protobuf headers. The .cpp pulls them.
+namespace fb::proto {
+class PreKeyBundle;
+class Envelope;
+}  // namespace fb::proto
+
+namespace fb::handshake {
+
+// Curve25519 keypair derived from an Ed25519 identity. The mapping is
+// deterministic (crypto_sign_ed25519_*_to_curve25519); both halves are
+// recomputable from the Identity object, so this struct is transient
+// in-memory state, not persisted.
+struct X25519Pair {
+    std::array<std::uint8_t, 32> pub{};
+    std::array<std::uint8_t, 32> priv{};
+};
+
+// Convert an Ed25519 identity's secret + public to the matching Curve25519
+// keypair for ECDH. Throws std::runtime_error if libsodium's conversion
+// fails (only on malformed identity material — should be impossible for
+// any Identity built via from_seed or generate).
+[[nodiscard]] X25519Pair derive_x25519(const fb::crypto::Identity& id);
+
+// X3DH-style ECDH + HKDF-SHA256. Computes crypto_scalarmult(mine.priv,
+// peer_pub) then HKDF-Extract(empty) + HKDF-Expand(info = "FinBit-X3DH-v0")
+// to 32 bytes. The output feeds the Double Ratchet root directly.
+//
+// Throws std::runtime_error on a low-order peer pubkey (scalarmult
+// returns non-zero, indicating a key in the small-subgroup attack space).
+[[nodiscard]] std::array<std::uint8_t, 32> derive_shared_secret(
+    const X25519Pair& mine,
+    std::span<const std::uint8_t, 32> peer_pub);
+
+// ---------------------------------------------------------------------------
+// Tier-7 PQ-hybrid wire-up.
+// ---------------------------------------------------------------------------
+
+// Deterministic ML-KEM-768 keypair + a binding Ed25519 signature.
+//
+// The keypair is reproducible from the Ed25519 identity seed via
+// fb::crypto::derive_pq_seed_from_identity_seed → 64 bytes → OpenSSL's
+// ML-KEM-768 seeded keygen. The signature is `identity.sign(pub)` and
+// gets shipped alongside the pubkey in PreKeyBundle / PrekeyRecord so
+// peers can verify the PQ key is bound to the same long-term identity
+// (defeats a MITM that strips PQ and substitutes a key it controls).
+struct PqIdentity {
+    fb::crypto::pq::MlKem768Pub  pub{};
+    fb::crypto::pq::MlKem768Sec  sec{};
+    fb::crypto::Sig              pubkey_sig{};
+};
+
+[[nodiscard]] PqIdentity derive_pq_identity(
+    const fb::crypto::Identity& id,
+    std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes> seed);
+
+// Sender-side hybrid: ECDH + ML-KEM-768 encap + HKDF-combine.
+//
+// `peer_pq_pub` may be:
+//   * Empty (1184-byte legacy peer / not advertised) → falls back to
+//     `derive_shared_secret` and returns empty `pq_ct`.
+//   * Exactly 1184 bytes → encap against the peer's PQ pubkey, combine.
+//   * Any other size → throws std::runtime_error.
+struct HybridSendResult {
+    std::array<std::uint8_t, 32>  shared{};
+    std::vector<std::uint8_t>     pq_ct;
+};
+
+[[nodiscard]] HybridSendResult derive_hybrid_send(
+    const X25519Pair& mine,
+    std::span<const std::uint8_t, 32> peer_x,
+    std::span<const std::uint8_t> peer_pq_pub);
+
+// Receiver-side hybrid: ECDH + ML-KEM-768 decap + HKDF-combine.
+// Symmetric to derive_hybrid_send. Empty `pq_ct` → pure-X25519 fallback.
+[[nodiscard]] std::array<std::uint8_t, 32> derive_hybrid_recv(
+    const X25519Pair& mine,
+    std::span<const std::uint8_t, 32> peer_x,
+    std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SecBytes> my_pq_sec,
+    std::span<const std::uint8_t> pq_ct);
+
+// Bundle-aware wrapper: extracts pq_pubkey from a PreKeyBundle, verifies
+// the binding sig (rejects MITM substitution rather than silently
+// downgrading), then calls derive_hybrid_send. Empty pq_pubkey on the
+// bundle is the legitimate "no PQ advertised" case.
+[[nodiscard]] HybridSendResult derive_hybrid_send_from_bundle(
+    const X25519Pair& mine,
+    std::span<const std::uint8_t, 32> peer_x,
+    const fb::proto::PreKeyBundle& bundle);
+
+// Envelope-aware wrapper: reads pq_ct from an Envelope and calls
+// derive_hybrid_recv. Empty pq_ct on the envelope → pre-PQ sender path.
+[[nodiscard]] std::array<std::uint8_t, 32> derive_hybrid_recv_from_env(
+    const X25519Pair& mine,
+    std::span<const std::uint8_t, 32> peer_x,
+    std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SecBytes> my_pq_sec,
+    const fb::proto::Envelope& env);
+
+}  // namespace fb::handshake
