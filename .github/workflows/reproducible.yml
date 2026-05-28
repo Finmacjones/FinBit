@@ -1,0 +1,112 @@
+name: reproducible-build
+
+# Verifies that a release artifact is bit-for-bit reproducible: builds the
+# same commit twice in two different paths/timestamps, then compares SHA-256
+# of every emitted binary. A divergence indicates either (a) a build flag
+# missed by FB_REPRODUCIBLE_BUILD or (b) a supply-chain attack — and either
+# way the run fails loudly.
+#
+# Triggered on release-tag pushes (v*) and on demand via workflow_dispatch.
+# The PR-time matrix already covers normal correctness; this workflow only
+# runs when reproducibility itself matters.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  reproducible:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            cmake ninja-build pkg-config \
+            libsodium-dev libssl-dev libsqlite3-dev \
+            protobuf-compiler libprotobuf-dev libuv1-dev
+
+      - name: Pick SOURCE_DATE_EPOCH from commit
+        id: sde
+        run: |
+          SDE=$(git log -1 --pretty=%ct)
+          echo "epoch=$SDE" >> "$GITHUB_OUTPUT"
+          echo "Using SOURCE_DATE_EPOCH=$SDE (commit author date)"
+
+      - name: Build A — under /tmp/build-a
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.sde.outputs.epoch }}
+        run: |
+          mkdir -p /tmp/build-a
+          cp -r . /tmp/build-a/src
+          cd /tmp/build-a/src
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFB_REPRODUCIBLE_BUILD=ON \
+            -DFB_BUILD_TESTS=OFF \
+            -DFB_BUILD_TOOLS=ON \
+            -DFB_BUILD_SERVER=ON
+          cmake --build build -j
+
+      - name: Build B — under /tmp/build-b with shifted timestamps
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.sde.outputs.epoch }}
+        run: |
+          mkdir -p /tmp/build-b
+          cp -r . /tmp/build-b/src
+          # Touch every file with a different timestamp so any leak through
+          # the build pipeline shows up as a hash divergence.
+          find /tmp/build-b/src -exec touch -d "2030-01-01" {} +
+          cd /tmp/build-b/src
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFB_REPRODUCIBLE_BUILD=ON \
+            -DFB_BUILD_TESTS=OFF \
+            -DFB_BUILD_TOOLS=ON \
+            -DFB_BUILD_SERVER=ON
+          cmake --build build -j
+
+      - name: Compare SHA-256 hashes
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in fb_relay fb-cli; do
+              a=$(find /tmp/build-a/src/build -type f -name "$f" -executable | head -1)
+              b=$(find /tmp/build-b/src/build -type f -name "$f" -executable | head -1)
+              if [ -z "$a" ] || [ -z "$b" ]; then
+                  echo "::warning::skipping $f (not built in one or both trees)"
+                  continue
+              fi
+              ha=$(sha256sum "$a" | awk '{print $1}')
+              hb=$(sha256sum "$b" | awk '{print $1}')
+              if [ "$ha" = "$hb" ]; then
+                  echo "PASS  $f  $ha"
+              else
+                  echo "FAIL  $f  A=$ha  B=$hb"
+                  fail=1
+              fi
+          done
+          exit $fail
+
+      - name: Publish hash manifest (release tag only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p reproducible-manifest
+          for f in fb_relay fb-cli; do
+              a=$(find /tmp/build-a/src/build -type f -name "$f" -executable | head -1)
+              [ -n "$a" ] && sha256sum "$a" >> reproducible-manifest/SHA256SUMS
+          done
+          cat reproducible-manifest/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: reproducible-manifest-${{ github.ref_name }}
+          path: reproducible-manifest/

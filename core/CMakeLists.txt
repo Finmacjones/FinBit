@@ -69,6 +69,9 @@ add_library(fb_core STATIC
     src/crypto/ratchet.cpp
     src/crypto/sender_keys.cpp
     src/crypto/mls_facade.cpp
+    src/crypto/pq_kem.cpp
+    src/crypto/hybrid_kem.cpp
+    src/crypto/padding.cpp
     src/net/frame_codec.cpp
     src/net/tcp.cpp
     src/net/io_loop.cpp
@@ -187,9 +190,36 @@ if(OpenSSL_FOUND)
         target_compile_definitions(fb_core PUBLIC FB_HAVE_ECH=0)
         message(STATUS "fb_core: OpenSSL has no ECH handshake hooks → ECH wiring gated off")
     endif()
+
+    # --- ML-KEM-768 (post-quantum KEM) detection -------------------------
+    # OpenSSL 3.5+ ships FIPS-203 ML-KEM-{512,768,1024} in the default
+    # provider. We need 768 (sec-level 3, ~AES-192 PQ). Probe by trying
+    # to compile a call against EVP_PKEY_CTX_new_from_name("ML-KEM-768").
+    # The pq_kem.cpp impl is #ifdef-gated on FB_HAVE_ML_KEM so a missing
+    # algorithm becomes a runtime "PQ unavailable" error rather than a
+    # build break. See docs/censorship-resistance.md (Tier 7 — PQ hybrid).
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+    check_cxx_source_compiles("
+        #include <openssl/evp.h>
+        int main() {
+            EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_from_name(nullptr, \"ML-KEM-768\", nullptr);
+            EVP_PKEY_CTX_free(c);
+            return 0;
+        }
+    " FB_OPENSSL_HAS_ML_KEM)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if(FB_OPENSSL_HAS_ML_KEM)
+        target_compile_definitions(fb_core PUBLIC FB_HAVE_ML_KEM=1)
+        message(STATUS "fb_core: OpenSSL ML-KEM-768 present → PQ-hybrid available")
+    else()
+        target_compile_definitions(fb_core PUBLIC FB_HAVE_ML_KEM=0)
+        message(STATUS "fb_core: OpenSSL has no ML-KEM-768 → PQ-hybrid throws on use")
+    endif()
 else()
     target_compile_definitions(fb_core PUBLIC FB_HAVE_OPENSSL=0)
     target_compile_definitions(fb_core PUBLIC FB_HAVE_ECH=0)
+    target_compile_definitions(fb_core PUBLIC FB_HAVE_ML_KEM=0)
     message(STATUS "fb_core: OpenSSL NOT found → TlsClient throws on use")
 endif()
 

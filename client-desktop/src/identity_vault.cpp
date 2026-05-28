@@ -281,4 +281,90 @@ std::optional<Seed> recovery_hex_to_seed(const QString& hex) {
     return out;
 }
 
+// ---- Duress vault (dual-blob) ---------------------------------------------
+
+VaultBlob seal_seed_dual(const QString& real_passphrase, const Seed& real_seed,
+                          const QString& decoy_passphrase, const Seed& decoy_seed,
+                          std::uint64_t opslimit, std::uint64_t memlimit) {
+    // Each half is a standard v2 blob with its own salt + nonce. Reusing
+    // seal_seed keeps the per-half format byte-identical to a single vault
+    // so a forensic analyst cannot tell apart "two halves" from "one valid
+    // blob followed by random padding".
+    VaultBlob real_blob  = seal_seed(real_passphrase,  real_seed,  opslimit, memlimit);
+    VaultBlob decoy_blob = seal_seed(decoy_passphrase, decoy_seed, opslimit, memlimit);
+    if (real_blob.size() != kVaultBlobBytes || decoy_blob.size() != kVaultBlobBytes) {
+        throw std::runtime_error("seal_seed_dual: unexpected blob size");
+    }
+    VaultBlob out;
+    out.reserve(kVaultDualBytes);
+    out.insert(out.end(), real_blob.begin(),  real_blob.end());
+    out.insert(out.end(), decoy_blob.begin(), decoy_blob.end());
+    return out;
+}
+
+std::optional<Seed> open_seed_dual(const QString& passphrase,
+                                    const VaultBlob& blob) {
+    // Single-blob fallback: lets one CLI hook accept either format.
+    if (blob.size() == kVaultBlobBytes || blob.size() == kVaultV1Bytes) {
+        return open_seed(passphrase, blob);
+    }
+    if (blob.size() != kVaultDualBytes) {
+        return std::nullopt;
+    }
+    VaultBlob first(blob.begin(), blob.begin() + kVaultBlobBytes);
+    if (auto s = open_seed(passphrase, first)) {
+        return s;
+    }
+    VaultBlob second(blob.begin() + kVaultBlobBytes, blob.end());
+    return open_seed(passphrase, second);
+    // Either half may succeed. The caller cannot distinguish which —
+    // exactly the property we want for plausible-deniability under coercion.
+}
+
+// ---- Multi-persona vault (N-blob) -----------------------------------------
+
+VaultBlob seal_seeds_multi(const QStringList& passphrases,
+                            const std::vector<Seed>& seeds,
+                            std::uint64_t opslimit, std::uint64_t memlimit) {
+    if (passphrases.isEmpty() || passphrases.size() != static_cast<int>(seeds.size())) {
+        throw std::runtime_error(
+            "seal_seeds_multi: passphrases and seeds must be same non-zero length");
+    }
+    VaultBlob out;
+    out.reserve(static_cast<std::size_t>(passphrases.size()) * kVaultBlobBytes);
+    for (int i = 0; i < passphrases.size(); ++i) {
+        VaultBlob slot = seal_seed(passphrases.at(i),
+                                    seeds[static_cast<std::size_t>(i)],
+                                    opslimit, memlimit);
+        if (slot.size() != kVaultBlobBytes) {
+            throw std::runtime_error("seal_seeds_multi: unexpected slot size");
+        }
+        out.insert(out.end(), slot.begin(), slot.end());
+    }
+    return out;
+}
+
+std::optional<Seed> open_seed_multi(const QString& passphrase,
+                                     const VaultBlob& blob) {
+    // Single-blob fallback so one CLI hook accepts every format.
+    if (blob.size() == kVaultBlobBytes || blob.size() == kVaultV1Bytes) {
+        return open_seed(passphrase, blob);
+    }
+    if (blob.size() < kVaultBlobBytes ||
+        blob.size() % kVaultBlobBytes != 0) {
+        return std::nullopt;
+    }
+    const std::size_t slot_count = blob.size() / kVaultBlobBytes;
+    for (std::size_t i = 0; i < slot_count; ++i) {
+        const auto first = blob.begin() +
+            static_cast<std::ptrdiff_t>(i * kVaultBlobBytes);
+        const auto last  = first + static_cast<std::ptrdiff_t>(kVaultBlobBytes);
+        VaultBlob slot(first, last);
+        if (auto s = open_seed(passphrase, slot)) {
+            return s;
+        }
+    }
+    return std::nullopt;
+}
+
 }  // namespace fb::desktop

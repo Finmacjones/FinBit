@@ -9,6 +9,8 @@ add_executable(fb_core_tests
     crypto/ratchet_test.cpp
     crypto/sender_keys_test.cpp
     crypto/mls_facade_test.cpp
+    crypto/pq_kem_test.cpp
+    crypto/padding_test.cpp
     net/frame_codec_test.cpp
     net/websocket_test.cpp
     net/ws_client_test.cpp

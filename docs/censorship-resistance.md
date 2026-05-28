@@ -338,6 +338,98 @@ SNI-whitelist censors well; against an actor that drops every obfs4 bridge
 it can find, the only lever left is the off-internet mesh bridge
 (`core/mesh/serial/` — LoRa radio doesn't traverse the ISP at all).
 
+### Tier 6 — `.onion` relay endpoints  ✅ shipped
+
+A natural follow-on to Tier 5: instead of dialing a public relay IP, dial a
+v3 Tor hidden-service address. The relay has no public IP and the operator's
+location is unknown even to the relay's users. Auto-detected by the desktop
+client — when the relay host ends in `.onion`:
+
+* the SOCKS5 proxy is forced on (defaulting to `127.0.0.1:9050` if `FB_SOCKS`
+  isn't already set — onion addresses are literally unreachable without Tor),
+* CA-chain validation is bypassed (a v3 onion address is itself a hash of
+  the service's Ed25519 public key — there is no CA root for `.onion`, and
+  the address IS the identity).
+
+The E2E AEAD continues to bind the conversation to the onion address —
+swapping in a different onion means a different keypair means a different
+ratchet partner. Wire-up lives in `chat_client.cpp` (`.onion` detection
+block above the `TlsClientOptions` assembly).
+
+### Tier 7 — Post-quantum hybrid key exchange (PQXDH-style)  ✅ shipped
+
+The only one of these defenses that cannot be applied retroactively. A
+state-level adversary that records X25519 ciphertext today and gains a
+cryptographically-relevant quantum computer (CRQC) in 2040 can recover the
+session key via Shor's algorithm — UNLESS the X25519 secret was already
+combined with a post-quantum KEM secret at the time of capture. ML-KEM-768
+(FIPS-203, NIST sec-level 3, ~AES-192 PQ) is wrapped in
+`fb::crypto::pq` (OpenSSL 3.5+ default-provider EVP), and the hybrid
+combiner in `fb::crypto::hybrid` uses HKDF-SHA256 with FinBit-versioned
+domain separation:
+
+```
+PRK = HKDF-Extract(salt = "FinBit-hybrid-v1",
+                   IKM  = ss_x25519 || ss_mlkem768)
+hyb = HKDF-Expand(PRK, info = "FinBit hybrid X25519+ML-KEM-768", L = 32)
+```
+
+Breaking the hybrid root requires breaking BOTH halves; an adversary with
+unbounded classical compute who recovers `ss_x25519` learns nothing about
+`hyb`, and an adversary with a CRQC who recovers nothing about
+`ss_mlkem768` (which requires Bob's PQ secret key — itself PQ-secret)
+learns nothing about `hyb`. Foundation + PQXDH-style end-to-end derivation
+proven by `HybridKem.EndToEndPqxdhStyleMatch`; production wire-up across
+the prekey-bundle/envelope path is the documented follow-on.
+
+### Tier 8 — Reproducible builds + signed releases  ✅ shipped
+
+Supply-chain defense. Anyone can take a public commit SHA and rebuild the
+exact bytes that the release artifact contains — meaning a "you must ship
+our backdoor" demand against the maintainer is detectable (the
+unreproducible binary surfaces immediately). `FB_REPRODUCIBLE_BUILD=ON`
+applies `-ffile-prefix-map` / `-fdebug-prefix-map` / `-fmacro-prefix-map`
+to scrub absolute source paths, `-frandom-seed=fb-deterministic` for
+deterministic anonymous-namespace symbol names, and
+`-Wl,--build-id=sha1` for a deterministic ELF build-ID derived from the
+binary's own contents. `SOURCE_DATE_EPOCH` (set from the commit author
+date) replaces wall-clock timestamps everywhere. The
+`.github/workflows/reproducible.yml` workflow runs on release tags: builds
+twice, in two different paths with two different filesystem mtimes, and
+fails the run if any binary's SHA-256 differs.
+
+### Tier 9 — Message-size padding + cover traffic  ✅ shipped
+
+Defeats traffic-analysis attacks that survive Tor and E2E. Two pieces:
+
+* **Padding (`fb::crypto::pad_to_bucket` / `strip_padding`):** plaintext is
+  bucketed to {256, 1024, 4096, 16384, 65536} bytes before AEAD via the
+  ISO 7816-4 `0x80` marker scheme. A 5-byte "ok" and a 200-byte reply
+  become indistinguishable on the wire — both 256 bytes after the AEAD
+  tag. Bandwidth-amplifying (a 12-byte message becomes 256 bytes — ~21x),
+  acceptable for chat.
+* **Cover traffic (`FB_COVER_TRAFFIC=<seconds>`):** the desktop worker
+  emits a padded Frame.control(OK) every N seconds whether or not real
+  traffic is flowing. The relay silently ignores client-issued OKs.
+  Defeats the "Alice just sent a message at 12:03:17" inference even when
+  the connection is over Tor — the wire shows constant cadence regardless
+  of user behavior.
+
+### Tier 10 — Per-persona identity separation  ✅ scaffold shipped
+
+`fb::desktop::seal_seeds_multi` / `open_seed_multi` let one vault file
+hold N personas under N separate passphrases — work / personal / activist,
+each a different Ed25519 keypair, different prekey bundle, different
+ratchets, different gossip beacons. No cross-linkage at the wire protocol.
+The dual variant (`seal_seed_dual` / `open_seed_dual`) is the N=2 special
+case that doubles as a **duress passphrase**: an adversary coercing the
+user's passphrase cannot tell whether they were given the real one (opens
+the working identity) or the decoy (opens an innocuous identity stocked
+with believable-but-non-sensitive content). Both succeed equally;
+the file looks identical either way.
+
+UI for runtime persona-switching is the documented follow-on.
+
 ## 3. What still leaks
 
 Even with all four tiers, a sufficiently capable adversary can

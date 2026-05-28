@@ -27,6 +27,46 @@ option(FB_ENABLE_SANITIZERS "Enable ASan + UBSan in Debug" ON)
 # default channel cipher in the meantime.
 option(FB_FEATURE_MLS "Enable MLS group crypto via vendored mlspp" OFF)
 
+# Reproducible-build mode. When ON, applies compiler/linker flags that strip
+# build-machine state from the output (absolute paths in debug info, random
+# section names, build IDs). Combined with SOURCE_DATE_EPOCH and a workflow
+# that builds twice on the same revision and compares hashes, this lets any
+# third party verify a published binary corresponds bit-for-bit to the git
+# tag — defeating supply-chain attacks where a compromised builder silently
+# inserts a backdoor. See .github/workflows/reproducible.yml and
+# docs/censorship-resistance.md (Tier 8). OFF by default (debug ergonomics
+# matter more for normal dev; CI flips this on for release tags).
+option(FB_REPRODUCIBLE_BUILD "Apply reproducible-build flags" OFF)
+
+if(FB_REPRODUCIBLE_BUILD)
+    # Strip absolute source paths from debug info + __FILE__ macros so a
+    # binary built under /home/alice/finbit and one built under
+    # /tmp/build-42/finbit are byte-identical.
+    add_compile_options(
+        -ffile-prefix-map=${CMAKE_SOURCE_DIR}=.
+        -fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.
+        -fmacro-prefix-map=${CMAKE_SOURCE_DIR}=.
+    )
+    # Deterministic random section names in object files (gcc inserts a
+    # randomly-seeded hash into anonymous-namespace symbols by default).
+    add_compile_options(-frandom-seed=fb-deterministic)
+    # Linker: replace the random build-id with a deterministic SHA1 over the
+    # final binary's hash sections.
+    if(NOT APPLE AND NOT MSVC)
+        add_link_options(-Wl,--build-id=sha1)
+    endif()
+    # Honour SOURCE_DATE_EPOCH end-to-end (CMake sets timestamps in the
+    # install tree from it when set). Surfacing here so a configure-time
+    # log shows the operator what value will be baked in.
+    if(DEFINED ENV{SOURCE_DATE_EPOCH})
+        message(STATUS "Reproducible build: SOURCE_DATE_EPOCH=$ENV{SOURCE_DATE_EPOCH}")
+    else()
+        message(WARNING "FB_REPRODUCIBLE_BUILD ON but SOURCE_DATE_EPOCH unset — "
+                        "embedded timestamps will still leak. Set it to the "
+                        "commit's author date for full reproducibility.")
+    endif()
+endif()
+
 if(MSVC)
     add_compile_options(/W4 /permissive-)
     # windows.h #defines `min` and `max` as function-like macros which

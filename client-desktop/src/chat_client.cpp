@@ -613,6 +613,14 @@ struct ChatClient::Impl {
     // null otherwise. Default-on (FB_NO_MESH disables; FB_LORA_DEVICE /
     // FB_LORA_BAUD override). Off-internet transport — the lifeline tier.
     std::unique_ptr<fb::mesh::IBridge>            mesh_bridge;
+
+    // Cover-traffic cadence (seconds). 0 = disabled. When > 0, the worker
+    // ships a padded no-op Frame at this interval to defeat presence /
+    // burst-timing analysis by a passive global observer. Opt-in via
+    // FB_COVER_TRAFFIC=<seconds>. Bandwidth-hostile; see
+    // docs/censorship-resistance.md (Tier 9).
+    std::uint64_t                                 cover_interval_s = 0;
+    std::chrono::steady_clock::time_point         last_cover_send{};
     std::mutex                                     lan_mu;
     std::vector<std::pair<std::string, std::uint16_t>> lan_dial_queue;  // guarded by lan_mu
     std::set<std::string>                          lan_dialed;          // "ip:port" already dialed
@@ -836,6 +844,17 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
         // ratchet payloads would still cross the wire as bare frames). Flip
         // TLS on so the relay sees an https-looking session via the tunnel.
         impl_->use_tls = true;
+    }
+    // Cover-traffic cadence (seconds). Bandwidth-hostile, opt-in. When set,
+    // the worker emits a padded no-op Frame at this interval whether or not
+    // there's real traffic — defeats the "they're online + just sent
+    // something" inference even with E2E + Tor in place.
+    if (const char* ct = std::getenv("FB_COVER_TRAFFIC"); ct && *ct) {
+        char* end = nullptr;
+        const auto n = std::strtoull(ct, &end, 10);
+        if (end != ct && n > 0) {
+            impl_->cover_interval_s = static_cast<std::uint64_t>(n);
+        }
     }
     impl_->tls_ca_file = ca_file.toStdString();
     impl_->tls_insecure_skip_verify = insecure_skip_verify;
@@ -1329,6 +1348,44 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // TCP behaviour.
             if (impl_->use_tls) {
                 impl_->tls.emplace();
+
+                // Tier-6 — .onion relay endpoints.
+                //
+                // A v3 Tor hidden-service address (56-char base32 + ".onion")
+                // is itself a hash of the service's Ed25519 public key, so
+                // CA-chain validation makes no sense (there's no public CA
+                // root for onion). Two things change automatically when the
+                // host ends in ".onion":
+                //   * the SOCKS5 proxy is forced on (the local Tor at
+                //     127.0.0.1:9050 by default — onion addresses are
+                //     literally unreachable without Tor); FB_SOCKS keeps
+                //     priority if the user already set it.
+                //   * cert-chain validation is bypassed (insecure_skip_verify
+                //     = true). The TLS *transport* still runs and gives us
+                //     forward secrecy + integrity at the network layer; the
+                //     E2E AEAD on top means relay identity is bound to the
+                //     onion address (a different onion is a different keypair
+                //     → a different relay → a different ratchet partner).
+                {
+                    const std::string h = impl_->host.toStdString();
+                    if (h.size() >= 6 &&
+                        h.compare(h.size() - 6, 6, ".onion") == 0) {
+                        if (impl_->socks5_proxy.empty()) {
+                            impl_->socks5_proxy = "127.0.0.1:9050";
+                            emit log(QString(
+                                ".onion host detected — forcing SOCKS5 proxy "
+                                "127.0.0.1:9050 (start Tor if not running)"));
+                        }
+                        if (!impl_->tls_insecure_skip_verify) {
+                            impl_->tls_insecure_skip_verify = true;
+                            emit log(QString(
+                                ".onion host — TLS chain validation disabled "
+                                "(onion address IS the identity; E2E still "
+                                "binds to it)"));
+                        }
+                    }
+                }
+
                 fb::net::TlsClientOptions tlsopts;
                 tlsopts.ca_file              = impl_->tls_ca_file;
                 tlsopts.insecure_skip_verify = impl_->tls_insecure_skip_verify;
@@ -3140,7 +3197,42 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
 
             // Main I/O loop.
             std::vector<std::uint8_t> rxbuf(4096);
+            impl_->last_cover_send = std::chrono::steady_clock::now();
             while (impl_->running) {
+                // 0a. Cover-traffic heartbeat. Opt-in (FB_COVER_TRAFFIC=N).
+                //     A passive observer (ISP, Tor exit, global adversary)
+                //     learns a surprising amount from message timing alone —
+                //     even with E2E + Tor, "Alice sent something at
+                //     12:03:17.42" is a powerful inference. A constant-rate
+                //     padded heartbeat hides REAL traffic in a stream of
+                //     identical-looking writes. We send a Frame.control with
+                //     code=OK and a 256-byte padded detail; the relay
+                //     gracefully ignores client-issued OKs. Encrypted at
+                //     WSS+TLS so the observer sees only ~280 bytes of
+                //     unintelligible bytes on a fixed schedule.
+                if (impl_->cover_interval_s > 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - impl_->last_cover_send >=
+                            std::chrono::seconds(impl_->cover_interval_s)) {
+                        try {
+                            fb::proto::Frame f;
+                            auto* ctl = f.mutable_control();
+                            ctl->set_code(fb::proto::ControlMessage::OK);
+                            // Pad detail to the smallest bucket (256B). Use
+                            // pseudorandom bytes so two heartbeats aren't
+                            // bytewise-identical (defeats trivial pattern-
+                            // match deduplication by a relay or observer).
+                            std::string padding(240, '\0');
+                            randombytes_buf(padding.data(), padding.size());
+                            ctl->set_detail(std::move(padding));
+                            blocking_send(impl_->conn, serialize(f));
+                        } catch (const std::exception&) {
+                            // Send failures are non-fatal; the main loop
+                            // will catch a dead connection on the next read.
+                        }
+                        impl_->last_cover_send = now;
+                    }
+                }
                 // 0z. Drain the first-contact parking lot (P).
                 //     For each PendingSend held while async DHT
                 //     lookups completed: re-attempt direct send
