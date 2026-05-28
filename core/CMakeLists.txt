@@ -74,6 +74,7 @@ add_library(fb_core STATIC
     src/net/io_loop.cpp
     src/net/doh_resolver.cpp
     src/net/ech.cpp
+    src/net/socks5.cpp
     src/net/websocket.cpp
     src/store/sqlite_store.cpp
     src/store/attachment_frame.cpp

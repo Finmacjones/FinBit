@@ -553,6 +553,11 @@ struct ChatClient::Impl {
     std::string tls_ca_file;
     bool        tls_insecure_skip_verify = false;
     std::string tls_sni;
+    // Tier-5 SOCKS5 (FB_SOCKS=host:port, typically 127.0.0.1:9050 → local
+    // Tor). When set, the relay TCP connection tunnels through the proxy —
+    // combined with obfs4/Snowflake bridges in torrc, the ISP sees only
+    // bridge traffic. Empty = direct TCP.
+    std::string socks5_proxy;
     // Tier-3 domain-fronting (FB_FRONT_SNI / FB_WS_HOST). When set,
     // ws_front_sni overrides the TLS SNI (the front the censor sees)
     // and ws_host_header sets the WS Host header (the real backend the
@@ -818,6 +823,14 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
     const char* wss_env = std::getenv("FB_WSS");
     impl_->use_wss = use_wss || (wss_env && *wss_env && std::string(wss_env) != "0");
     impl_->use_tls = use_tls || impl_->use_wss;
+    // Tier-5: optional SOCKS5 outbound (Tor / obfs4 / Snowflake).
+    if (const char* sp = std::getenv("FB_SOCKS"); sp && *sp) {
+        impl_->socks5_proxy = sp;
+        // SOCKS5 only meaningful when we layer TLS over it (otherwise the
+        // ratchet payloads would still cross the wire as bare frames). Flip
+        // TLS on so the relay sees an https-looking session via the tunnel.
+        impl_->use_tls = true;
+    }
     impl_->tls_ca_file = ca_file.toStdString();
     impl_->tls_insecure_skip_verify = insecure_skip_verify;
     impl_->tls_sni = sni_hostname.toStdString();
@@ -1265,6 +1278,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 fb::net::TlsClientOptions tlsopts;
                 tlsopts.ca_file              = impl_->tls_ca_file;
                 tlsopts.insecure_skip_verify = impl_->tls_insecure_skip_verify;
+                tlsopts.socks5_proxy         = impl_->socks5_proxy;
                 // Tier-3: the front domain (FB_FRONT_SNI) overrides the
                 // SNI when set; that's what a passive observer sees.
                 tlsopts.sni_hostname         = impl_->ws_front_sni.empty()

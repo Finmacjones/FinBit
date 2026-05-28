@@ -15,6 +15,7 @@ add_executable(fb_core_tests
     net/doh_resolver_test.cpp
     net/tls_fingerprint_test.cpp
     net/ech_test.cpp
+    net/socks5_test.cpp
     store/sqlite_store_test.cpp
     store/attachment_frame_test.cpp
     identity/username_log_test.cpp

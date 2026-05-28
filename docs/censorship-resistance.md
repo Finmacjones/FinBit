@@ -293,6 +293,51 @@ which is a dependency/build-system change deliberately not bundled here.
 The same BoringSSL swap (or a future OpenSSL) flips `FB_HAVE_ECH` on and
 activates the already-wired SNI encryption.
 
+### Tier 5 — SOCKS5 outbound (Tor / obfs4 / Snowflake)  ✅ shipped
+
+For networks that DPI-block FinBit even with the mimicry above (or
+whitelist-only networks where TLS-on-443 isn't enough), the relay TCP
+connection can tunnel through a local SOCKS5 proxy. Combined with **Tor**
+running pluggable transports (obfs4, Snowflake, meek) in `torrc`, the ISP
+sees only the bridge protocol — not a connection to the FinBit relay:
+
+```
+FinBit ──TCP──▶ 127.0.0.1:9050 (Tor SOCKS5)
+                └── obfs4 / Snowflake ──▶ Tor circuit ──▶ relay
+```
+
+**Wire-up** (`fb::net::socks5_connect`, RFC 1928, no-auth, ATYP=domain):
+
+- Greeting offers `NO_AUTH` only; the proxy responds with the chosen method.
+- CONNECT uses ATYP=0x03 (domain name) so **Tor performs the DNS lookup** —
+  no client-side DNS leak, and `.onion` targets work transparently.
+- The handshake takes a few short blocking round-trips on the proxy socket,
+  then the socket is set non-blocking and returned. The TLS layer (and the
+  Tier-1..4 stack above) runs unchanged over the tunnel; SNI + cert
+  validation are bound to the **target** host, not the proxy.
+
+**Enabling it.** Run Tor locally (with bridges configured if you're behind a
+Tor-blocking censor) and set:
+
+```
+export FB_SOCKS=127.0.0.1:9050
+fb_desktop
+```
+
+`FB_SOCKS` implies `FB_WSS` (TLS on by default) — otherwise the relay frames
+would still traverse the tunnel in cleartext to the exit. The setting flows
+through `TlsClientOptions::socks5_proxy` in `core/include/fb/net/tls_client.hpp`
+and is exercised end-to-end by `core/tests/net/socks5_test.cpp` (wire format +
+live tunnel through an in-process stub proxy + refusal-code surfacing).
+
+**Tradeoffs.** Tor itself is blocked in the harshest regimes (China, Iran),
+so bridge discovery becomes the new problem; obfs4 / Snowflake make the
+hop *look* unremarkable, but a long-running adversary can fingerprint the
+bridge populations. The honest position: this tier handles passive DPI and
+SNI-whitelist censors well; against an actor that drops every obfs4 bridge
+it can find, the only lever left is the off-internet mesh bridge
+(`core/mesh/serial/` — LoRa radio doesn't traverse the ISP at all).
+
 ## 3. What still leaks
 
 Even with all four tiers, a sufficiently capable adversary can

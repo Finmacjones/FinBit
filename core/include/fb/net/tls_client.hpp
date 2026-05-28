@@ -58,6 +58,15 @@ struct TlsClientOptions {
     // system CA bundle is used (SSL_CTX_set_default_verify_paths).
     std::string ca_file;
 
+    // Optional SOCKS5 proxy ("host:port") to route the underlying TCP
+    // connection through. Combined with a local Tor instance running with
+    // obfs4/Snowflake bridges (torrc), this is FinBit's hostile-network
+    // transport: the ISP sees obfs4-looking traffic to a bridge instead of
+    // a TLS connection to the relay. Empty = direct TCP. The TLS handshake
+    // runs unchanged over the SOCKS5 tunnel; SNI / cert validation are
+    // bound to the TARGET host, not the proxy.
+    std::string socks5_proxy;
+
     // Disable cert validation entirely. Strictly for local dev / CI where
     // a self-signed cert is acceptable; warn-on-use logged from the cli.
     bool insecure_skip_verify = false;

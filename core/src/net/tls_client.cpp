@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "fb/net/tls_client.hpp"
 
+#include "fb/net/socks5.hpp"
 #include "fb/net/tcp.hpp"
 
 #include <chrono>
@@ -276,8 +277,24 @@ void TlsClient::connect(const std::string& host, std::uint16_t port,
         EVP_PKEY_free(ckey);
     }
 
-    // 2. TCP connect.
-    impl_->socket = tcp_connect(host, port);
+    // 2. TCP connect (direct, or via SOCKS5 proxy — e.g. local Tor at
+    //    127.0.0.1:9050 with obfs4/Snowflake bridges configured in torrc).
+    //    The TLS handshake below runs unchanged over the tunnel; SNI + cert
+    //    validation are bound to the TARGET host, not the proxy.
+    if (!opts.socks5_proxy.empty()) {
+        const auto& p = opts.socks5_proxy;
+        const auto colon = p.rfind(':');
+        if (colon == std::string::npos) {
+            throw std::runtime_error("TlsClient: socks5_proxy must be 'host:port'");
+        }
+        const std::string proxy_host = p.substr(0, colon);
+        const auto proxy_port = static_cast<std::uint16_t>(
+            std::atoi(p.c_str() + colon + 1));
+        impl_->socket = fb::net::socks5::socks5_connect(
+            proxy_host, proxy_port, host, port);
+    } else {
+        impl_->socket = tcp_connect(host, port);
+    }
 
     // 3. SSL object. Bind it to the socket fd.
     impl_->ssl = SSL_new(impl_->ctx);
