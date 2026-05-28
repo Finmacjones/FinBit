@@ -41,7 +41,9 @@
 #include "envelope.pb.h"
 #include "fb/config/build_config.hpp"
 #include "fb/crypto/hkdf.hpp"
+#include "fb/crypto/hybrid_kem.hpp"
 #include "fb/crypto/identity.hpp"
+#include "fb/crypto/pq_kem.hpp"
 #include "fb/crypto/ratchet.hpp"
 #include "fb/crypto/sender_keys.hpp"
 #include "fb/crypto/mls_facade.hpp"
@@ -113,6 +115,121 @@ std::array<std::uint8_t, 32> derive_shared_secret(const X25519Pair& mine,
     std::array<std::uint8_t, 32> out{};
     std::memcpy(out.data(), vec.data(), 32);
     return out;
+}
+
+// ============================================================================
+// PQ-hybrid (Tier 7) — same wire-up shape as fb-cli (see tools/fb-cli/main.cpp
+// for the rationale and references). Lifted verbatim because the proto types
+// are identical and the helpers are pure; eventually both call sites should
+// share a header in fb::handshake — for now duplicating is cheap and keeps
+// the desktop translation unit self-contained.
+// ============================================================================
+struct PqIdentity {
+    fb::crypto::pq::MlKem768Pub  pub{};
+    fb::crypto::pq::MlKem768Sec  sec{};
+    fb::crypto::Sig              pubkey_sig{};
+};
+
+PqIdentity derive_pq_identity(const fb::crypto::Identity& id,
+    std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes> seed) {
+    PqIdentity p;
+    auto pq_seed = fb::crypto::derive_pq_seed_from_identity_seed(seed);
+    auto kp = fb::crypto::pq::keygen_ml_kem_768_from_seed(
+        std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SeedBytes>(pq_seed));
+    p.pub = kp.pub;
+    p.sec = kp.sec;
+    p.pubkey_sig = id.sign(std::span<const std::uint8_t>(p.pub.data(), p.pub.size()));
+    return p;
+}
+
+struct HybridSendResult {
+    std::array<std::uint8_t, 32> shared{};
+    std::vector<std::uint8_t>    pq_ct;
+};
+
+HybridSendResult derive_hybrid_send(const X25519Pair& mine,
+                                    std::span<const std::uint8_t, 32> peer_x,
+                                    std::span<const std::uint8_t> peer_pq_pub) {
+    HybridSendResult out{};
+    out.shared = derive_shared_secret(mine, peer_x);
+    if (peer_pq_pub.empty()) {
+        return out;
+    }
+    if (peer_pq_pub.size() != fb::crypto::pq::kMlKem768PubBytes) {
+        throw std::runtime_error("hybrid_send: pq_pubkey wrong size");
+    }
+    std::array<std::uint8_t, fb::crypto::pq::kMlKem768PubBytes> peer_arr{};
+    std::memcpy(peer_arr.data(), peer_pq_pub.data(), peer_pq_pub.size());
+    auto enc = fb::crypto::pq::encap_ml_kem_768(
+        std::span<const std::uint8_t, fb::crypto::pq::kMlKem768PubBytes>(peer_arr));
+    auto hyb = fb::crypto::hybrid::combine_x25519_mlkem768(
+        std::span<const std::uint8_t, 32>(out.shared),
+        std::span<const std::uint8_t, 32>(enc.ss));
+    std::memcpy(out.shared.data(), hyb.data(), 32);
+    out.pq_ct.assign(enc.ct.begin(), enc.ct.end());
+    return out;
+}
+
+std::array<std::uint8_t, 32> derive_hybrid_recv(
+    const X25519Pair& mine,
+    std::span<const std::uint8_t, 32> peer_x,
+    std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SecBytes> my_pq_sec,
+    std::span<const std::uint8_t> pq_ct_bytes) {
+    auto ss_x = derive_shared_secret(mine, peer_x);
+    if (pq_ct_bytes.empty()) {
+        return ss_x;
+    }
+    if (pq_ct_bytes.size() != fb::crypto::pq::kMlKem768CtBytes) {
+        throw std::runtime_error("hybrid_recv: pq_ct wrong size");
+    }
+    std::array<std::uint8_t, fb::crypto::pq::kMlKem768CtBytes> ct_arr{};
+    std::memcpy(ct_arr.data(), pq_ct_bytes.data(), pq_ct_bytes.size());
+    auto ss_pq = fb::crypto::pq::decap_ml_kem_768(
+        std::span<const std::uint8_t, fb::crypto::pq::kMlKem768CtBytes>(ct_arr),
+        my_pq_sec);
+    auto hyb = fb::crypto::hybrid::combine_x25519_mlkem768(
+        std::span<const std::uint8_t, 32>(ss_x),
+        std::span<const std::uint8_t, 32>(ss_pq));
+    std::array<std::uint8_t, 32> out{};
+    std::memcpy(out.data(), hyb.data(), 32);
+    return out;
+}
+
+HybridSendResult derive_hybrid_send_from_bundle(
+    const X25519Pair& mine,
+    std::span<const std::uint8_t, 32> peer_x,
+    const fb::proto::PreKeyBundle& bundle) {
+    std::span<const std::uint8_t> pq_pub(
+        reinterpret_cast<const std::uint8_t*>(bundle.pq_pubkey().data()),
+        bundle.pq_pubkey().size());
+    if (!pq_pub.empty()) {
+        if (bundle.identity_pubkey().size() != fb::crypto::kIdentityPubKeyBytes) {
+            throw std::runtime_error("hybrid_send_from_bundle: identity_pubkey size");
+        }
+        if (bundle.pq_pubkey_sig().size() != fb::crypto::kIdentitySigBytes) {
+            throw std::runtime_error("hybrid_send_from_bundle: missing pq_pubkey_sig");
+        }
+        fb::crypto::PubKey id_pub{};
+        std::memcpy(id_pub.data(), bundle.identity_pubkey().data(), id_pub.size());
+        fb::crypto::Sig sig{};
+        std::memcpy(sig.data(), bundle.pq_pubkey_sig().data(), sig.size());
+        if (!fb::crypto::Identity::verify(id_pub, pq_pub, sig)) {
+            throw std::runtime_error(
+                "hybrid_send_from_bundle: pq_pubkey signature invalid — possible MITM");
+        }
+    }
+    return derive_hybrid_send(mine, peer_x, pq_pub);
+}
+
+std::array<std::uint8_t, 32> derive_hybrid_recv_from_env(
+    const X25519Pair& mine,
+    std::span<const std::uint8_t, 32> peer_x,
+    std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SecBytes> my_pq_sec,
+    const fb::proto::Envelope& env) {
+    std::span<const std::uint8_t> ct_span(
+        reinterpret_cast<const std::uint8_t*>(env.pq_ct().data()),
+        env.pq_ct().size());
+    return derive_hybrid_recv(mine, peer_x, my_pq_sec, ct_span);
 }
 
 std::vector<std::uint8_t> serialize(const google::protobuf::MessageLite& m) {
@@ -541,6 +658,11 @@ struct ChatClient::Impl {
     // Touched by worker only.
     std::optional<fb::crypto::Identity> identity;
     X25519Pair x25519;
+
+    // Tier-7 PQ-hybrid: deterministic ML-KEM-768 keypair derived from the
+    // long-term Ed25519 identity seed via HKDF (FinBit-PQ-seed-v1). Same
+    // user → same PQ identity across runs; no extra persistence required.
+    PqIdentity pq_id{};
     std::unique_ptr<fb::store::SqliteStore> store;
     std::string store_path;
     std::optional<fb::net::Socket> sock;
@@ -660,6 +782,15 @@ struct ChatClient::Impl {
         std::array<std::uint8_t, 32> peer_x{};
         std::optional<fb::crypto::DoubleRatchet> rat;
         bool initialized_as_alice = false;
+        // Tier-7 PQ-hybrid: 1088-byte ML-KEM-768 ciphertext that the Alice
+        // side encapsulated against the peer's pq_pubkey. Spliced into
+        // every outbound envelope from this session so the receiver can
+        // decap on their first inbound and arrive at the same hybrid root.
+        // Empty when the peer's bundle didn't advertise PQ (DHT-sourced
+        // PrekeyRecord that pre-dates the PQ field, or a pre-PQ client).
+        // For Bob-initialized sessions this stays empty (the recv path
+        // reads pq_ct from the envelope directly).
+        std::vector<std::uint8_t> pq_ct;
     };
     std::map<std::string, Session> sessions;
     // Channels keyed by display-name. id is name -> generichash.
@@ -920,6 +1051,14 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             sodium_memzero(store_master_key.data(), store_master_key.size());
 
             impl_->identity = fb::crypto::Identity::from_seed(impl_->seed);
+            // Tier-7 PQ-hybrid: derive the deterministic ML-KEM-768 keypair
+            // from the raw seed BEFORE we zeroize it (the seed is the only
+            // input from which the PQ keypair can be recomputed; the
+            // Identity object exposes only the Ed25519-derived secret key,
+            // not the original seed material).
+            impl_->pq_id = derive_pq_identity(*impl_->identity,
+                std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(
+                    impl_->seed));
             // We intentionally no longer call save_identity() — it was a
             // legacy path that wrote the secret key into the SQLite store
             // in cleartext. Now that LoginDialog + identity_vault are the
@@ -928,7 +1067,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // docs/security-audit.md). Wipe the in-memory raw seed once
             // Identity::from_seed has copied it into mlock'd memory.
             sodium_memzero(impl_->seed.data(), impl_->seed.size());
-            emit log(QString("identity unlocked from vault, store=%1")
+            emit log(QString("identity unlocked from vault, store=%1 pq=ML-KEM-768")
                          .arg(QString::fromStdString(impl_->store_path)));
             impl_->x25519 = derive_x25519(*impl_->identity);
 
@@ -1527,6 +1666,17 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 b->set_signed_prekey(std::string(
                     reinterpret_cast<const char*>(impl_->x25519.pub.data()),
                     impl_->x25519.pub.size()));
+                // Tier-7 PQ-hybrid: publish the deterministic ML-KEM-768
+                // pubkey + Ed25519 sig binding it to the identity. Peers
+                // verify the sig before encap; without binding, a MITM
+                // relay could swap a PQ key under its own control without
+                // invalidating the X25519 share.
+                b->set_pq_pubkey(std::string(
+                    reinterpret_cast<const char*>(impl_->pq_id.pub.data()),
+                    impl_->pq_id.pub.size()));
+                b->set_pq_pubkey_sig(std::string(
+                    reinterpret_cast<const char*>(impl_->pq_id.pubkey_sig.data()),
+                    impl_->pq_id.pubkey_sig.size()));
                 b->set_published_at_ms(static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch())
@@ -2320,9 +2470,19 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                             sender_pub_bytes.data())) != 0) {
                                     continue;
                                 }
-                                auto shared = derive_shared_secret(
+                                // Tier-7 PQ-hybrid recv: if the inbound
+                                // envelope carries pq_ct, decap with our
+                                // ML-KEM secret and combine with the
+                                // X25519 ECDH; arrive at the same hybrid
+                                // root the sender derived. Empty pq_ct →
+                                // pre-PQ sender, falls back to pure X25519.
+                                auto shared = derive_hybrid_recv_from_env(
                                     impl_->x25519,
-                                    std::span<const std::uint8_t, 32>(peer_x.data(), 32));
+                                    std::span<const std::uint8_t, 32>(peer_x.data(), 32),
+                                    std::span<const std::uint8_t,
+                                              fb::crypto::pq::kMlKem768SecBytes>(
+                                        impl_->pq_id.sec.data(), impl_->pq_id.sec.size()),
+                                    env);
                                 sess.rat.emplace(fb::crypto::DoubleRatchet::init_bob(
                                     std::span<const std::uint8_t, 32>(shared.data(),
                                                                        shared.size()),
@@ -3284,18 +3444,28 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 std::memcpy(peer_x.data(),
                                     pkey_rec_opt->signed_prekey().data(),
                                     32);
-                                auto shared = derive_shared_secret(
+                                // Tier-7 PQ-hybrid send (DHT path). The
+                                // serverless PrekeyRecord proto in
+                                // core/proto/dht.proto doesn't yet carry
+                                // pq_pubkey — TODO extend it so DHT-routed
+                                // first-contact gets the same harvest-now
+                                // defense. For now pass empty pq_pubkey,
+                                // which falls back to pure X25519 (same
+                                // behavior as pre-PQ codebase).
+                                auto hybrid = derive_hybrid_send(
                                     impl_->x25519,
                                     std::span<const std::uint8_t, 32>(
-                                        peer_x.data(), 32));
+                                        peer_x.data(), 32),
+                                    std::span<const std::uint8_t>{});
                                 auto& sess =
                                     impl_->sessions[p.send.peer];
                                 sess.peer_pub = p.peer_pub;
                                 sess.peer_x   = peer_x;
+                                sess.pq_ct    = std::move(hybrid.pq_ct);   // empty until DHT proto extends
                                 sess.rat.emplace(
                                     fb::crypto::DoubleRatchet::init_alice(
                                         std::span<const std::uint8_t, 32>(
-                                            shared.data(), shared.size()),
+                                            hybrid.shared.data(), hybrid.shared.size()),
                                         std::span<const std::uint8_t, 32>(
                                             peer_x.data(), 32)));
                                 sess.initialized_as_alice = true;
@@ -4049,6 +4219,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             std::span<const std::uint8_t>(pt.data(), pt.size()),
                             std::span<const std::uint8_t>(env_aad.data(),
                                                             env_aad.size()));
+                        const auto& sess_pq_ct = peer_sess.pq_ct;
                         fb::proto::Frame f;
                         auto* env = f.mutable_envelope();
                         env->set_envelope_id(std::string(envid.begin(), envid.end()));
@@ -4062,6 +4233,9 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 impl_->identity->public_key().data()),
                             impl_->identity->public_key().size()));
                         env->set_ciphertext(std::string(inner.begin(), inner.end()));
+                        if (!sess_pq_ct.empty()) {
+                            env->set_pq_ct(std::string(sess_pq_ct.begin(), sess_pq_ct.end()));
+                        }
                         env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                         env->set_protocol_version(fb::config::kProtocolVersion);
                         blocking_send(impl_->conn, serialize(f));
@@ -4150,6 +4324,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             std::span<const std::uint8_t>(pt.data(), pt.size()),
                             std::span<const std::uint8_t>(env_aad.data(),
                                                             env_aad.size()));
+                        const auto& sess_pq_ct = sess->pq_ct;
                         fb::proto::Frame f;
                         auto* env = f.mutable_envelope();
                         env->set_envelope_id(std::string(envid.begin(), envid.end()));
@@ -4162,6 +4337,9 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             reinterpret_cast<const char*>(impl_->identity->public_key().data()),
                             impl_->identity->public_key().size()));
                         env->set_ciphertext(std::string(inner.begin(), inner.end()));
+                        if (!sess_pq_ct.empty()) {
+                            env->set_pq_ct(std::string(sess_pq_ct.begin(), sess_pq_ct.end()));
+                        }
                         env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                         env->set_protocol_version(fb::config::kProtocolVersion);
                         blocking_send(impl_->conn, serialize(f));
@@ -4297,6 +4475,11 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     impl_->identity->public_key().size()));
                                 env.set_ciphertext(std::string(
                                     ct.begin(), ct.end()));
+                                if (!sess_direct.pq_ct.empty()) {
+                                    env.set_pq_ct(std::string(
+                                        sess_direct.pq_ct.begin(),
+                                        sess_direct.pq_ct.end()));
+                                }
                                 env.set_aad(std::string(
                                     outer_aad.begin(), outer_aad.end()));
                                 env.set_aead_alg(
@@ -4570,6 +4753,9 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         reinterpret_cast<const char*>(impl_->identity->public_key().data()),
                         impl_->identity->public_key().size()));
                     env->set_ciphertext(std::string(inner.begin(), inner.end()));
+                    if (!sess.pq_ct.empty()) {
+                        env->set_pq_ct(std::string(sess.pq_ct.begin(), sess.pq_ct.end()));
+                    }
                     env->set_aead_alg(fb::config::aead_alg::kAes256Gcm);
                     env->set_protocol_version(fb::config::kProtocolVersion);
                     blocking_send(impl_->conn, serialize(f));
@@ -4873,11 +5059,24 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                             r.bundle().identity_pubkey().data(), 32);
                                 std::memcpy(sess.peer_x.data(),
                                             r.bundle().signed_prekey().data(), 32);
-                                auto shared = derive_shared_secret(
+                                // Tier-7 PQ-hybrid send: if the bundle
+                                // carries pq_pubkey, verify the binding
+                                // sig and encapsulate; stash the resulting
+                                // pq_ct so every outbound envelope from
+                                // this session ships it (the recipient
+                                // only needs it on the first to bootstrap
+                                // their ratchet — including it on all
+                                // subsequent sends is a small bandwidth
+                                // cost in exchange for robustness against
+                                // a lost first message).
+                                auto hybrid = derive_hybrid_send_from_bundle(
                                     impl_->x25519,
-                                    std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32));
+                                    std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32),
+                                    r.bundle());
+                                sess.pq_ct = std::move(hybrid.pq_ct);
                                 sess.rat.emplace(fb::crypto::DoubleRatchet::init_alice(
-                                    std::span<const std::uint8_t, 32>(shared.data(), shared.size()),
+                                    std::span<const std::uint8_t, 32>(
+                                        hybrid.shared.data(), hybrid.shared.size()),
                                     std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32)));
                                 sess.initialized_as_alice = true;
                                 emit log(QString("ratchet ready for %1")
