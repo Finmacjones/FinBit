@@ -1943,6 +1943,15 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             impl_->identity->secret_key().data()) != 0) {
                         return;
                     }
+                    // Tier-7 PQ-hybrid: publish the ML-KEM-768 pubkey
+                    // alongside the X25519 SPK so DHT first-contact peers
+                    // can encap against it. The v2 canonical signing bytes
+                    // include the PQ fields → pre-PQ validators will
+                    // reject this record (they recompute v1 bytes and the
+                    // outer sig mismatches); peers on this build accept
+                    // both v1 and v2 records. Coexistence is the natural
+                    // upgrade path — old peers keep using old records,
+                    // new peers gain the PQ defense.
                     auto pkrec = fb::p2p::build_prekey_record(
                         sig_pub, sig_priv,
                         std::span<const std::uint8_t>(
@@ -1950,7 +1959,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         std::span<const std::uint8_t>(
                             spk_sig.data(), spk_sig_len),
                         now_ms_fn(),
-                        fb::p2p::kDefaultProviderTtlMs);
+                        fb::p2p::kDefaultProviderTtlMs,
+                        std::span<const std::uint8_t>(
+                            impl_->pq_id.pub.data(), impl_->pq_id.pub.size()),
+                        std::span<const std::uint8_t>(
+                            impl_->pq_id.pubkey_sig.data(),
+                            impl_->pq_id.pubkey_sig.size()));
                     auto pksent = impl_->dht->publish_prekey(pkrec);
                     emit log(QString("DHT prekey republish: sent_to=%1")
                                  .arg(static_cast<qulonglong>(pksent)));
@@ -3445,18 +3459,26 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     pkey_rec_opt->signed_prekey().data(),
                                     32);
                                 // Tier-7 PQ-hybrid send (DHT path). The
-                                // serverless PrekeyRecord proto in
-                                // core/proto/dht.proto doesn't yet carry
-                                // pq_pubkey — TODO extend it so DHT-routed
-                                // first-contact gets the same harvest-now
-                                // defense. For now pass empty pq_pubkey,
-                                // which falls back to pure X25519 (same
-                                // behavior as pre-PQ codebase).
+                                // PrekeyRecord proto now carries
+                                // `pq_pubkey` + `pq_pubkey_sig` (v2
+                                // canonical signing bytes; the outer
+                                // record signature already bound them at
+                                // DHT validate time). When the v2 record
+                                // is present, encap against the peer's
+                                // ML-KEM pubkey and ship the resulting
+                                // pq_ct on every send from this session.
+                                // Pre-PQ peers continue to publish v1
+                                // records with empty pq_pubkey, which
+                                // gracefully falls back to pure X25519.
+                                std::span<const std::uint8_t> peer_pq_span(
+                                    reinterpret_cast<const std::uint8_t*>(
+                                        pkey_rec_opt->pq_pubkey().data()),
+                                    pkey_rec_opt->pq_pubkey().size());
                                 auto hybrid = derive_hybrid_send(
                                     impl_->x25519,
                                     std::span<const std::uint8_t, 32>(
                                         peer_x.data(), 32),
-                                    std::span<const std::uint8_t>{});
+                                    peer_pq_span);
                                 auto& sess =
                                     impl_->sessions[p.send.peer];
                                 sess.peer_pub = p.peer_pub;

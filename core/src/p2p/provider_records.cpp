@@ -326,7 +326,12 @@ std::size_t ProviderStore::size() const {
 
 namespace {
 
-constexpr const char* kPrekeyMagic = "fb.p2p.PrekeyRecord:v1\n";
+constexpr const char* kPrekeyMagic   = "fb.p2p.PrekeyRecord:v1\n";
+constexpr const char* kPrekeyMagicV2 = "fb.p2p.PrekeyRecord:v2\n";
+
+// FIPS-203 ML-KEM-768 public key size. Kept local (avoid pulling
+// fb/crypto/pq_kem header into p2p just for the constant).
+constexpr std::size_t kPqPubBytes = 1184;
 
 }  // namespace
 
@@ -336,7 +341,9 @@ std::vector<std::uint8_t> prekey_canonical_signing_bytes(
     std::span<const std::uint8_t> signed_prekey_signature,
     std::uint64_t published_at_ms,
     std::uint64_t ttl_ms,
-    std::span<const std::uint8_t> nonce) {
+    std::span<const std::uint8_t> nonce,
+    std::span<const std::uint8_t> pq_pubkey,
+    std::span<const std::uint8_t> pq_pubkey_sig) {
     if (publisher_pubkey.size() != 32) {
         throw std::invalid_argument("PrekeyRecord: pubkey must be 32B");
     }
@@ -351,8 +358,21 @@ std::vector<std::uint8_t> prekey_canonical_signing_bytes(
     if (nonce.size() != 16) {
         throw std::invalid_argument("PrekeyRecord: nonce must be 16B");
     }
+    // PQ fields are all-or-nothing.
+    const bool pq_present = !pq_pubkey.empty() || !pq_pubkey_sig.empty();
+    if (pq_present) {
+        if (pq_pubkey.size() != kPqPubBytes) {
+            throw std::invalid_argument(
+                "PrekeyRecord: pq_pubkey must be 1184B (ML-KEM-768)");
+        }
+        if (pq_pubkey_sig.size() != crypto_sign_BYTES) {
+            throw std::invalid_argument(
+                "PrekeyRecord: pq_pubkey_sig must be 64B");
+        }
+    }
+
     std::vector<std::uint8_t> out;
-    const std::string magic = kPrekeyMagic;
+    const std::string magic = pq_present ? kPrekeyMagicV2 : kPrekeyMagic;
     out.insert(out.end(), magic.begin(), magic.end());
     out.push_back(32);
     out.insert(out.end(), publisher_pubkey.begin(), publisher_pubkey.end());
@@ -370,6 +390,15 @@ std::vector<std::uint8_t> prekey_canonical_signing_bytes(
     append_be64(ttl_ms);
     out.push_back(16);
     out.insert(out.end(), nonce.begin(), nonce.end());
+
+    if (pq_present) {
+        // pq_pub_len is big-endian u16 (1184 > 255 → can't use one byte).
+        out.push_back(static_cast<std::uint8_t>((kPqPubBytes >> 8) & 0xff));
+        out.push_back(static_cast<std::uint8_t>(kPqPubBytes & 0xff));
+        out.insert(out.end(), pq_pubkey.begin(), pq_pubkey.end());
+        out.push_back(64);
+        out.insert(out.end(), pq_pubkey_sig.begin(), pq_pubkey_sig.end());
+    }
     return out;
 }
 
@@ -379,7 +408,9 @@ fb::proto::PrekeyRecord build_prekey_record(
     std::span<const std::uint8_t> signed_prekey,
     std::span<const std::uint8_t> signed_prekey_signature,
     std::uint64_t published_at_ms,
-    std::uint64_t ttl_ms) {
+    std::uint64_t ttl_ms,
+    std::span<const std::uint8_t> pq_pubkey,
+    std::span<const std::uint8_t> pq_pubkey_sig) {
     if (sig_pub.size() != crypto_sign_PUBLICKEYBYTES) {
         throw std::invalid_argument("build_prekey_record: sig_pub must be 32B");
     }
@@ -395,6 +426,16 @@ fb::proto::PrekeyRecord build_prekey_record(
     out.set_published_at_ms(published_at_ms);
     out.set_ttl_ms(ttl_ms);
 
+    // PQ fields (Tier 7). When set, both flow into the record AND the v2
+    // canonical signing bytes; when empty, the record stays v1 and old
+    // validators accept it.
+    const bool pq_present = !pq_pubkey.empty() || !pq_pubkey_sig.empty();
+    if (pq_present) {
+        out.set_pq_pubkey(std::string(pq_pubkey.begin(), pq_pubkey.end()));
+        out.set_pq_pubkey_sig(std::string(
+            pq_pubkey_sig.begin(), pq_pubkey_sig.end()));
+    }
+
     std::array<std::uint8_t, 16> nonce{};
     randombytes_buf(nonce.data(), nonce.size());
     out.set_nonce(std::string(nonce.begin(), nonce.end()));
@@ -402,7 +443,8 @@ fb::proto::PrekeyRecord build_prekey_record(
     auto signing_bytes = prekey_canonical_signing_bytes(
         sig_pub, signed_prekey, signed_prekey_signature,
         published_at_ms, ttl_ms,
-        std::span<const std::uint8_t>(nonce.data(), nonce.size()));
+        std::span<const std::uint8_t>(nonce.data(), nonce.size()),
+        pq_pubkey, pq_pubkey_sig);
     std::array<std::uint8_t, crypto_sign_BYTES> sig{};
     unsigned long long sig_len = 0;
     if (crypto_sign_detached(sig.data(), &sig_len,
@@ -423,6 +465,12 @@ bool verify_prekey_record_signature(const fb::proto::PrekeyRecord& r) {
     if (r.signed_prekey_signature().size() != crypto_sign_BYTES) return false;
     if (r.signature().size() != crypto_sign_BYTES) return false;
     if (r.nonce().size() != 16) return false;
+    // PQ fields are all-or-nothing.
+    const bool pq_present = !r.pq_pubkey().empty() || !r.pq_pubkey_sig().empty();
+    if (pq_present) {
+        if (r.pq_pubkey().size() != kPqPubBytes) return false;
+        if (r.pq_pubkey_sig().size() != crypto_sign_BYTES) return false;
+    }
     auto pub = std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(r.publisher_pubkey().data()),
         r.publisher_pubkey().size());
@@ -435,8 +483,15 @@ bool verify_prekey_record_signature(const fb::proto::PrekeyRecord& r) {
     auto nonce = std::span<const std::uint8_t>(
         reinterpret_cast<const std::uint8_t*>(r.nonce().data()),
         r.nonce().size());
+    auto pq_pub_span = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(r.pq_pubkey().data()),
+        r.pq_pubkey().size());
+    auto pq_sig_span = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(r.pq_pubkey_sig().data()),
+        r.pq_pubkey_sig().size());
     auto signing_bytes = prekey_canonical_signing_bytes(
-        pub, spk, spk_sig, r.published_at_ms(), r.ttl_ms(), nonce);
+        pub, spk, spk_sig, r.published_at_ms(), r.ttl_ms(), nonce,
+        pq_pub_span, pq_sig_span);
     if (0 != crypto_sign_verify_detached(
             reinterpret_cast<const unsigned char*>(r.signature().data()),
             signing_bytes.data(), signing_bytes.size(), pub.data())) {
@@ -451,6 +506,17 @@ bool verify_prekey_record_signature(const fb::proto::PrekeyRecord& r) {
             reinterpret_cast<const unsigned char*>(r.signed_prekey().data()),
             r.signed_prekey().size(), pub.data())) {
         return false;
+    }
+    // PQ binding-sig check — same pattern as the SPK signature, signed by
+    // the identity key over pq_pubkey bytes alone. Guards against a peer
+    // republishing the OUTER record with a swapped PQ key they don't own.
+    if (pq_present) {
+        if (0 != crypto_sign_verify_detached(
+                reinterpret_cast<const unsigned char*>(r.pq_pubkey_sig().data()),
+                reinterpret_cast<const unsigned char*>(r.pq_pubkey().data()),
+                r.pq_pubkey().size(), pub.data())) {
+            return false;
+        }
     }
     return true;
 }

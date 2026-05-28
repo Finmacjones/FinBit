@@ -99,6 +99,21 @@ message PrekeyRecord {
     bytes  signature              = 7;   // 64B Ed25519 over canonical
                                           // signing bytes (analogous to
                                           // ProviderRecord.signature).
+
+    // Post-quantum hybrid (Tier 7). When non-empty, the publisher supports
+    // ML-KEM-768 + X25519 hybrid key exchange for first-contact via the DHT
+    // path. 1184 bytes per FIPS-203. When BOTH pq_pubkey and pq_pubkey_sig
+    // are set, the outer `signature` is computed over the v2 canonical
+    // signing bytes (which include the PQ fields); when both are empty,
+    // v1 signing bytes are used and old validators accept the record.
+    bytes  pq_pubkey              = 8;
+
+    // Ed25519 signature over `pq_pubkey` by the identity key — same binding
+    // pattern as PreKeyBundle.pq_pubkey_sig in handshake.proto. Verified
+    // independently from the outer record signature so a peer that
+    // republishes the record under their own key can't swap the PQ pubkey
+    // without owning the identity secret.
+    bytes  pq_pubkey_sig          = 9;
 }
 
 // "I serve prekey for pubkey X — store this record." Sent to the K

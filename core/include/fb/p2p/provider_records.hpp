@@ -128,13 +128,32 @@ private:
 // in the centralized mode).
 // =============================================================================
 
+// Canonical signing bytes for a PrekeyRecord.
+//
+// Two layout versions:
+//   * v1 (kPrekeyMagic = "fb.p2p.PrekeyRecord:v1\n") — used when both
+//     `pq_pubkey` and `pq_pubkey_sig` are empty. Byte-for-byte identical
+//     to the pre-PQ layout; old validators accept records signed this way.
+//   * v2 (kPrekeyMagicV2 = "fb.p2p.PrekeyRecord:v2\n") — used when both
+//     `pq_pubkey` (1184 B) and `pq_pubkey_sig` (64 B) are non-empty. Same
+//     prefix as v1, then appends:
+//       uint16_be(pq_pub_len = 1184)  || pq_pubkey
+//       uint8(pq_sig_len    = 64)     || pq_pubkey_sig
+//     Old validators recompute v1 bytes (they don't know about the PQ
+//     fields), the signature mismatches, and the record is rejected —
+//     which is the correct behavior for a v2-only consumer.
+//
+// Throws std::invalid_argument if exactly one PQ field is set, or if any
+// size is wrong.
 [[nodiscard]] std::vector<std::uint8_t> prekey_canonical_signing_bytes(
     std::span<const std::uint8_t> publisher_pubkey,
     std::span<const std::uint8_t> signed_prekey,
     std::span<const std::uint8_t> signed_prekey_signature,
     std::uint64_t published_at_ms,
     std::uint64_t ttl_ms,
-    std::span<const std::uint8_t> nonce);
+    std::span<const std::uint8_t> nonce,
+    std::span<const std::uint8_t> pq_pubkey      = {},
+    std::span<const std::uint8_t> pq_pubkey_sig  = {});
 
 // Build + sign a prekey record. `sig_pub` is the publisher's identity
 // pubkey (Ed25519, 32B). `sig_priv` is the matching 64B secret. The
@@ -143,13 +162,21 @@ private:
 // — produced once when the SPK was generated, valid as long as the SPK
 // is. (Different from the OUTER record signature, which covers the
 // whole record + nonce + ttl.)
+//
+// Optional PQ fields: when `pq_pubkey` (1184 B ML-KEM-768) and
+// `pq_pubkey_sig` (64 B Ed25519 over pq_pubkey by the identity key) are
+// supplied, both are embedded in the record and bound into the outer
+// signature via the v2 canonical layout. Pass empty spans (default) to
+// produce a v1 record that pre-PQ validators still accept.
 [[nodiscard]] fb::proto::PrekeyRecord build_prekey_record(
     std::span<const std::uint8_t> sig_pub,
     std::span<const std::uint8_t> sig_priv,
     std::span<const std::uint8_t> signed_prekey,
     std::span<const std::uint8_t> signed_prekey_signature,
     std::uint64_t published_at_ms,
-    std::uint64_t ttl_ms = kDefaultProviderTtlMs);
+    std::uint64_t ttl_ms = kDefaultProviderTtlMs,
+    std::span<const std::uint8_t> pq_pubkey      = {},
+    std::span<const std::uint8_t> pq_pubkey_sig  = {});
 
 class PrekeyStore {
 public:

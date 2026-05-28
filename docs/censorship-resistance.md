@@ -398,6 +398,26 @@ learns nothing about `hyb`.
   Alice→Bob DM with the hybrid handshake on the live wire, AEAD decrypts,
   and the server stays blind to the plaintext.
 
+**Serverless DHT path (chat_client first-contact):** `PrekeyRecord` in
+`core/proto/dht.proto` gains `pq_pubkey` + `pq_pubkey_sig`. The outer
+record signature uses one of two canonical layouts:
+* **v1** (`"fb.p2p.PrekeyRecord:v1\n"` magic) — used when both PQ fields
+  are empty. Byte-identical to the pre-PQ layout; pre-PQ validators still
+  accept v1 records.
+* **v2** (`"fb.p2p.PrekeyRecord:v2\n"`) — used when both PQ fields are
+  set. Appends `uint16_be(1184) || pq_pubkey || uint8(64) || pq_pubkey_sig`
+  to the v1 prefix. Pre-PQ validators recompute v1 bytes from the v2
+  record (they don't see the PQ fields, just unknown proto fields),
+  signature mismatches, record is rejected — the correct conservative
+  behavior for a v2-only verifier facing a v1-only consumer.
+
+The DHT validator now verifies the v1-or-v2 outer signature, AND (for v2
+records) the Ed25519 binding signature over `pq_pubkey` by the identity
+key — same pattern as the SPK binding signature. Consumers at first-
+contact (chat_client `pkey_rec_opt->pq_pubkey()`) pass the bytes to
+`derive_hybrid_send`, which encapsulates and ships `pq_ct` on every send
+from the resulting session.
+
 ### Tier 8 — Reproducible builds + signed releases  ✅ shipped
 
 Supply-chain defense. Anyone can take a public commit SHA and rebuild the

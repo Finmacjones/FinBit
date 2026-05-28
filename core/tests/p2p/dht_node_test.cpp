@@ -332,6 +332,104 @@ TEST(DhtNode, PrekeyPublishAndLookupRoundTrip) {
 }
 
 // Empty routing table: lookup_prekey still fires its completion
+// Tier-7 PQ-hybrid: a PrekeyRecord built with pq_pubkey + pq_pubkey_sig
+// uses the v2 canonical signing bytes. Verify the round trip:
+//   * record carries the PQ fields
+//   * outer signature verifies (PrekeyStore::put accepts)
+//   * tampering pq_pubkey breaks the outer signature
+//   * tampering pq_pubkey_sig breaks the binding-sig check
+//   * a v1-style record (empty PQ fields) still verifies — backward compat
+TEST(DhtNode, PrekeyRecordV2WithPqFieldsRoundTrip) {
+    auto a_kp = gen_kp();
+
+    std::array<std::uint8_t, 32> spk{};
+    randombytes_buf(spk.data(), spk.size());
+    std::array<std::uint8_t, crypto_sign_BYTES> spk_sig{};
+    unsigned long long sig_len = 0;
+    ASSERT_EQ(crypto_sign_detached(spk_sig.data(), &sig_len, spk.data(), spk.size(),
+                                    a_kp.sec.data()), 0);
+
+    // Fake PQ pubkey (1184 bytes of random — we're testing the wire
+    // wrapping, not ML-KEM itself). Sign with the identity to bind it.
+    std::array<std::uint8_t, 1184> pq_pub{};
+    randombytes_buf(pq_pub.data(), pq_pub.size());
+    std::array<std::uint8_t, crypto_sign_BYTES> pq_pub_sig{};
+    unsigned long long pq_sig_len = 0;
+    ASSERT_EQ(crypto_sign_detached(
+        pq_pub_sig.data(), &pq_sig_len,
+        pq_pub.data(), pq_pub.size(), a_kp.sec.data()), 0);
+
+    auto rec = fb::p2p::build_prekey_record(
+        as_span(a_kp.pub), as_span(a_kp.sec),
+        std::span<const std::uint8_t>(spk.data(), spk.size()),
+        std::span<const std::uint8_t>(spk_sig.data(), spk_sig.size()),
+        kT0, kTtl,
+        std::span<const std::uint8_t>(pq_pub.data(), pq_pub.size()),
+        std::span<const std::uint8_t>(pq_pub_sig.data(), pq_pub_sig.size()));
+
+    // PQ fields ride along on the record.
+    EXPECT_EQ(rec.pq_pubkey().size(), 1184u);
+    EXPECT_EQ(rec.pq_pubkey_sig().size(), 64u);
+    EXPECT_EQ(rec.pq_pubkey(),
+              std::string(reinterpret_cast<const char*>(pq_pub.data()), pq_pub.size()));
+
+    // PrekeyStore::put performs full validation (outer sig + SPK sig + PQ
+    // sig). A clean record must be accepted.
+    fb::p2p::PrekeyStore store;
+    EXPECT_EQ(store.put(rec, kNow), fb::p2p::PrekeyStore::PutResult::kAccepted);
+
+    // Tampering pq_pubkey breaks the OUTER signature (the v2 signing
+    // bytes include pq_pubkey, so flipping one bit makes the
+    // recomputed signing bytes diverge from what was signed).
+    {
+        auto tampered = rec;
+        std::string pq = tampered.pq_pubkey();
+        pq[42] ^= 0x01;
+        tampered.set_pq_pubkey(pq);
+        fb::p2p::PrekeyStore s2;
+        EXPECT_EQ(s2.put(tampered, kNow),
+                  fb::p2p::PrekeyStore::PutResult::kRejectedSig);
+    }
+
+    // Tampering pq_pubkey_sig breaks the BINDING signature check (the
+    // signature no longer verifies as Ed25519 over pq_pubkey by the
+    // identity key) — guards against a peer re-publishing the record
+    // with a swapped PQ pubkey under their own identity.
+    {
+        auto tampered = rec;
+        std::string sig_s = tampered.pq_pubkey_sig();
+        sig_s[7] ^= 0x80;
+        tampered.set_pq_pubkey_sig(sig_s);
+        fb::p2p::PrekeyStore s3;
+        EXPECT_EQ(s3.put(tampered, kNow),
+                  fb::p2p::PrekeyStore::PutResult::kRejectedSig);
+    }
+}
+
+TEST(DhtNode, PrekeyRecordV1StillVerifiesWithoutPqFields) {
+    auto a_kp = gen_kp();
+    std::array<std::uint8_t, 32> spk{};
+    randombytes_buf(spk.data(), spk.size());
+    std::array<std::uint8_t, crypto_sign_BYTES> spk_sig{};
+    unsigned long long sig_len = 0;
+    ASSERT_EQ(crypto_sign_detached(
+        spk_sig.data(), &sig_len, spk.data(), spk.size(), a_kp.sec.data()), 0);
+
+    // Empty PQ fields → v1 canonical signing bytes → byte-for-byte
+    // compatible with pre-PQ validators.
+    auto rec = fb::p2p::build_prekey_record(
+        as_span(a_kp.pub), as_span(a_kp.sec),
+        std::span<const std::uint8_t>(spk.data(), spk.size()),
+        std::span<const std::uint8_t>(spk_sig.data(), spk_sig.size()),
+        kT0, kTtl);
+    EXPECT_TRUE(rec.pq_pubkey().empty());
+    EXPECT_TRUE(rec.pq_pubkey_sig().empty());
+
+    fb::p2p::PrekeyStore store;
+    EXPECT_EQ(store.put(rec, kNow),
+              fb::p2p::PrekeyStore::PutResult::kAccepted);
+}
+
 // callback (with whatever's in the local store, here empty).
 TEST(DhtNode, PrekeyLookupWithNoPeersFiresEmptyCallback) {
     auto a_kp = gen_kp();
