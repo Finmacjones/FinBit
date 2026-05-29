@@ -22,6 +22,17 @@ struct RelayConfig {
     std::string   tls_key;                      // PEM private key
     std::string   offline_db;                   // SQLite path; empty = in-memory
     bool          quiet        = false;         // suppress stderr banners (embedded)
+
+    // Amnesia mode (Tier-11 operational defence). When true, the relay
+    // refuses to persist ANYTHING to disk regardless of other flags:
+    //   * offline_db is force-cleared (in-memory queue, power-off = gone)
+    //   * a startup banner declares the mode — "what the operator cannot
+    //     hand over under subpoena" advertisement
+    //   * any future persistence flag must consult `amnesia` and no-op
+    // Pair with docs/warrant-canary.md so operators can publish a signed
+    // canary asserting the property to peers + auditors. CLI flag:
+    // `--amnesia` on fb_server.
+    bool          amnesia      = false;
 };
 
 // Run the relay until `stop` becomes true (polled ~200 ms). Blocks the calling

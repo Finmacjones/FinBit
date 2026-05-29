@@ -656,6 +656,8 @@ int main(int argc, char** argv) {
     auto x25519 = derive_x25519(identity);
     auto pq_id = derive_pq_identity(identity,
         std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+    auto pq_sig_id = fb::handshake::derive_pq_sig_identity(identity,
+        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
 
     std::cerr << "[fb-cli] user=" << args.user
               << " fingerprint=" << identity.fingerprint()
@@ -953,6 +955,11 @@ int main(int argc, char** argv) {
         b->set_pq_pubkey_sig(std::string(
             reinterpret_cast<const char*>(pq_id.pubkey_sig.data()),
             pq_id.pubkey_sig.size()));
+        // Tier-11 PQ-sig: hybrid (Ed25519 + ML-DSA-65) signatures over
+        // signed_prekey and pq_pubkey. Peers verify both must pass —
+        // a CRQC who forges Ed25519 still has to forge ML-DSA-65 to
+        // swap either pubkey mid-flight.
+        fb::handshake::add_pq_sig_fields_to_bundle(*b, identity, pq_sig_id);
         b->set_published_at_ms(static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch())

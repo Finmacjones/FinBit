@@ -53,6 +53,7 @@ int main(int argc, char** argv) {
         else if (a == "--tls-cert" && i + 1 < argc) cfg.tls_cert = argv[++i];
         else if (a == "--tls-key"  && i + 1 < argc) cfg.tls_key  = argv[++i];
         else if (a == "--offline-db" && i + 1 < argc) cfg.offline_db = argv[++i];
+        else if (a == "--amnesia") cfg.amnesia = true;
         else if (a == "--public") public_listen = true;
         else if (a == "--help" || a == "-h") {
             std::fprintf(stderr,
@@ -68,7 +69,12 @@ int main(int argc, char** argv) {
                 "  --tls-raw-port P TLS-wrapped raw frames (native TLS); needs cert/key\n"
                 "  --tls-cert F    PEM certificate chain\n"
                 "  --tls-key F     PEM private key\n"
-                "  --offline-db F  SQLite path for offline queue + directory (else RAM)\n\n"
+                "  --offline-db F  SQLite path for offline queue + directory (else RAM)\n"
+                "  --amnesia       NEVER persist to disk — even when --offline-db is set,\n"
+                "                  the path is force-cleared. RAM-only operation; power\n"
+                "                  off = total state loss. Use to advertise that no\n"
+                "                  subpoena can compel data the operator doesn't have.\n"
+                "                  Pair with docs/warrant-canary.md.\n\n"
                 "Self-signed cert for local testing:\n"
                 "  openssl req -x509 -newkey rsa:2048 -nodes -days 30 \\\n"
                 "    -keyout key.pem -out cert.pem -subj /CN=localhost\n\n"

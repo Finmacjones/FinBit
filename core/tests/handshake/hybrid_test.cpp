@@ -335,6 +335,110 @@ TEST(Handshake, HybridVerifyRequiresBothHalves) {
     }
 }
 
+// ---- PreKeyBundle PQ-sig wiring -------------------------------------------
+
+namespace {
+
+// Construct a minimally-valid PreKeyBundle with both PQ-KEM + PQ-sig fields
+// populated for `id`. The other fields (signed_prekey, signed_prekey_sig)
+// get nonzero placeholders so the wire-format invariants hold.
+fb::proto::PreKeyBundle make_full_bundle(const fb::crypto::Identity& id,
+                                         std::span<const std::uint8_t,
+                                                   fb::crypto::kIdentitySeedBytes> seed) {
+    fb::proto::PreKeyBundle b;
+    b.set_identity_pubkey(std::string(
+        reinterpret_cast<const char*>(id.public_key().data()),
+        id.public_key().size()));
+    // Phase-0 placeholder SPK + sig (real binding done by the actual SPK
+    // signature; we only need the bytes to exist for PQ-sig coverage).
+    std::array<std::uint8_t, 32> spk{};
+    for (std::size_t i = 0; i < spk.size(); ++i) spk[i] = i + 1;
+    b.set_signed_prekey(std::string(spk.begin(), spk.end()));
+    auto spk_ed_sig = id.sign(
+        std::span<const std::uint8_t>(spk.data(), spk.size()));
+    b.set_signed_prekey_sig(std::string(
+        spk_ed_sig.begin(), spk_ed_sig.end()));
+
+    auto pq_id = fb::handshake::derive_pq_identity(id,
+        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+    b.set_pq_pubkey(std::string(pq_id.pub.begin(), pq_id.pub.end()));
+    b.set_pq_pubkey_sig(std::string(
+        pq_id.pubkey_sig.begin(), pq_id.pubkey_sig.end()));
+
+    auto pq_sig = fb::handshake::derive_pq_sig_identity(id,
+        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+    fb::handshake::add_pq_sig_fields_to_bundle(b, id, pq_sig);
+    return b;
+}
+
+}  // namespace
+
+TEST(Handshake, BundlePqSigsRoundTrip) {
+    auto id = ident_from_byte(0x44);
+    auto seed = seed_of_byte(0x44);
+    auto b = make_full_bundle(id, seed);
+    EXPECT_EQ(b.pq_sig_pubkey().size(), fb::crypto::pq::kMlDsa65PubBytes);
+    EXPECT_EQ(b.pq_sig_pubkey_sig().size(), fb::crypto::kIdentitySigBytes);
+    EXPECT_EQ(b.signed_prekey_sig_pq().size(), fb::crypto::pq::kMlDsa65SigBytes);
+    EXPECT_EQ(b.pq_pubkey_sig_pq().size(), fb::crypto::pq::kMlDsa65SigBytes);
+    EXPECT_TRUE(verify_bundle_pq_sigs(b));
+}
+
+TEST(Handshake, BundleWithoutPqSigsPassesAsLegacy) {
+    auto id = ident_from_byte(0x55);
+    fb::proto::PreKeyBundle b;
+    b.set_identity_pubkey(std::string(
+        reinterpret_cast<const char*>(id.public_key().data()),
+        id.public_key().size()));
+    // No PQ-sig fields → legacy publisher → must pass.
+    EXPECT_TRUE(verify_bundle_pq_sigs(b));
+}
+
+TEST(Handshake, BundlePqSigsRejectStrippedSubset) {
+    auto id = ident_from_byte(0x66);
+    auto seed = seed_of_byte(0x66);
+    auto b = make_full_bundle(id, seed);
+    // Strip pq_sig_pubkey_sig but leave the other PQ-sig fields — MITM
+    // partial-strip should be REFUSED (not silently downgraded).
+    b.clear_pq_sig_pubkey_sig();
+    EXPECT_FALSE(verify_bundle_pq_sigs(b));
+}
+
+TEST(Handshake, BundlePqSigsRejectTamperedSpkSigPq) {
+    auto id = ident_from_byte(0x77);
+    auto seed = seed_of_byte(0x77);
+    auto b = make_full_bundle(id, seed);
+    auto s = b.signed_prekey_sig_pq();
+    s[100] ^= 0x80;
+    b.set_signed_prekey_sig_pq(s);
+    EXPECT_FALSE(verify_bundle_pq_sigs(b));
+}
+
+TEST(Handshake, BundlePqSigsRejectTamperedPqPubkeySigPq) {
+    auto id = ident_from_byte(0x88);
+    auto seed = seed_of_byte(0x88);
+    auto b = make_full_bundle(id, seed);
+    auto s = b.pq_pubkey_sig_pq();
+    s[42] ^= 0x01;
+    b.set_pq_pubkey_sig_pq(s);
+    EXPECT_FALSE(verify_bundle_pq_sigs(b));
+}
+
+TEST(Handshake, BundlePqSigsRejectSwappedPqSigPubkey) {
+    auto id = ident_from_byte(0x99);
+    auto seed_a = seed_of_byte(0x99);
+    auto seed_b = seed_of_byte(0xAA);
+    auto bundle = make_full_bundle(id, seed_a);
+    // MITM swaps in an unrelated PQ-sig pubkey + tries to keep going.
+    // Without re-signing the binding, the pq_sig_pubkey_sig fails first.
+    auto wrong = fb::handshake::derive_pq_sig_identity(
+        ident_from_byte(0xBB),   // a different identity entirely
+        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed_b));
+    bundle.set_pq_sig_pubkey(std::string(
+        wrong.pub.begin(), wrong.pub.end()));
+    EXPECT_FALSE(verify_bundle_pq_sigs(bundle));
+}
+
 TEST(Handshake, HybridVerifyRejectsWrongMessage) {
     auto id = ident_from_byte(0x99);
     auto seed = seed_of_byte(0x99);

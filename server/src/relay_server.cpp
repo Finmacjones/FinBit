@@ -329,6 +329,27 @@ int fb::server::run_relay(const RelayConfig& cfg, std::atomic<bool>& stop) {
     std::string   tls_key      = cfg.tls_key;
     std::string   offline_db   = cfg.offline_db;
 
+    // Amnesia mode (Tier-11): refuse all disk persistence, regardless of
+    // any other flag. Override + banner + future-proofing — any new
+    // persistence flag must also gate on cfg.amnesia.
+    if (cfg.amnesia) {
+        if (!offline_db.empty()) {
+            std::fprintf(stderr,
+                "[server] AMNESIA MODE: clearing --offline-db (%s) — RAM only\n",
+                offline_db.c_str());
+            offline_db.clear();
+        }
+        std::fprintf(stderr,
+            "[server] ============================================================\n"
+            "[server] AMNESIA MODE ACTIVE — no disk persistence\n"
+            "[server]   * offline message queue: in-RAM only (power off = gone)\n"
+            "[server]   * directory + prekey store: in-RAM only\n"
+            "[server]   * the operator can advertise: no subpoena can compel\n"
+            "[server]     data the operator does not have.\n"
+            "[server]   * pair with docs/warrant-canary.md (signed monthly).\n"
+            "[server] ============================================================\n");
+    }
+
     fb::server::Directory dir;
     fb::server::Relay relay;
     if (!offline_db.empty()) {

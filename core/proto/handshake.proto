@@ -57,6 +57,39 @@ message PreKeyBundle {
     // classical X25519 share is already identity-bound; binding the PQ
     // share too is what makes the hybrid genuinely two-factor).
     bytes  pq_pubkey_sig        = 8;
+
+    // ---- PQ-sig hybrid (Tier 11) ----
+    // ML-DSA-65 (FIPS-204) public key (1952 B). When non-empty, the
+    // publisher signs the SPK + the KEM pubkey with BOTH Ed25519 AND
+    // ML-DSA-65 — verifiers require both to pass (fb::handshake::
+    // hybrid_verify). An attacker with a future CRQC who breaks Ed25519
+    // still has to forge ML-DSA-65 (a PQ-hard lattice problem) to swap
+    // the SPK or KEM pubkey mid-flight. Backward compat: empty fields
+    // → Ed25519-only verification (pre-PQ-sig publisher, same trust
+    // model as the pre-PQ-sig codebase).
+    bytes  pq_sig_pubkey        = 9;
+
+    // Ed25519 signature over pq_sig_pubkey by the identity key. Roots the
+    // PQ-sig identity in the existing Ed25519 identity. HONEST LIMIT:
+    // this binding sig is Ed25519-only — a CRQC adversary can forge it
+    // and swap in their own pq_sig_pubkey, then sign anything with their
+    // own PQ-sig key. Full PQ-rooted identity (Ed25519+ML-DSA at the
+    // protocol root) is the documented next-tier upgrade.
+    bytes  pq_sig_pubkey_sig    = 10;
+
+    // ML-DSA-65 (3309 B) signature over the X25519 signed_prekey by the
+    // pq_sig_pubkey. Verified ALONGSIDE signed_prekey_sig — both must
+    // pass for a hybrid-verified bundle. A relay/MITM that swaps the
+    // SPK must forge BOTH a 64-byte Ed25519 sig AND a 3309-byte ML-DSA
+    // sig to go undetected — even a CRQC who can forge the former can't
+    // forge the latter without solving an ML-DSA-equivalent lattice
+    // problem.
+    bytes  signed_prekey_sig_pq = 11;
+
+    // ML-DSA-65 signature over pq_pubkey by pq_sig_pubkey. Same role as
+    // signed_prekey_signature_pq but for the KEM pubkey — a swap of
+    // pq_pubkey mid-flight requires forging both this and pq_pubkey_sig.
+    bytes  pq_pubkey_sig_pq     = 12;
 }
 
 // User registration / identity claim posted to the server. Server verifies

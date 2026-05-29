@@ -142,6 +142,15 @@ HybridSendResult derive_hybrid_send_from_bundle(
                 "hybrid_send_from_bundle: pq_pubkey signature invalid — possible MITM");
         }
     }
+    // Tier-11 PQ-sig: when the bundle advertises PQ-sig fields, every
+    // hybrid signature inside must verify (verify_bundle_pq_sigs handles
+    // the partial-state-refused logic and the legacy-bundle pass-through).
+    // A bundle that has PQ-sig fields with a tampered sig is treated as
+    // active MITM, not as a downgrade opportunity.
+    if (!verify_bundle_pq_sigs(bundle)) {
+        throw std::runtime_error(
+            "hybrid_send_from_bundle: PQ-sig verification failed — possible MITM");
+    }
     return derive_hybrid_send(mine, peer_x, pq_pub);
 }
 
@@ -239,6 +248,116 @@ bool hybrid_verify(
     // Force both checks to evaluate even when the first fails — defeats a
     // timing observer learning whether the classical or PQ half is wrong.
     return ok_ed & ok_pq;
+}
+
+void add_pq_sig_fields_to_bundle(
+    fb::proto::PreKeyBundle& bundle,
+    const fb::crypto::Identity& classical,
+    const PqSigIdentity& pq) {
+    // 1. Publish the ML-DSA-65 pubkey + the Ed25519 binding sig the
+    //    PqSigIdentity already carries.
+    bundle.set_pq_sig_pubkey(std::string(
+        reinterpret_cast<const char*>(pq.pub.data()), pq.pub.size()));
+    bundle.set_pq_sig_pubkey_sig(std::string(
+        reinterpret_cast<const char*>(pq.pubkey_sig.data()),
+        pq.pubkey_sig.size()));
+
+    // 2. ML-DSA-65 sig over the SPK by the PQ-sig keypair. Caller already
+    //    wrote bundle.signed_prekey before us.
+    auto spk_pq = fb::crypto::pq::sign_ml_dsa_65(
+        std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65SecBytes>(
+            pq.sec.data(), pq.sec.size()),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(bundle.signed_prekey().data()),
+            bundle.signed_prekey().size()));
+    bundle.set_signed_prekey_sig_pq(std::string(
+        reinterpret_cast<const char*>(spk_pq.data()), spk_pq.size()));
+
+    // 3. ML-DSA-65 sig over the KEM pubkey by the PQ-sig keypair.
+    if (!bundle.pq_pubkey().empty()) {
+        auto kem_pq = fb::crypto::pq::sign_ml_dsa_65(
+            std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65SecBytes>(
+                pq.sec.data(), pq.sec.size()),
+            std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(bundle.pq_pubkey().data()),
+                bundle.pq_pubkey().size()));
+        bundle.set_pq_pubkey_sig_pq(std::string(
+            reinterpret_cast<const char*>(kem_pq.data()), kem_pq.size()));
+    }
+
+    (void)classical;   // (binding sig already inside pq.pubkey_sig)
+}
+
+bool verify_bundle_pq_sigs(const fb::proto::PreKeyBundle& bundle) noexcept {
+    // Treat all-empty as a pre-PQ-sig publisher and pass — backward compat.
+    const bool any =
+        !bundle.pq_sig_pubkey().empty() ||
+        !bundle.pq_sig_pubkey_sig().empty() ||
+        !bundle.signed_prekey_sig_pq().empty() ||
+        !bundle.pq_pubkey_sig_pq().empty();
+    if (!any) return true;
+
+    // Partial state = refuse (a MITM stripping some fields but not others
+    // should never silently downgrade).
+    if (bundle.pq_sig_pubkey().size() != fb::crypto::pq::kMlDsa65PubBytes)   return false;
+    if (bundle.pq_sig_pubkey_sig().size() != fb::crypto::kIdentitySigBytes)  return false;
+    if (bundle.signed_prekey_sig_pq().size() != fb::crypto::pq::kMlDsa65SigBytes) return false;
+    if (bundle.identity_pubkey().size() != fb::crypto::kIdentityPubKeyBytes) return false;
+    if (bundle.signed_prekey().size() != 32)                                 return false;
+
+    // 1. Ed25519: identity_pubkey signed pq_sig_pubkey.
+    fb::crypto::PubKey id_pub{};
+    std::memcpy(id_pub.data(), bundle.identity_pubkey().data(), id_pub.size());
+    fb::crypto::Sig pq_pub_sig{};
+    std::memcpy(pq_pub_sig.data(), bundle.pq_sig_pubkey_sig().data(), pq_pub_sig.size());
+    if (!fb::crypto::Identity::verify(
+            id_pub,
+            std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(bundle.pq_sig_pubkey().data()),
+                bundle.pq_sig_pubkey().size()),
+            pq_pub_sig)) {
+        return false;
+    }
+
+    // 2. ML-DSA-65: pq_sig_pubkey signed signed_prekey.
+    {
+        fb::crypto::pq::MlDsa65Sig sig{};
+        std::memcpy(sig.data(), bundle.signed_prekey_sig_pq().data(), sig.size());
+        fb::crypto::pq::MlDsa65Pub pq_pub{};
+        std::memcpy(pq_pub.data(), bundle.pq_sig_pubkey().data(), pq_pub.size());
+        if (!fb::crypto::pq::verify_ml_dsa_65(
+                std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>(pq_pub),
+                std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(bundle.signed_prekey().data()),
+                    bundle.signed_prekey().size()),
+                std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65SigBytes>(sig))) {
+            return false;
+        }
+    }
+
+    // 3. ML-DSA-65: pq_sig_pubkey signed pq_pubkey (if KEM pubkey is set).
+    if (!bundle.pq_pubkey().empty()) {
+        if (bundle.pq_pubkey_sig_pq().size() != fb::crypto::pq::kMlDsa65SigBytes) {
+            return false;
+        }
+        fb::crypto::pq::MlDsa65Sig sig{};
+        std::memcpy(sig.data(), bundle.pq_pubkey_sig_pq().data(), sig.size());
+        fb::crypto::pq::MlDsa65Pub pq_pub{};
+        std::memcpy(pq_pub.data(), bundle.pq_sig_pubkey().data(), pq_pub.size());
+        if (!fb::crypto::pq::verify_ml_dsa_65(
+                std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>(pq_pub),
+                std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(bundle.pq_pubkey().data()),
+                    bundle.pq_pubkey().size()),
+                std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65SigBytes>(sig))) {
+            return false;
+        }
+    } else if (!bundle.pq_pubkey_sig_pq().empty()) {
+        // pq_pubkey_sig_pq present but pq_pubkey absent — malformed.
+        return false;
+    }
+
+    return true;
 }
 
 }  // namespace fb::handshake

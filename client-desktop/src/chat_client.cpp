@@ -563,6 +563,12 @@ struct ChatClient::Impl {
     // long-term Ed25519 identity seed via HKDF (FinBit-PQ-seed-v1). Same
     // user → same PQ identity across runs; no extra persistence required.
     PqIdentity pq_id{};
+
+    // Tier-11 PQ-sig: deterministic ML-DSA-65 keypair derived from the
+    // same Ed25519 seed (different HKDF info). Used to publish hybrid
+    // signatures on PreKeyBundle (signed_prekey + pq_pubkey) so a CRQC
+    // attacker can't downgrade.
+    fb::handshake::PqSigIdentity pq_sig_id{};
     std::unique_ptr<fb::store::SqliteStore> store;
     std::string store_path;
     std::optional<fb::net::Socket> sock;
@@ -973,6 +979,10 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // Identity object exposes only the Ed25519-derived secret key,
             // not the original seed material).
             impl_->pq_id = derive_pq_identity(*impl_->identity,
+                std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(
+                    impl_->seed));
+            impl_->pq_sig_id = fb::handshake::derive_pq_sig_identity(
+                *impl_->identity,
                 std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(
                     impl_->seed));
             // We intentionally no longer call save_identity() — it was a
@@ -1613,6 +1623,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 b->set_pq_pubkey_sig(std::string(
                     reinterpret_cast<const char*>(impl_->pq_id.pubkey_sig.data()),
                     impl_->pq_id.pubkey_sig.size()));
+                // Tier-11 PQ-sig: hybrid (Ed25519 + ML-DSA-65) signatures
+                // over signed_prekey and pq_pubkey. Verifier requires both
+                // halves to pass — defeats a CRQC swapping either pubkey
+                // mid-flight.
+                fb::handshake::add_pq_sig_fields_to_bundle(
+                    *b, *impl_->identity, impl_->pq_sig_id);
                 b->set_published_at_ms(static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch())

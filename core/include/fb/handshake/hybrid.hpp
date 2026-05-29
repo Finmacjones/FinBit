@@ -248,4 +248,31 @@ struct HybridSignature {
     std::span<const std::uint8_t> message,
     const HybridSignature& sig) noexcept;
 
+// Populate the four PQ-sig fields on a PreKeyBundle. The caller must have
+// already set identity_pubkey, signed_prekey, signed_prekey_sig, pq_pubkey,
+// pq_pubkey_sig. This adds:
+//   * pq_sig_pubkey         — the ML-DSA-65 pubkey
+//   * pq_sig_pubkey_sig     — Ed25519 sig over pq_sig_pubkey by the identity
+//   * signed_prekey_sig_pq  — ML-DSA-65 sig over signed_prekey by pq_sig_pubkey
+//   * pq_pubkey_sig_pq      — ML-DSA-65 sig over pq_pubkey by pq_sig_pubkey
+void add_pq_sig_fields_to_bundle(
+    fb::proto::PreKeyBundle& bundle,
+    const fb::crypto::Identity& classical,
+    const PqSigIdentity& pq);
+
+// Verify the PQ-sig fields on a peer's PreKeyBundle.
+//
+// Returns true iff EITHER (a) the bundle is pre-PQ-sig (all four PQ-sig
+// fields empty) — Ed25519-only fallback path — OR (b) all four fields are
+// present and every hybrid signature verifies. Returns false on any
+// partial/mismatched state (which would only happen with a MITM that
+// stripped some fields but not others — refuse rather than silently
+// downgrade).
+//
+// The verifier does NOT also check the existing Ed25519 signed_prekey_sig
+// or pq_pubkey_sig — those are checked elsewhere (the call sites that
+// already exist in derive_hybrid_send_from_bundle). This helper only
+// adds the PQ half.
+[[nodiscard]] bool verify_bundle_pq_sigs(const fb::proto::PreKeyBundle& bundle) noexcept;
+
 }  // namespace fb::handshake
