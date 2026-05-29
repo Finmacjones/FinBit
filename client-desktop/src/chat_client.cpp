@@ -343,6 +343,35 @@ QString peer_label_for(std::span<const std::uint8_t> pub) {
     return s;
 }
 
+// Sealed-sender wrapper: parses an already-serialized DmPayload, fills in
+// sealed_sender_pubkey + sealed_sender_sig, re-serializes. The signature
+// covers (envelope_id || timestamp_ms_be) — the same outer AAD bound by
+// the AEAD — so an envelope can't be replayed under a different id or
+// time without breaking BOTH the seal and the AEAD tag at once. Used by
+// every chat_client send site once a session is "pq_acked" (the peer has
+// proven they can decrypt by replying); the corresponding Envelope must
+// SET sender_pubkey EMPTY so the relay learns nothing about who sent it.
+std::vector<std::uint8_t> seal_dm_payload(
+    std::vector<std::uint8_t> dm_bytes,
+    const fb::crypto::Identity& id,
+    std::span<const std::uint8_t> envelope_id,
+    std::uint64_t timestamp_ms) {
+    fb::proto::DmPayload dmp;
+    if (!dmp.ParseFromArray(dm_bytes.data(), static_cast<int>(dm_bytes.size()))) {
+        return dm_bytes;
+    }
+    auto seal = fb::handshake::make_sealed_sender_fields(id, envelope_id, timestamp_ms);
+    dmp.set_sealed_sender_pubkey(std::string(
+        reinterpret_cast<const char*>(seal.pubkey.data()), seal.pubkey.size()));
+    dmp.set_sealed_sender_sig(std::string(
+        reinterpret_cast<const char*>(seal.sig.data()), seal.sig.size()));
+    std::vector<std::uint8_t> out(dmp.ByteSizeLong());
+    if (!dmp.SerializeToArray(out.data(), static_cast<int>(out.size()))) {
+        return dm_bytes;
+    }
+    return out;
+}
+
 std::vector<std::uint8_t> pack_media_signal_payload(
     std::span<const std::uint8_t, 16> call_id, std::uint32_t kind,
     std::span<const std::uint8_t> payload, std::uint32_t epoch,
@@ -1416,6 +1445,26 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 tlsopts.ca_file              = impl_->tls_ca_file;
                 tlsopts.insecure_skip_verify = impl_->tls_insecure_skip_verify;
                 tlsopts.socks5_proxy         = impl_->socks5_proxy;
+                // SOCKS5 stream isolation: when routing through a SOCKS5
+                // proxy (typically Tor), pass per-relay-host credentials
+                // so Tor's IsolateSOCKSAuth keys a dedicated circuit for
+                // *this* FinBit dial — separating us from any other app
+                // (or another FinBit relay) sharing the same Tor instance.
+                // Stable per-host so reconnects reuse the same circuit;
+                // doesn't authenticate against Tor (it just keys
+                // isolation). FB_SOCKS_USER / FB_SOCKS_PASS override.
+                if (!impl_->socks5_proxy.empty()) {
+                    if (const char* u = std::getenv("FB_SOCKS_USER"); u && *u) {
+                        tlsopts.socks5_username = u;
+                    } else {
+                        tlsopts.socks5_username = "finbit:" + impl_->host.toStdString();
+                    }
+                    if (const char* p = std::getenv("FB_SOCKS_PASS"); p && *p) {
+                        tlsopts.socks5_password = p;
+                    } else {
+                        tlsopts.socks5_password = "x";   // any non-empty is fine
+                    }
+                }
                 // Tier-3: the front domain (FB_FRONT_SNI) overrides the
                 // SNI when set; that's what a passive observer sees.
                 tlsopts.sni_hostname         = impl_->ws_front_sni.empty()
@@ -2204,9 +2253,97 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             auto dispatch_envelope = [&](const fb::proto::Envelope& env_in) {
                 for (int _hoisted_once = 0; _hoisted_once < 1; ++_hoisted_once) {
                             const auto& env = env_in;
-                            if (env.sender_pubkey().size() != 32) continue;
-                            const std::string sender_pub_bytes(env.sender_pubkey().begin(),
-                                                                env.sender_pubkey().end());
+                            // Sealed-sender pre-pass (Signal-style metadata
+                            // defense). When env.sender_pubkey is EMPTY:
+                            //  1. The envelope must be a DM (channels need
+                            //     sender_pub for SenderKeys; sealed isn't
+                            //     defined for them yet).
+                            //  2. Try each session.rat with try_decrypt
+                            //     (state-snapshot variant — wrong sessions
+                            //     stay intact). On success, parse the
+                            //     inner DmPayload, require
+                            //     sealed_sender_pubkey == session.peer_pub,
+                            //     and verify sealed_sender_sig over the
+                            //     envelope_id || timestamp_ms.
+                            //  3. Fabricate sender_pub_bytes from the
+                            //     matched session and skip the legacy
+                            //     re-decrypt by stashing the plaintext
+                            //     in sealed_pt.
+                            //
+                            // First-contact envelopes still ship a plaintext
+                            // sender_pubkey (Bob has nothing to try-all
+                            // against yet) — that one-time identity reveal
+                            // is the current tradeoff.
+                            std::string sender_pub_bytes;
+                            std::optional<std::vector<std::uint8_t>> sealed_pt;
+                            if (env.sender_pubkey().empty()) {
+                                if (env.recipient_case() !=
+                                    fb::proto::Envelope::kUserPubkey) {
+                                    continue;
+                                }
+                                const auto env_id_span =
+                                    std::span<const std::uint8_t>(
+                                        reinterpret_cast<const std::uint8_t*>(
+                                            env.envelope_id().data()),
+                                        env.envelope_id().size());
+                                const auto env_ct_span =
+                                    std::span<const std::uint8_t>(
+                                        reinterpret_cast<const std::uint8_t*>(
+                                            env.ciphertext().data()),
+                                        env.ciphertext().size());
+                                const auto env_aad_span =
+                                    std::span<const std::uint8_t>(
+                                        reinterpret_cast<const std::uint8_t*>(
+                                            env.aad().data()),
+                                        env.aad().size());
+                                for (auto& [_sname, s] : impl_->sessions) {
+                                    if (!s.rat) continue;
+                                    auto attempt = s.rat->try_decrypt(
+                                        env_ct_span, env_aad_span);
+                                    if (!attempt) continue;
+                                    fb::proto::DmPayload dmp;
+                                    if (!dmp.ParseFromArray(attempt->data(),
+                                            static_cast<int>(attempt->size()))) {
+                                        continue;
+                                    }
+                                    if (dmp.sealed_sender_pubkey().size() != 32 ||
+                                        dmp.sealed_sender_sig().size() != 64) {
+                                        continue;
+                                    }
+                                    if (0 != std::memcmp(
+                                            dmp.sealed_sender_pubkey().data(),
+                                            s.peer_pub.data(), 32)) {
+                                        continue;
+                                    }
+                                    if (!fb::handshake::verify_sealed_sender(
+                                            std::span<const std::uint8_t,
+                                                      fb::crypto::kIdentityPubKeyBytes>(
+                                                reinterpret_cast<const std::uint8_t*>(
+                                                    dmp.sealed_sender_pubkey().data()), 32),
+                                            std::span<const std::uint8_t,
+                                                      fb::crypto::kIdentitySigBytes>(
+                                                reinterpret_cast<const std::uint8_t*>(
+                                                    dmp.sealed_sender_sig().data()), 64),
+                                            env_id_span, env.timestamp_ms())) {
+                                        continue;
+                                    }
+                                    sender_pub_bytes.assign(
+                                        reinterpret_cast<const char*>(s.peer_pub.data()),
+                                        s.peer_pub.size());
+                                    sealed_pt = std::move(*attempt);
+                                    break;
+                                }
+                                if (sender_pub_bytes.empty()) {
+                                    emit log("sealed-sender envelope: no "
+                                              "session matched + verified");
+                                    continue;
+                                }
+                            } else {
+                                if (env.sender_pubkey().size() != 32) continue;
+                                sender_pub_bytes.assign(
+                                    env.sender_pubkey().begin(),
+                                    env.sender_pubkey().end());
+                            }
                             // Channel envelope?
                             if (env.recipient_case() ==
                                 fb::proto::Envelope::kChannelGroupId) {
@@ -2416,13 +2553,24 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     continue;
                                 }
                             }
-                            auto pt = sess.rat->decrypt(
-                                std::span<const std::uint8_t>(
-                                    reinterpret_cast<const std::uint8_t*>(
-                                        env.ciphertext().data()),
-                                    env.ciphertext().size()),
-                                std::span<const std::uint8_t>(
-                                    outer_aad.data(), outer_aad.size()));
+                            // Sealed-sender pre-pass at the top of dispatch
+                            // may have already consumed the ratchet step
+                            // via try_decrypt; sealed_pt holds the
+                            // recovered plaintext in that case so we skip
+                            // a second decrypt that would advance the
+                            // chain past the just-consumed message key.
+                            std::optional<std::vector<std::uint8_t>> pt;
+                            if (sealed_pt.has_value()) {
+                                pt = std::move(sealed_pt);
+                            } else {
+                                pt = sess.rat->decrypt(
+                                    std::span<const std::uint8_t>(
+                                        reinterpret_cast<const std::uint8_t*>(
+                                            env.ciphertext().data()),
+                                        env.ciphertext().size()),
+                                    std::span<const std::uint8_t>(
+                                        outer_aad.data(), outer_aad.size()));
+                            }
                             if (!pt) {
                                 emit log("decrypt failed");
                                 continue;
@@ -4694,6 +4842,21 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     const auto env_aad = envelope_aad_bytes(
                         std::span<const std::uint8_t>(envid.data(), envid.size()),
                         now_ms);
+                    // Sealed sender: once the peer has acked our session
+                    // (sess.pq_acked, set when their first reply decrypted
+                    // under our ratchet), wrap the DmPayload with our
+                    // sealed_sender_pubkey + sig and OMIT
+                    // Envelope.sender_pubkey on the wire. Pre-ack sends
+                    // fall back to the legacy plaintext sender_pubkey so
+                    // first-contact bootstrapping still works (the peer
+                    // has nothing to try-all against).
+                    const bool _sealed = sess.pq_acked;
+                    if (_sealed) {
+                        pt = seal_dm_payload(std::move(pt), *impl_->identity,
+                                              std::span<const std::uint8_t>(
+                                                  envid.data(), envid.size()),
+                                              now_ms);
+                    }
                     auto inner = sess.rat->encrypt(
                         std::span<const std::uint8_t>(pt.data(), pt.size()),
                         std::span<const std::uint8_t>(env_aad.data(),
@@ -4706,9 +4869,11 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     env->set_user_pubkey(std::string(
                         reinterpret_cast<const char*>(sess.peer_pub.data()),
                         sess.peer_pub.size()));
-                    env->set_sender_pubkey(std::string(
-                        reinterpret_cast<const char*>(impl_->identity->public_key().data()),
-                        impl_->identity->public_key().size()));
+                    if (!_sealed) {
+                        env->set_sender_pubkey(std::string(
+                            reinterpret_cast<const char*>(impl_->identity->public_key().data()),
+                            impl_->identity->public_key().size()));
+                    }
                     env->set_ciphertext(std::string(inner.begin(), inner.end()));
                     if (!sess.pq_ct.empty()) {
                         env->set_pq_ct(std::string(sess.pq_ct.begin(), sess.pq_ct.end()));

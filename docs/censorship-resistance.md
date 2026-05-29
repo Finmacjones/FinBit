@@ -449,6 +449,55 @@ is a drop-in replacement of four functions documented at the top of
 `finbit_pq.js` (recommended: vendor `@noble/post-quantum`'s `ml-kem-768`
 as a sibling ESM module).
 
+### Tier 11 — Sealed sender + SOCKS5 stream isolation + binary hardening  ✅ shipped
+
+Three defences against bad actors at different layers of the stack —
+metadata, network, and binary.
+
+**Sealed sender** (Signal-style, `DmPayload.sealed_sender_pubkey/_sig`):
+once a peer has acked a session (`Session::pq_acked` — set when their
+first inbound from us decrypted under our ratchet), all subsequent
+outbound envelopes ship with `Envelope.sender_pubkey` EMPTY. The
+relay learns nothing about who is talking to whom for those
+post-bootstrap envelopes. The sender identity rides inside the
+AEAD-encrypted DmPayload as an Ed25519 sig over the outer envelope_id
+‖ timestamp_ms, and the recipient verifies the sig matches the session
+it decrypted under (defeats relay reordering envelopes between
+sessions). To make "decrypt under the right session" work without a
+plaintext sender_pubkey, the recipient iterates each candidate session
+with `DoubleRatchet::try_decrypt` — a new state-snapshot variant that
+rolls back on AEAD failure (the default `decrypt` mutates state before
+the MAC check, which would corrupt wrong sessions silently). First-
+contact envelopes (no session yet) keep the plaintext sender_pubkey as
+before — one-time identity reveal is unavoidable without an
+ephemeral-sender handshake.
+
+**SOCKS5 stream isolation** (`TlsClientOptions::socks5_username/password`):
+the chat_client now passes per-relay-host credentials when routing
+through SOCKS5, triggering Tor's `IsolateSOCKSAuth` behaviour: each
+distinct credential gets a dedicated circuit. The credentials don't
+authenticate against Tor — they're a circuit-isolation key only. The
+result: multiple FinBit dials through one Tor instance can't be
+correlated to the same exit, and any other app sharing the Tor proxy
+sees a different circuit too. `FB_SOCKS_USER` / `FB_SOCKS_PASS`
+override the defaults. The lower-level `fb::net::socks5_connect` now
+also supports the userpass auth method (RFC 1929).
+
+**Binary hardening** (`FB_HARDEN=ON` by default): every release build
+now ships with full RELRO + BIND_NOW (read-only GOT defeats overwrite
+ROP), `-fstack-protector-strong` (canaries on every function with a
+local buffer / address-taken local), `-D_FORTIFY_SOURCE=3` (checked
+memcpy/strcpy/snprintf via __builtin_object_size — catches more
+overflows than the older =2), `_GLIBCXX_ASSERTIONS` (bounds-checks
+on `std::vector::operator[]` etc.), `-ftrivial-auto-var-init=zero`
+(eliminates use-of-uninit-stack bugs at ~0.5% runtime cost; gcc 12+
+/ clang 16+), and `-fcf-protection=full` (Intel CET shadow stack +
+indirect-branch tracking on x86_64; compiles to NOP on older CPUs).
+Auto-skipped on Debug builds (debugging signal) and when sanitizers
+are active (they conflict with FORTIFY + canary). The compile_commands.json
+shows every flag landing on every TU; full RELRO confirmed via
+`readelf -d | grep BIND_NOW`.
+
 ### Tier 8 — Reproducible builds + signed releases  ✅ shipped
 
 Supply-chain defense. Anyone can take a public commit SHA and rebuild the

@@ -55,13 +55,31 @@ public:
 
 // ---- Pure wire-format helpers (unit-testable) -----------------------------
 
-// "[0x05][0x01][0x00]" — no-auth greeting.
+// Default no-auth greeting: "[0x05][0x01][0x00]".
 [[nodiscard]] std::vector<std::uint8_t> encode_greeting();
+
+// Greeting that offers username/password auth (RFC 1929, METHOD=0x02) in
+// addition to NO_AUTH (0x00) — used for SOCKS5 stream isolation via Tor's
+// `IsolateSOCKSAuth` (on by default in Tor): different credentials get
+// different circuits. The credentials don't authenticate against Tor — they
+// just key the circuit. "[0x05][0x02][0x00][0x02]".
+[[nodiscard]] std::vector<std::uint8_t> encode_greeting_with_userpass();
+
+// Encode an RFC 1929 username/password sub-negotiation request. Both
+// strings 0..255 bytes. "[0x01][ulen][user][plen][pass]".
+[[nodiscard]] std::vector<std::uint8_t> encode_userpass_auth(
+    const std::string& username, const std::string& password);
 
 // Returns the server's chosen METHOD byte if the response is well-formed
 // (VER=0x05, exactly 2 bytes); std::nullopt otherwise. 0x00 = NO_AUTH accepted;
-// 0xFF = no acceptable method.
+// 0x02 = username/password accepted; 0xFF = no acceptable method.
 [[nodiscard]] std::optional<std::uint8_t> parse_greeting_response(
+    std::span<const std::uint8_t> resp);
+
+// Parse the RFC 1929 sub-negotiation response. Returns the STATUS byte
+// (0x00 = success; non-zero = failure) when the response is well-formed
+// (VER=0x01, exactly 2 bytes); std::nullopt otherwise.
+[[nodiscard]] std::optional<std::uint8_t> parse_userpass_response(
     std::span<const std::uint8_t> resp);
 
 // CONNECT request with ATYP=0x03 (domain). host must be 1..255 bytes.
@@ -97,9 +115,22 @@ public:
 //
 // `timeout_ms` bounds the whole handshake (greet + CONNECT round-trips), not
 // the lifetime of the resulting tunnel.
+//
+// When `username`/`password` are non-empty, the SOCKS5 greeting offers
+// RFC 1929 username/password auth (METHOD=0x02); if the server picks it,
+// the credentials are sent and a non-zero status surfaces as SocksError.
+// The CRITICAL use case is Tor's `IsolateSOCKSAuth` stream-isolation:
+// passing per-connection credentials forces Tor to use a fresh circuit,
+// so multiple FinBit connections through one Tor instance can't be
+// correlated to the same circuit by the exit. The credentials themselves
+// don't authenticate against Tor — they just key the circuit. Empty
+// credentials → NO_AUTH (the default), back-compat with the prior call
+// signature.
 [[nodiscard]] fb::net::Socket socks5_connect(
     const std::string& proxy_host, std::uint16_t proxy_port,
     const std::string& target_host, std::uint16_t target_port,
-    int timeout_ms = 10000);
+    int timeout_ms = 10000,
+    const std::string& username = "",
+    const std::string& password = "");
 
 }  // namespace fb::net::socks5

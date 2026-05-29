@@ -38,6 +38,92 @@ option(FB_FEATURE_MLS "Enable MLS group crypto via vendored mlspp" OFF)
 # matter more for normal dev; CI flips this on for release tags).
 option(FB_REPRODUCIBLE_BUILD "Apply reproducible-build flags" OFF)
 
+# Binary hardening — applied to non-Debug, non-sanitizer builds. Compiles
+# defenses against classic memory-safety exploits (smashed stack, ROP, GOT
+# overwrite, uninitialized stack reads). Defaults ON because every flag here
+# is free or near-free at runtime. See docs/censorship-resistance.md.
+#
+# Baseline already provided by modern toolchains (PIE, partial RELRO, NX
+# stack, basic stack canary) — this block adds full RELRO, strong stack
+# protector, _FORTIFY_SOURCE=3 + libstdc++ asserts, Intel CET shadow stack,
+# and zero-init of stack autos. Skip in Debug (worsens debugging signal)
+# and when sanitizers are on (they conflict with FORTIFY + canary).
+option(FB_HARDEN "Apply binary-hardening flags (PIE/RELRO/CET/FORTIFY/canary)" ON)
+
+if(FB_HARDEN AND NOT MSVC)
+    set(_fb_harden_active OFF)
+    set(_fb_harden_debug
+        "${CMAKE_BUILD_TYPE}" STREQUAL "Debug" OR
+        "${CMAKE_BUILD_TYPE}" STREQUAL "RelWithDebInfo")
+    if(NOT "${CMAKE_BUILD_TYPE}" STREQUAL "Debug"
+       AND NOT (FB_ENABLE_SANITIZERS AND "${CMAKE_BUILD_TYPE}" STREQUAL "Debug"))
+        set(_fb_harden_active ON)
+    endif()
+    # We DO apply most hardening on RelWithDebInfo (the FinBit default) —
+    # FORTIFY needs optimisation (-O>=1), but everything else is fine.
+
+    if(_fb_harden_active)
+        # ---- Compiler ----
+        # Strong stack protector — covers every function with a stack
+        # buffer, address-of-local, alloca, or local array. Cost: ~1%
+        # at function epilogue.
+        add_compile_options(-fstack-protector-strong)
+
+        # _FORTIFY_SOURCE=3 — checked memcpy/strcpy/snprintf/etc. via
+        # __builtin_object_size; catches more overflows than =2 by using
+        # whole-program object-size knowledge. Available on glibc 2.34+
+        # (Ubuntu 22.04 / Debian 12 / Arch). Needs -O >= 1.
+        add_compile_options(
+            "$<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-U_FORTIFY_SOURCE>"
+            "$<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-D_FORTIFY_SOURCE=3>"
+        )
+
+        # libstdc++ assertions — bounds-checks on operator[], front(),
+        # back(), iterator misuse. Catches a meaningful class of UB at
+        # runtime with small overhead.
+        add_compile_definitions(_GLIBCXX_ASSERTIONS)
+
+        # Zero-init stack autos — eliminates entire classes of
+        # use-of-uninitialized-stack bugs at ~0.5% runtime cost. Needs
+        # gcc 12+ / clang 16+; gracefully ignored on older toolchains
+        # via CheckCXXCompilerFlag-style guard below.
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag(-ftrivial-auto-var-init=zero
+                                FB_HAS_TRIVIAL_AUTO_VAR_INIT)
+        if(FB_HAS_TRIVIAL_AUTO_VAR_INIT)
+            add_compile_options(-ftrivial-auto-var-init=zero)
+        endif()
+
+        # Intel CET (Indirect Branch Tracking + Shadow Stack) on x86_64.
+        # Hardware-enforced control-flow integrity; needs CPU support
+        # (Tigerlake+ / Zen 4+) and a glibc compiled with CET. Compiles
+        # to NOP if the CPU lacks it.
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+            check_cxx_compiler_flag(-fcf-protection=full FB_HAS_CET)
+            if(FB_HAS_CET)
+                add_compile_options(-fcf-protection=full)
+            endif()
+        endif()
+
+        # ---- Linker ----
+        # Full RELRO + immediate bind: marks GOT read-only after dynamic
+        # linker resolves all symbols at startup, defeating GOT-overwrite
+        # ROP gadgets. Pair with NX stack (already on by default).
+        if(NOT APPLE)
+            add_link_options(-Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+        endif()
+
+        message(STATUS "FB_HARDEN: full RELRO + stack-protector-strong + "
+                       "_FORTIFY_SOURCE=3 + _GLIBCXX_ASSERTIONS"
+                       "$<$<BOOL:${FB_HAS_TRIVIAL_AUTO_VAR_INIT}>: + trivial-auto-var-init=zero>"
+                       "$<$<BOOL:${FB_HAS_CET}>: + Intel CET>")
+    else()
+        message(STATUS "FB_HARDEN: skipped (Debug or sanitizers active)")
+    endif()
+    unset(_fb_harden_active)
+    unset(_fb_harden_debug)
+endif()
+
 if(FB_REPRODUCIBLE_BUILD)
     # Strip absolute source paths from debug info + __FILE__ macros so a
     # binary built under /home/alice/finbit and one built under

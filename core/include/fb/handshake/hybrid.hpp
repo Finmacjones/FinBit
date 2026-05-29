@@ -135,4 +135,53 @@ struct HybridSendResult {
     std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SecBytes> my_pq_sec,
     const fb::proto::Envelope& env);
 
+// ---------------------------------------------------------------------------
+// Sealed sender (Signal-style metadata defense).
+//
+// When a session is established (the peer has decrypted at least one of our
+// envelopes), subsequent envelopes ship with Envelope.sender_pubkey EMPTY —
+// the relay no longer learns who is talking to whom. The sender identity
+// rides inside the AEAD-encrypted DmPayload as `sealed_sender_pubkey` +
+// `sealed_sender_sig`, where the sig is Ed25519 over the same outer AAD
+// (envelope_id || timestamp_ms_be) the AEAD already authenticates. The
+// recipient verifies the sig under the claimed pubkey AND requires the
+// claimed pubkey to match the session it decrypted under (defeats relay
+// reordering envelopes between sessions).
+//
+// First-contact envelopes (no session yet on either side) keep the legacy
+// plaintext sender_pubkey on the wire — one-time identity reveal is
+// unavoidable without an ephemeral-sender handshake (Noise_NK etc.). All
+// later envelopes from the same sender are sealed.
+// ---------------------------------------------------------------------------
+
+// Build the bytes that the sealed-sender sig covers. Equal to
+// envelope_id || u64_be(timestamp_ms) — the same outer AAD the AEAD
+// authenticates. Producing both signatures over the same bytes means an
+// envelope can't be replayed under a different id or with a shifted
+// timestamp without invalidating both checks at once.
+[[nodiscard]] std::vector<std::uint8_t> sealed_sender_sig_input(
+    std::span<const std::uint8_t> envelope_id,
+    std::uint64_t timestamp_ms);
+
+struct SealedSenderFields {
+    fb::crypto::PubKey pubkey{};
+    fb::crypto::Sig    sig{};
+};
+
+// Sender side: produce { pubkey, sig } to attach as
+// DmPayload.sealed_sender_pubkey + sealed_sender_sig.
+[[nodiscard]] SealedSenderFields make_sealed_sender_fields(
+    const fb::crypto::Identity& id,
+    std::span<const std::uint8_t> envelope_id,
+    std::uint64_t timestamp_ms);
+
+// Recipient side: verify that the embedded sender claim is genuine. The
+// caller is expected to ALSO check claimed_pubkey == session.peer_pub
+// (this function doesn't have access to session state — keep it pure).
+[[nodiscard]] bool verify_sealed_sender(
+    std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes> claimed_pubkey,
+    std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>    claimed_sig,
+    std::span<const std::uint8_t> envelope_id,
+    std::uint64_t timestamp_ms) noexcept;
+
 }  // namespace fb::handshake

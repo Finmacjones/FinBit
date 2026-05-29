@@ -348,4 +348,25 @@ std::optional<std::vector<std::uint8_t>> DoubleRatchet::decrypt(
     return xchacha20_decrypt(key, nonce, ct, aad);
 }
 
+std::optional<std::vector<std::uint8_t>> DoubleRatchet::try_decrypt(
+    std::span<const std::uint8_t> ratchet_msg, std::span<const std::uint8_t> outer_aad) {
+    // Snapshot the entire State so a failed AEAD verify leaves no trace
+    // (the existing decrypt() mutates state — derives the message key
+    // via kdf_ck and advances ckr/nr — BEFORE the MAC check; reusing the
+    // session afterward would skip a chain step and never re-derive the
+    // missed message key). The State's std::map<skipped> copy is the
+    // only allocation here; everything else is byte-array copy.
+    //
+    // Rollback semantics: on nullopt return, state_ is byte-identical to
+    // what it was before the call. On success, state_ reflects exactly
+    // what decrypt() would have produced. Either way, the caller can
+    // call try_decrypt again — or fall back to decrypt — safely.
+    State snapshot = *state_;
+    auto pt = decrypt(ratchet_msg, outer_aad);
+    if (!pt) {
+        *state_ = std::move(snapshot);
+    }
+    return pt;
+}
+
 }  // namespace fb::crypto

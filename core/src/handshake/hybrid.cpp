@@ -156,4 +156,42 @@ std::array<std::uint8_t, 32> derive_hybrid_recv_from_env(
     return derive_hybrid_recv(mine, peer_x, my_pq_sec, ct_span);
 }
 
+// ---- Sealed sender --------------------------------------------------------
+
+std::vector<std::uint8_t> sealed_sender_sig_input(
+    std::span<const std::uint8_t> envelope_id, std::uint64_t timestamp_ms) {
+    std::vector<std::uint8_t> out;
+    out.reserve(envelope_id.size() + 8);
+    out.insert(out.end(), envelope_id.begin(), envelope_id.end());
+    for (int i = 7; i >= 0; --i) {
+        out.push_back(static_cast<std::uint8_t>((timestamp_ms >> (8 * i)) & 0xff));
+    }
+    return out;
+}
+
+SealedSenderFields make_sealed_sender_fields(
+    const fb::crypto::Identity& id,
+    std::span<const std::uint8_t> envelope_id,
+    std::uint64_t timestamp_ms) {
+    SealedSenderFields out;
+    out.pubkey = id.public_key();
+    auto msg = sealed_sender_sig_input(envelope_id, timestamp_ms);
+    out.sig = id.sign(std::span<const std::uint8_t>(msg.data(), msg.size()));
+    return out;
+}
+
+bool verify_sealed_sender(
+    std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes> claimed_pubkey,
+    std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>    claimed_sig,
+    std::span<const std::uint8_t> envelope_id,
+    std::uint64_t timestamp_ms) noexcept {
+    fb::crypto::PubKey pk{};
+    std::memcpy(pk.data(), claimed_pubkey.data(), pk.size());
+    fb::crypto::Sig sg{};
+    std::memcpy(sg.data(), claimed_sig.data(), sg.size());
+    auto msg = sealed_sender_sig_input(envelope_id, timestamp_ms);
+    return fb::crypto::Identity::verify(
+        pk, std::span<const std::uint8_t>(msg.data(), msg.size()), sg);
+}
+
 }  // namespace fb::handshake

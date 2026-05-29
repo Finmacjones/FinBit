@@ -291,7 +291,9 @@ void TlsClient::connect(const std::string& host, std::uint16_t port,
         const auto proxy_port = static_cast<std::uint16_t>(
             std::atoi(p.c_str() + colon + 1));
         impl_->socket = fb::net::socks5::socks5_connect(
-            proxy_host, proxy_port, host, port);
+            proxy_host, proxy_port, host, port,
+            /*timeout_ms=*/10000,
+            opts.socks5_username, opts.socks5_password);
     } else {
         impl_->socket = tcp_connect(host, port);
     }

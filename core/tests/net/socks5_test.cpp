@@ -42,6 +42,42 @@ TEST(Socks5Wire, ParseGreetingResponse) {
         std::span<const std::uint8_t>(tooshort, 1)).has_value());
 }
 
+TEST(Socks5Wire, GreetingWithUserpassOffersBothMethods) {
+    auto g = encode_greeting_with_userpass();
+    EXPECT_EQ(g, (std::vector<std::uint8_t>{0x05, 0x02, 0x00, 0x02}));
+}
+
+TEST(Socks5Wire, UserpassAuthEncoding) {
+    auto a = encode_userpass_auth("finbit:relay.example.com", "x");
+    ASSERT_GE(a.size(), 3u);
+    EXPECT_EQ(a[0], 0x01);            // sub-negotiation VER
+    EXPECT_EQ(a[1], 24);              // ulen = strlen("finbit:relay.example.com")
+    EXPECT_EQ(std::string(a.begin() + 2, a.begin() + 2 + 24),
+              "finbit:relay.example.com");
+    EXPECT_EQ(a[2 + 24], 1);          // plen
+    EXPECT_EQ(a[2 + 24 + 1], 'x');
+}
+
+TEST(Socks5Wire, UserpassAuthTruncatesAtBoundary) {
+    // 256-byte username gets clamped to 255 (RFC 1929 ulen is a byte).
+    auto a = encode_userpass_auth(std::string(256, 'A'), "");
+    EXPECT_EQ(a[1], 255);
+    EXPECT_EQ(a.size(), 3u + 255);    // [0x01][ulen][user][plen=0]
+    EXPECT_EQ(a[2 + 255], 0);
+}
+
+TEST(Socks5Wire, ParseUserpassResponse) {
+    std::uint8_t ok[] = {0x01, 0x00};
+    std::uint8_t fail[] = {0x01, 0xFF};
+    std::uint8_t badver[] = {0x05, 0x00};
+    EXPECT_EQ(parse_userpass_response(std::span<const std::uint8_t>(ok, 2)),
+              std::optional<std::uint8_t>{0x00});
+    EXPECT_EQ(parse_userpass_response(std::span<const std::uint8_t>(fail, 2)),
+              std::optional<std::uint8_t>{0xFF});
+    EXPECT_FALSE(parse_userpass_response(
+        std::span<const std::uint8_t>(badver, 2)).has_value());
+}
+
 TEST(Socks5Wire, ConnectRequestDomainAtyp) {
     auto r = encode_connect_request("relay.example.com", 443);
     ASSERT_EQ(r.size(), 7u + 17u);   // header(4) + len(1) + name(17) + port(2)

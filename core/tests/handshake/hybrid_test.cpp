@@ -175,6 +175,84 @@ TEST(Handshake, BundleHelperVerifiesBindingSig) {
     }, std::runtime_error);
 }
 
+// ---------------------------------------------------------------------------
+// Sealed sender — sender_pubkey hidden from the relay (Signal-style)
+// ---------------------------------------------------------------------------
+
+TEST(Handshake, SealedSenderSigInputIsEnvelopeIdConcatBeTs) {
+    std::array<std::uint8_t, 16> env_id{};
+    for (std::size_t i = 0; i < env_id.size(); ++i) {
+        env_id[i] = static_cast<std::uint8_t>(0xA0 + i);
+    }
+    constexpr std::uint64_t ts = 0x0102030405060708ULL;
+    auto bytes = sealed_sender_sig_input(
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts);
+    ASSERT_EQ(bytes.size(), 16u + 8u);
+    for (std::size_t i = 0; i < 16; ++i) EXPECT_EQ(bytes[i], env_id[i]);
+    // Big-endian u64 of 0x0102030405060708.
+    EXPECT_EQ(bytes[16], 0x01); EXPECT_EQ(bytes[17], 0x02);
+    EXPECT_EQ(bytes[18], 0x03); EXPECT_EQ(bytes[19], 0x04);
+    EXPECT_EQ(bytes[20], 0x05); EXPECT_EQ(bytes[21], 0x06);
+    EXPECT_EQ(bytes[22], 0x07); EXPECT_EQ(bytes[23], 0x08);
+}
+
+TEST(Handshake, SealedSenderRoundTrip) {
+    auto alice = ident_from_byte(0xEE);
+    std::array<std::uint8_t, 16> env_id{};
+    for (std::size_t i = 0; i < env_id.size(); ++i) {
+        env_id[i] = static_cast<std::uint8_t>(i + 1);
+    }
+    const std::uint64_t ts = 1700000000123ULL;
+
+    auto fields = make_sealed_sender_fields(alice,
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts);
+    EXPECT_EQ(fields.pubkey, alice.public_key());
+
+    EXPECT_TRUE(verify_sealed_sender(
+        std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>(
+            fields.pubkey.data(), fields.pubkey.size()),
+        std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>(
+            fields.sig.data(), fields.sig.size()),
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts));
+}
+
+TEST(Handshake, SealedSenderRejectsTimestampShift) {
+    auto alice = ident_from_byte(0xCC);
+    std::array<std::uint8_t, 16> env_id{};
+    randombytes_buf(env_id.data(), env_id.size());
+    const std::uint64_t ts = 1700000000000ULL;
+    auto f = make_sealed_sender_fields(alice,
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts);
+
+    // Same sig, different timestamp → MUST fail (relay can't replay
+    // an envelope at a different time).
+    EXPECT_FALSE(verify_sealed_sender(
+        std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>(
+            f.pubkey.data(), f.pubkey.size()),
+        std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>(
+            f.sig.data(), f.sig.size()),
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()),
+        ts + 1));
+}
+
+TEST(Handshake, SealedSenderRejectsEnvelopeIdReplay) {
+    auto alice = ident_from_byte(0xDD);
+    std::array<std::uint8_t, 16> env_id_a{}, env_id_b{};
+    randombytes_buf(env_id_a.data(), env_id_a.size());
+    randombytes_buf(env_id_b.data(), env_id_b.size());
+    const std::uint64_t ts = 1700000000000ULL;
+    auto f = make_sealed_sender_fields(alice,
+        std::span<const std::uint8_t>(env_id_a.data(), env_id_a.size()), ts);
+
+    // Reusing the sig against a different envelope id → MUST fail.
+    EXPECT_FALSE(verify_sealed_sender(
+        std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>(
+            f.pubkey.data(), f.pubkey.size()),
+        std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>(
+            f.sig.data(), f.sig.size()),
+        std::span<const std::uint8_t>(env_id_b.data(), env_id_b.size()), ts));
+}
+
 TEST(Handshake, BundleWithoutPqGracefullyFallsBack) {
     auto alice  = ident_from_byte(0xC0);
     auto bob    = ident_from_byte(0xC1);

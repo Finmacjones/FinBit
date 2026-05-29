@@ -66,6 +66,19 @@ public:
     [[nodiscard]] std::optional<std::vector<std::uint8_t>> decrypt(
         std::span<const std::uint8_t> ratchet_msg, std::span<const std::uint8_t> aad);
 
+    // Snapshot-then-decrypt: attempt decrypt under a state snapshot; on any
+    // failure (parse / AEAD MAC / out-of-window) restore the prior state
+    // so the ratchet can be re-tried against another envelope. Used by
+    // the sealed-sender recipient path, where the relay-visible envelope
+    // omits sender_pubkey and the recipient must try each candidate
+    // session until one decrypts. The default `decrypt()` ABOVE mutates
+    // state BEFORE the MAC check (per the Signal DR spec, advancing the
+    // chain to derive the message key) — calling it against the wrong
+    // session would corrupt that session permanently. This variant pays
+    // the cost of one State copy per attempt to stay safe.
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>> try_decrypt(
+        std::span<const std::uint8_t> ratchet_msg, std::span<const std::uint8_t> aad);
+
     // PIMPL — full definition lives in ratchet.cpp. Public so internal
     // helpers in the .cpp can take `State&` without friend declarations;
     // the type is forward-only here so consumers see no internals.

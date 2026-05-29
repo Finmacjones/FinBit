@@ -67,6 +67,15 @@ struct TlsClientOptions {
     // bound to the TARGET host, not the proxy.
     std::string socks5_proxy;
 
+    // Optional SOCKS5 username/password for RFC 1929 sub-negotiation.
+    // The CRITICAL use case is Tor's `IsolateSOCKSAuth` (on by default in
+    // Tor): per-connection credentials force fresh circuits, so distinct
+    // FinBit dials through one Tor instance can't be correlated to the
+    // same exit. Tor doesn't actually authenticate the credentials —
+    // they're a circuit-isolation key only. Empty = NO_AUTH (default).
+    std::string socks5_username;
+    std::string socks5_password;
+
     // Disable cert validation entirely. Strictly for local dev / CI where
     // a self-signed cert is acceptable; warn-on-use logged from the cli.
     bool insecure_skip_verify = false;

@@ -62,10 +62,38 @@ std::vector<std::uint8_t> encode_greeting() {
     return {0x05, 0x01, 0x00};   // VER=5, NMETHODS=1, METHODS=[NO_AUTH]
 }
 
+std::vector<std::uint8_t> encode_greeting_with_userpass() {
+    // VER=5, NMETHODS=2, METHODS=[NO_AUTH, USERPASS]. Tor honours either;
+    // when we send credentials, Tor uses them as the IsolateSOCKSAuth key
+    // for circuit isolation. Listing NO_AUTH alongside lets a plain SOCKS5
+    // server that doesn't speak RFC 1929 still pick NO_AUTH and proceed.
+    return {0x05, 0x02, 0x00, 0x02};
+}
+
+std::vector<std::uint8_t> encode_userpass_auth(const std::string& username,
+                                                const std::string& password) {
+    const std::size_t ulen = username.size() > 255 ? 255 : username.size();
+    const std::size_t plen = password.size() > 255 ? 255 : password.size();
+    std::vector<std::uint8_t> out;
+    out.reserve(3 + ulen + plen);
+    out.push_back(0x01);                                   // sub-negotiation VER
+    out.push_back(static_cast<std::uint8_t>(ulen));
+    out.insert(out.end(), username.data(), username.data() + ulen);
+    out.push_back(static_cast<std::uint8_t>(plen));
+    out.insert(out.end(), password.data(), password.data() + plen);
+    return out;
+}
+
 std::optional<std::uint8_t> parse_greeting_response(std::span<const std::uint8_t> r) {
     if (r.size() != 2) return std::nullopt;
     if (r[0] != 0x05)  return std::nullopt;
     return r[1];
+}
+
+std::optional<std::uint8_t> parse_userpass_response(std::span<const std::uint8_t> r) {
+    if (r.size() != 2) return std::nullopt;
+    if (r[0] != 0x01)  return std::nullopt;   // sub-negotiation VER
+    return r[1];                              // 0x00 = success
 }
 
 std::vector<std::uint8_t> encode_connect_request(const std::string& host,
@@ -141,7 +169,9 @@ fb::net::Socket socks5_connect(const std::string& proxy_host,
                                 std::uint16_t proxy_port,
                                 const std::string& target_host,
                                 std::uint16_t target_port,
-                                int timeout_ms) {
+                                int timeout_ms,
+                                const std::string& username,
+                                const std::string& password) {
     if (target_host.empty() || target_host.size() > 255) {
         throw SocksError("SOCKS5: target host must be 1..255 bytes");
     }
@@ -156,16 +186,36 @@ fb::net::Socket socks5_connect(const std::string& proxy_host,
     fb_set_blocking(s.fd());
     fb_set_rcv_timeout(s.fd(), timeout_ms);
 
-    // 3. Greeting: offer NO_AUTH.
-    send_all(s.fd(), encode_greeting());
+    // 3. Greeting. When credentials are provided, also offer RFC 1929
+    //    username/password (METHOD=0x02) — Tor uses these to key
+    //    IsolateSOCKSAuth circuits. Server still picks; we handle both.
+    const bool offer_userpass = !username.empty() || !password.empty();
+    send_all(s.fd(), offer_userpass ? encode_greeting_with_userpass()
+                                    : encode_greeting());
     std::uint8_t greet_resp[2];
     recv_exact(s.fd(), std::span<std::uint8_t>(greet_resp, 2));
     auto method = parse_greeting_response(
         std::span<const std::uint8_t>(greet_resp, 2));
     if (!method) throw SocksError("SOCKS5: malformed greeting response");
-    if (*method != 0x00) {
-        throw SocksError("SOCKS5: proxy rejected NO_AUTH "
-                         "(method 0xFF means no acceptable methods)");
+    if (*method == 0xFF) {
+        throw SocksError("SOCKS5: proxy rejected all offered auth methods");
+    }
+    if (*method == 0x02) {
+        // Sub-negotiate username/password. Tor accepts any non-empty
+        // creds — they're a circuit-isolation key, not a credential check.
+        send_all(s.fd(), encode_userpass_auth(username, password));
+        std::uint8_t auth_resp[2];
+        recv_exact(s.fd(), std::span<std::uint8_t>(auth_resp, 2));
+        auto status = parse_userpass_response(
+            std::span<const std::uint8_t>(auth_resp, 2));
+        if (!status) {
+            throw SocksError("SOCKS5: malformed userpass sub-negotiation response");
+        }
+        if (*status != 0x00) {
+            throw SocksError("SOCKS5: userpass auth rejected by proxy");
+        }
+    } else if (*method != 0x00) {
+        throw SocksError("SOCKS5: proxy chose an unsupported auth method");
     }
 
     // 4. CONNECT (domain ATYP — proxy resolves; no client DNS leak).

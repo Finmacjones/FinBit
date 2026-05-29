@@ -150,6 +150,47 @@ TEST(Ratchet, DistinctSessionsDoNotAcceptEachOthersTraffic) {
     EXPECT_FALSE(p2.bob.decrypt(span_of(e), span_of(kAad)).has_value());
 }
 
+// Sealed sender prerequisite: when a recipient receives an envelope with no
+// plaintext sender_pubkey, they try each candidate session in turn. Each
+// attempt against the WRONG session must leave that session's state
+// untouched — otherwise the wrong session would be silently corrupted
+// (kdf_ck would advance, the real next message from that peer would land
+// on a chain-step ahead). try_decrypt provides this with a state snapshot.
+TEST(Ratchet, TryDecryptOnWrongSessionRollsBackState) {
+    auto p1 = make_pair();
+    auto p2 = make_pair();
+    auto wrong_envelope = p1.alice.encrypt(bytes("for p1.bob"), span_of(kAad));
+
+    // 1. try_decrypt on the wrong session must fail and leave it intact.
+    EXPECT_FALSE(p2.bob.try_decrypt(span_of(wrong_envelope), span_of(kAad)).has_value());
+
+    // 2. The wrongly-tried session can STILL decrypt its own legitimate
+    //    inbound — proving state wasn't advanced by the failed try.
+    auto good = p2.alice.encrypt(bytes("for p2.bob"), span_of(kAad));
+    auto pt = p2.bob.try_decrypt(span_of(good), span_of(kAad));
+    ASSERT_TRUE(pt.has_value());
+    EXPECT_EQ(*pt, bytes("for p2.bob"));
+}
+
+TEST(Ratchet, TryDecryptOnRightSessionAdvancesStateLikeDecrypt) {
+    auto p = make_pair();
+    auto e1 = p.alice.encrypt(bytes("first"), span_of(kAad));
+    auto pt1 = p.bob.try_decrypt(span_of(e1), span_of(kAad));
+    ASSERT_TRUE(pt1.has_value());
+    EXPECT_EQ(*pt1, bytes("first"));
+
+    // A second encrypt → decrypt round-trip works, proving the previous
+    // try_decrypt advanced the chain rather than being a peek.
+    auto e2 = p.alice.encrypt(bytes("second"), span_of(kAad));
+    auto pt2 = p.bob.decrypt(span_of(e2), span_of(kAad));
+    ASSERT_TRUE(pt2.has_value());
+    EXPECT_EQ(*pt2, bytes("second"));
+
+    // Replay of e1 (now consumed) is rejected — proves the message-counter
+    // advance from the prior try_decrypt actually committed.
+    EXPECT_FALSE(p.bob.try_decrypt(span_of(e1), span_of(kAad)).has_value());
+}
+
 TEST(Ratchet, BobCannotSendBeforeReceiving) {
     auto p = make_pair();
     EXPECT_THROW({ (void)p.bob.encrypt(bytes("nope"), span_of(kAad)); }, std::logic_error);

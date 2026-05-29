@@ -165,4 +165,36 @@ message DmPayload {
         Attachment              attachment         = 9;
         RoomKey                 room_key           = 10;
     }
+
+    // ---- Sealed sender (Signal-style metadata defense) -------------------
+    //
+    // When set, the relay-visible Envelope.sender_pubkey is EMPTY — the
+    // relay cannot see who sent the message. These two fields ride inside
+    // the AEAD-encrypted ratchet payload and are the authoritative sender
+    // identity:
+    //
+    //   sealed_sender_pubkey: 32B Ed25519 — sender's long-term identity
+    //   sealed_sender_sig:    64B Ed25519 — sender's detached signature
+    //                                       over (envelope_id || timestamp_ms_be)
+    //                                       so a relay can't replay an
+    //                                       envelope under a different id
+    //                                       or shift the timestamp.
+    //
+    // Recipient flow on a sealed envelope (sender_pubkey empty on wire):
+    //   1. Try each existing Session.rat to decrypt env.ciphertext. The
+    //      MAC failure of a wrong session is fast; typical N is small.
+    //   2. When one decrypts, parse this DmPayload.
+    //   3. Require sealed_sender_pubkey == session.peer_pub (a sealed
+    //      DM that decrypts under session X must claim sender X — defeats
+    //      a relay reordering envelopes between sessions).
+    //   4. Verify sealed_sender_sig as Ed25519 over (env.envelope_id ||
+    //      env.timestamp_ms big-endian) by sealed_sender_pubkey.
+    //
+    // First-contact envelopes (no session yet) keep the legacy plaintext
+    // sender_pubkey on the wire — Bob has nothing to "try all sessions"
+    // against, so a one-time identity reveal is unavoidable without a
+    // major protocol change (Noise_NK ephemeral, etc.). All
+    // subsequent envelopes from this sender are sealed.
+    bytes sealed_sender_pubkey = 100;
+    bytes sealed_sender_sig    = 101;
 }
