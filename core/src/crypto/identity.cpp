@@ -163,6 +163,47 @@ bool pubkey_from_base64(std::string_view encoded, PubKey& out) noexcept {
     return rc == 0 && bin_len == out.size();
 }
 
+std::string safety_number(const PubKey& a, const PubKey& b) {
+    ensure_sodium();
+    // Bytewise lex-sort the two pubkeys so safety_number(a, b) ==
+    // safety_number(b, a) — both peers compute the same number.
+    std::array<std::uint8_t, kIdentityPubKeyBytes * 2> joined{};
+    const bool a_first =
+        std::memcmp(a.data(), b.data(), kIdentityPubKeyBytes) <= 0;
+    const PubKey& lo = a_first ? a : b;
+    const PubKey& hi = a_first ? b : a;
+    std::memcpy(joined.data(),                        lo.data(), kIdentityPubKeyBytes);
+    std::memcpy(joined.data() + kIdentityPubKeyBytes, hi.data(), kIdentityPubKeyBytes);
+
+    // BLAKE2b-256 → 32 bytes.
+    std::array<std::uint8_t, 32> h{};
+    crypto_generichash(h.data(), h.size(), joined.data(), joined.size(),
+                       nullptr, 0);
+
+    // 30 of the 32 hash bytes → 12 groups of 5 decimal digits = 60 digits
+    // total (~199 bits of MITM-detection entropy). Each 5-byte chunk →
+    // two 5-digit groups via (u40 / 10^5) % 10^5 and u40 % 10^5.
+    std::string out;
+    out.reserve(60 + 11);
+    for (std::size_t chunk = 0; chunk < 6; ++chunk) {
+        std::uint64_t v = 0;
+        for (std::size_t i = 0; i < 5; ++i) {
+            v = (v << 8) | h[chunk * 5 + i];
+        }
+        const std::uint32_t hi5 = static_cast<std::uint32_t>(
+            (v / 100000ULL) % 100000ULL);
+        const std::uint32_t lo5 = static_cast<std::uint32_t>(v % 100000ULL);
+        char buf[6];
+        std::snprintf(buf, sizeof(buf), "%05u", hi5);
+        if (!out.empty()) out.push_back(' ');
+        out.append(buf, 5);
+        std::snprintf(buf, sizeof(buf), "%05u", lo5);
+        out.push_back(' ');
+        out.append(buf, 5);
+    }
+    return out;
+}
+
 std::array<std::uint8_t, 64> derive_pq_seed_from_identity_seed(
     std::span<const std::uint8_t, kIdentitySeedBytes> seed) {
     constexpr char kInfo[] = "FinBit-PQ-seed-v1";

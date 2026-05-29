@@ -66,6 +66,32 @@ private:
 [[nodiscard]] std::string         pubkey_to_base64(const PubKey& pubkey);
 [[nodiscard]] bool                pubkey_from_base64(std::string_view encoded, PubKey& out) noexcept;
 
+// Two-party safety number — a stable, order-independent string both peers
+// can read aloud / compare via QR to detect a MITM that has substituted
+// one of their pubkeys.
+//
+// Construction (Signal-style, but Ed25519-only):
+//   sorted_pair = sort(pubkey_a, pubkey_b)              // bytewise lex sort
+//   h = BLAKE2b-256(sorted_pair[0] || sorted_pair[1])
+//   number = decimal( h[0..30] )                        // 60 digits, 5-spaced
+//
+// Order-independence (the bytewise sort) means Alice's "verify against
+// Bob" code reads identically to Bob's "verify against Alice" code — no
+// ambiguity about whose name goes first. 60 decimal digits give 200 bits
+// of MITM-detection entropy; an attacker who can pre-compute a pubkey
+// whose safety number matches a target needs 2^100 work. Spaced every 5
+// digits for human-readability ("12345 67890 ...").
+//
+// MITM threat model: a substitution attack on first contact succeeds
+// silently in the pre-PQ-sig codebase. After PQ-sig wire-up (Tier 11), the
+// PreKeyBundle binding sigs catch a substitution AT KEY-FETCH TIME — but
+// only against an attacker who didn't ALSO compromise the directory.
+// The safety number is the human-layer backstop: even a complete
+// directory compromise cannot make Alice's and Bob's safety numbers
+// match unless the attacker controls keys whose hash maps to the same
+// 200-bit value.
+[[nodiscard]] std::string safety_number(const PubKey& a, const PubKey& b);
+
 // Derive a 64-byte ML-KEM seed deterministically from a 32-byte Ed25519
 // identity seed. Used to give every identity a stable post-quantum keypair
 // without persisting a separate file: the PQ keypair is recomputable from

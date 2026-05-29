@@ -72,6 +72,7 @@ add_library(fb_core STATIC
     src/crypto/pq_kem.cpp
     src/crypto/hybrid_kem.cpp
     src/crypto/padding.cpp
+    src/crypto/shamir.cpp
     src/handshake/hybrid.cpp
     src/net/frame_codec.cpp
     src/net/tcp.cpp

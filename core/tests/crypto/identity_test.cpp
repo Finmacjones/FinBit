@@ -67,6 +67,49 @@ TEST(Identity, PubkeyBase64RoundTrip) {
     EXPECT_EQ(decoded, id.public_key());
 }
 
+// ---- safety_number (MITM-detection — Tier 11) -----------------------------
+
+TEST(Identity, SafetyNumberIsOrderIndependent) {
+    auto alice = fb::crypto::Identity::generate();
+    auto bob   = fb::crypto::Identity::generate();
+    const auto ab = fb::crypto::safety_number(alice.public_key(), bob.public_key());
+    const auto ba = fb::crypto::safety_number(bob.public_key(), alice.public_key());
+    EXPECT_EQ(ab, ba) << "safety number must be order-independent so both peers compute the same string";
+}
+
+TEST(Identity, SafetyNumberIsStableForFixedPubkeys) {
+    auto alice = fb::crypto::Identity::generate();
+    auto bob   = fb::crypto::Identity::generate();
+    const auto first  = fb::crypto::safety_number(alice.public_key(), bob.public_key());
+    const auto second = fb::crypto::safety_number(alice.public_key(), bob.public_key());
+    EXPECT_EQ(first, second);
+}
+
+TEST(Identity, SafetyNumberFormat) {
+    auto alice = fb::crypto::Identity::generate();
+    auto bob   = fb::crypto::Identity::generate();
+    const auto sn = fb::crypto::safety_number(alice.public_key(), bob.public_key());
+    // 12 groups of 5 digits separated by 11 spaces → 60 digits + 11 spaces = 71 chars.
+    EXPECT_EQ(sn.size(), 71u);
+    int digits = 0, spaces = 0;
+    for (char c : sn) {
+        if (c == ' ') ++spaces;
+        else if (c >= '0' && c <= '9') ++digits;
+        else ADD_FAILURE() << "unexpected char in safety number: " << c;
+    }
+    EXPECT_EQ(digits, 60);
+    EXPECT_EQ(spaces, 11);
+}
+
+TEST(Identity, SafetyNumberChangesIfEitherPubkeyChanges) {
+    auto alice = fb::crypto::Identity::generate();
+    auto bob1  = fb::crypto::Identity::generate();
+    auto bob2  = fb::crypto::Identity::generate();
+    const auto sn1 = fb::crypto::safety_number(alice.public_key(), bob1.public_key());
+    const auto sn2 = fb::crypto::safety_number(alice.public_key(), bob2.public_key());
+    EXPECT_NE(sn1, sn2) << "swapping the peer must change the safety number (MITM detection)";
+}
+
 TEST(Identity, MoveDoesNotDoubleFree) {
     auto a = fb::crypto::Identity::generate();
     const auto pub_before = a.public_key();
