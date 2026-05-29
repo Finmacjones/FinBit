@@ -187,6 +187,20 @@ public:
     // Stop the worker and release sockets. Blocks until the thread exits.
     void disconnect();
 
+    // ---- Tier-11 MITM verification surface ----
+    //
+    // The "Verify identity" UI dialog calls these. The safety number is
+    // 12 groups of 5 digits — both peers compute the same string and
+    // compare aloud / via QR; matching numbers prove no MITM has
+    // substituted either pubkey. The verified flag is per-peer and
+    // currently in-memory (sqlite persistence is a focused follow-on);
+    // it drives the UI's ✓ badge.
+    [[nodiscard]] QString    safetyNumberFor(const QByteArray& peerPub) const;
+    [[nodiscard]] bool       isPeerVerified(const QByteArray& peerPub) const;
+    void                     setPeerVerified(const QByteArray& peerPub, bool verified);
+    [[nodiscard]] QByteArray myIdentityPubkey() const;
+    [[nodiscard]] QString    myFingerprint() const;
+
     // History entry returned by load_recent_history().
     struct HistoryEntry {
         bool        outgoing;        // true = me → peer; false = peer → me

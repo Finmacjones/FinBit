@@ -61,6 +61,7 @@
 #include "fb/crypto/identity.hpp"
 #include "fb/crypto/ratchet.hpp"
 #include "fb/crypto/sender_keys.hpp"
+#include "fb/crypto/shamir.hpp"
 #include "fb/handshake/hybrid.hpp"
 #include "fb/net/ech.hpp"
 #include "fb/net/frame_codec.hpp"
@@ -125,6 +126,12 @@ struct Args {
     // Room SFrame key distribution test (Lever B group keying). --send-roomkey
     // DMs a random room_secret to --peer; --listen prints any received one.
     bool send_roomkey = false;
+
+    // Tier-11 Shamir social-recovery commands. Offline — no relay needed.
+    bool        shamir_split   = false;
+    bool        shamir_combine = false;
+    int         shamir_m       = 0;        // threshold (M)
+    int         shamir_n       = 0;        // total shares (N)
     int  room_epoch = 1;
     // Call-signaling test mode (headless, no real media). Mirrors the
     // desktop's group-call lazy bootstrap: --call-offer starts from a
@@ -194,6 +201,10 @@ void usage() {
               << "  --call-listen                     print MY-PUBKEY, await OFFER, reply ANSWER\n"
               << "  --call-offer --peer-pubkey HEX --text SDP\n"
               << "                                    bootstrap (lookup→fetch→init), send OFFER\n"
+              << "Social recovery (Shamir, Tier 11 — offline, no relay needed):\n"
+              << "  --shamir-split M N           hex-encoded secret on stdin → N hex shares on stdout\n"
+              << "                                (any M of the N shares reconstruct)\n"
+              << "  --shamir-combine             M hex shares on stdin (one per line) → hex secret\n"
               << "Channel modes (Phase 1, SenderKeys group crypto):\n"
               << "  --channel-create --channel-name NAME --dist-file PATH --text MSG\n"
               << "                                    create chain, write dist file, send msg\n"
@@ -260,6 +271,16 @@ bool parse(int argc, char** argv, Args& a) {
                                         if (!next(a.image_path)) return false; }
         else if (s == "--image-out") { if (!next(a.image_out)) return false; }
         else if (s == "--send-roomkey") { a.send_roomkey = true; }
+        else if (s == "--shamir-split") {
+            // --shamir-split M N — split the 64-hex-byte secret read from
+            // stdin into N shares (any M reconstruct).
+            std::string m, n;
+            if (!next(m) || !next(n)) return false;
+            a.shamir_split = true;
+            a.shamir_m = std::atoi(m.c_str());
+            a.shamir_n = std::atoi(n.c_str());
+        }
+        else if (s == "--shamir-combine") { a.shamir_combine = true; }
         else if (s == "--room-epoch") { std::string v;
                                         if (!next(v)) return false;
                                         a.room_epoch = std::atoi(v.c_str()); }
@@ -303,6 +324,10 @@ bool parse(int argc, char** argv, Args& a) {
         else if (s == "--help" || s == "-h") { usage(); std::exit(0); }
         else { std::cerr << "unknown arg: " << s << "\n"; usage(); return false; }
     }
+    // Shamir commands are offline — they don't need a username, server, or
+    // any identity state. Skip the user-required check + the mode-count
+    // check below.
+    if (a.shamir_split || a.shamir_combine) return true;
     if (a.user.empty()) return false;
     const int modes = (a.send ? 1 : 0) + (a.listen ? 1 : 0) +
                       (a.channel_create ? 1 : 0) + (a.channel_listen ? 1 : 0) +
@@ -639,6 +664,86 @@ int main(int argc, char** argv) {
     if (sodium_init() < 0) {
         std::cerr << "sodium_init failed\n";
         return 2;
+    }
+
+    // ---- Offline Shamir social-recovery commands ----
+    // Run BEFORE the username-derived identity setup — these commands
+    // don't need a relay, a username, or any identity state. The secret
+    // is hex on stdin / shares are hex on stdout (one per line).
+    auto unhex = [](const std::string& s) -> std::vector<std::uint8_t> {
+        std::string clean;
+        clean.reserve(s.size());
+        for (char c : s) {
+            if (!std::isspace(static_cast<unsigned char>(c))) clean.push_back(c);
+        }
+        if (clean.size() % 2 != 0) return {};
+        std::vector<std::uint8_t> out(clean.size() / 2);
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            unsigned int v = 0;
+            if (std::sscanf(clean.c_str() + i * 2, "%02x", &v) != 1) return {};
+            out[i] = static_cast<std::uint8_t>(v);
+        }
+        return out;
+    };
+    auto tohex = [](const std::vector<std::uint8_t>& b) {
+        std::string s;
+        s.reserve(b.size() * 2);
+        char buf[3];
+        for (auto x : b) {
+            std::snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned>(x));
+            s.append(buf, 2);
+        }
+        return s;
+    };
+    if (args.shamir_split) {
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            std::cerr << "shamir-split: no secret on stdin\n"; return 2;
+        }
+        auto secret = unhex(line);
+        if (secret.empty()) { std::cerr << "shamir-split: bad hex\n"; return 2; }
+        try {
+            auto shares = fb::crypto::shamir::split(
+                std::span<const std::uint8_t>(secret.data(), secret.size()),
+                static_cast<std::uint8_t>(args.shamir_m),
+                static_cast<std::uint8_t>(args.shamir_n));
+            for (const auto& s : shares) {
+                std::cout << tohex(fb::crypto::shamir::encode_share(s)) << "\n";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "shamir-split: " << e.what() << "\n";
+            return 2;
+        }
+        return 0;
+    }
+    if (args.shamir_combine) {
+        std::vector<fb::crypto::shamir::Share> shares;
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line.empty()) continue;
+            auto bytes = unhex(line);
+            if (bytes.empty()) continue;
+            try {
+                shares.push_back(fb::crypto::shamir::decode_share(
+                    std::span<const std::uint8_t>(bytes.data(), bytes.size())));
+            } catch (const std::exception& e) {
+                std::cerr << "shamir-combine: " << e.what() << "\n";
+                return 2;
+            }
+        }
+        if (shares.empty()) {
+            std::cerr << "shamir-combine: no shares on stdin\n"; return 2;
+        }
+        try {
+            auto secret = fb::crypto::shamir::combine(
+                std::span<const fb::crypto::shamir::Share>(
+                    shares.data(), shares.size()));
+            std::cout << tohex(secret) << "\n";
+        } catch (const std::exception& e) {
+            std::cerr << "shamir-combine: " << e.what() << "\n";
+            return 2;
+        }
+        return 0;
     }
 
     // Deterministic identity per username (Phase 0 demo only — never do this

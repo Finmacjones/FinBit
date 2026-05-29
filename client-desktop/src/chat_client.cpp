@@ -569,6 +569,13 @@ struct ChatClient::Impl {
     // signatures on PreKeyBundle (signed_prekey + pq_pubkey) so a CRQC
     // attacker can't downgrade.
     fb::handshake::PqSigIdentity pq_sig_id{};
+
+    // Tier-11 MITM verification — peers the user has manually marked
+    // verified via the safety-number flow. In-memory for now; sqlite
+    // persistence is a follow-on (task #382 stays open for the UI work
+    // + persistence). The map is keyed by raw 32-byte peer pubkey to
+    // survive any session-id reordering.
+    std::map<std::array<std::uint8_t, 32>, bool> verified_peers;
     std::unique_ptr<fb::store::SqliteStore> store;
     std::string store_path;
     std::optional<fb::net::Socket> sock;
@@ -6001,6 +6008,58 @@ std::vector<ChatClient::HistoryEntry> ChatClient::load_recent_history(std::size_
               });
     if (out.size() > limit) out.resize(limit);
     return out;
+}
+
+// ---- Tier-11 MITM verification ---------------------------------------------
+
+QString ChatClient::safetyNumberFor(const QByteArray& peerPub) const {
+    if (!impl_->identity || peerPub.size() != 32) {
+        return {};
+    }
+    fb::crypto::PubKey peer{};
+    std::memcpy(peer.data(), peerPub.constData(), peer.size());
+    return QString::fromStdString(
+        fb::crypto::safety_number(impl_->identity->public_key(), peer));
+}
+
+bool ChatClient::isPeerVerified(const QByteArray& peerPub) const {
+    if (peerPub.size() != 32) return false;
+    std::array<std::uint8_t, 32> key{};
+    std::memcpy(key.data(), peerPub.constData(), 32);
+    std::lock_guard lk(impl_->mu);
+    auto it = impl_->verified_peers.find(key);
+    return it != impl_->verified_peers.end() && it->second;
+}
+
+void ChatClient::setPeerVerified(const QByteArray& peerPub, bool verified) {
+    if (peerPub.size() != 32) return;
+    std::array<std::uint8_t, 32> key{};
+    std::memcpy(key.data(), peerPub.constData(), 32);
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->verified_peers[key] = verified;
+    }
+    emit log(QString("peer fingerprint %1 marked %2")
+                 .arg(QString::fromStdString(
+                     fb::crypto::Identity::fingerprint(
+                         [&] {
+                             fb::crypto::PubKey p{};
+                             std::memcpy(p.data(), key.data(), 32);
+                             return p;
+                         }())))
+                 .arg(verified ? "verified" : "unverified"));
+}
+
+QByteArray ChatClient::myIdentityPubkey() const {
+    if (!impl_->identity) return {};
+    const auto& pub = impl_->identity->public_key();
+    return QByteArray(reinterpret_cast<const char*>(pub.data()),
+                       static_cast<int>(pub.size()));
+}
+
+QString ChatClient::myFingerprint() const {
+    if (!impl_->identity) return {};
+    return QString::fromStdString(impl_->identity->fingerprint());
 }
 
 }  // namespace fb::desktop
