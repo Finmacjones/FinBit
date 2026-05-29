@@ -103,11 +103,22 @@ export function encodeHelloAck(signature) {
     return wrapFrame(FRAME.hello_ack, new Uint8Array(inner));
 }
 
-export function encodePreKeyBundle(identityPub, signedPrekey, publishedAtMs) {
+export function encodePreKeyBundle(identityPub, signedPrekey, publishedAtMs,
+                                    pqPubkey = null, pqPubkeySig = null) {
     const inner = [];
     writeBytes(inner, 1, identityPub);
     writeBytes(inner, 2, signedPrekey);
     writeUint64(inner, 6, publishedAtMs);
+    // Tier-7 PQ-hybrid fields. When the web client's PQ adapter is wired
+    // up (see client-web/ui/finbit_pq.js) these are emitted; otherwise
+    // they're absent and the wire is byte-identical to the pre-PQ form,
+    // and peers fall back to pure X25519 for our envelopes.
+    if (pqPubkey && pqPubkey.length > 0) {
+        writeBytes(inner, 7, pqPubkey);
+    }
+    if (pqPubkeySig && pqPubkeySig.length > 0) {
+        writeBytes(inner, 8, pqPubkeySig);
+    }
     return new Uint8Array(inner);
 }
 
@@ -136,7 +147,7 @@ export function encodeUsernameLookup(pubkey) {
 // Envelope: recipient is a oneof — for DMs we use field 16 (user_pubkey).
 export function encodeDmEnvelope({
     envelopeId, timestampMs, senderPubkey, recipientPubkey, ciphertext,
-    aeadAlg = 1, protoVersion = 1,
+    aeadAlg = 1, protoVersion = 1, pqCt = null,
 }) {
     const inner = [];
     writeBytes(inner, 1, envelopeId);
@@ -145,6 +156,10 @@ export function encodeDmEnvelope({
     writeBytes(inner, 4, ciphertext);
     writeUint32(inner, 6, aeadAlg);
     writeUint32(inner, 7, protoVersion);
+    // Tier-7 PQ-hybrid: 1088B ML-KEM-768 ciphertext when the web client's
+    // PQ adapter is wired and the peer published a pq_pubkey. Empty
+    // otherwise — the receiver falls back to pure X25519 derivation.
+    if (pqCt && pqCt.length > 0) writeBytes(inner, 9, pqCt);
     writeBytes(inner, 16, recipientPubkey);  // user_pubkey (oneof recipient)
     return wrapFrame(FRAME.envelope, new Uint8Array(inner));
 }
@@ -292,6 +307,12 @@ export function decodeKeyFetchResp(inner) {
         bundle = {
             identityPub: b[1] || new Uint8Array(),
             signedPrekey: b[2] || new Uint8Array(),
+            // Tier-7 PQ-hybrid: peer's ML-KEM-768 pubkey + Ed25519
+            // binding sig. Empty when peer is pre-PQ; web client falls
+            // back to pure X25519 send (no harvest-now defense for this
+            // envelope, but interop preserved).
+            pqPubkey: b[7] || new Uint8Array(),
+            pqPubkeySig: b[8] || new Uint8Array(),
         };
     }
     // `request_id` (u64) absent → 0n (legacy server fallback).
@@ -306,6 +327,12 @@ export function decodeEnvelope(inner) {
         senderPubkey: inner[3] || new Uint8Array(),
         ciphertext: inner[4] || new Uint8Array(),
         aeadAlg: Number(inner[6] || 0n),
+        // Tier-7 PQ-hybrid: 1088B ML-KEM-768 ciphertext on the first
+        // envelope of a hybrid session (chat_client / fb-cli ship this).
+        // Web clients use it via the finbit_pq adapter when PQ is wired;
+        // otherwise it's ignored (envelope still decrypts via X25519 if
+        // the sender ALSO shipped the X25519 share — which they do).
+        pqCt: inner[9] || new Uint8Array(),
         userPubkey: inner[16] || null,
         channelGroupId: inner[17] || null,
     };

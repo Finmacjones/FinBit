@@ -305,6 +305,10 @@ struct PendingMediaSignal {
     // Forwarded-room only: forwarder→leaf track→sender bindings carried on an
     // OFFER (mid → 32-byte sender pubkey). Empty for 1:1 / mesh.
     std::vector<std::pair<std::string, std::array<std::uint8_t, 32>>> track_bindings;
+    // Tier-7 SFrame PQ: 1088-byte ML-KEM-768 ciphertext, set ONLY when
+    // kind == OFFER and the caller has the callee's pq_pubkey cached.
+    // pack_media_signal_payload splices it into MediaSignal.pq_ct.
+    std::vector<std::uint8_t> pq_ct;
 };
 
 std::vector<std::uint8_t> pack_text_payload(const std::string& text) {
@@ -343,7 +347,8 @@ std::vector<std::uint8_t> pack_media_signal_payload(
     std::span<const std::uint8_t, 16> call_id, std::uint32_t kind,
     std::span<const std::uint8_t> payload, std::uint32_t epoch,
     const std::vector<std::pair<std::string, std::array<std::uint8_t, 32>>>&
-        track_bindings = {}) {
+        track_bindings = {},
+    std::span<const std::uint8_t> pq_ct = {}) {
     fb::proto::DmPayload p;
     auto* ms = p.mutable_media_signal();
     ms->set_call_id(std::string(call_id.begin(), call_id.end()));
@@ -354,6 +359,9 @@ std::vector<std::uint8_t> pack_media_signal_payload(
         auto* tb = ms->add_track_bindings();
         tb->set_mid(mid);
         tb->set_sender_pubkey(sender.data(), sender.size());
+    }
+    if (!pq_ct.empty()) {
+        ms->set_pq_ct(std::string(pq_ct.begin(), pq_ct.end()));
     }
     std::vector<std::uint8_t> out(p.ByteSizeLong());
     if (!p.SerializeToArray(out.data(), static_cast<int>(out.size()))) out.clear();
@@ -654,6 +662,15 @@ struct ChatClient::Impl {
         // For Bob-initialized sessions this stays empty (the recv path
         // reads pq_ct from the envelope directly).
         std::vector<std::uint8_t> pq_ct;
+        // Cleared after we receive the first inbound envelope from this
+        // peer — proves their ratchet bootstrapped on the hybrid root, so
+        // subsequent pq_ct shipments are redundant. Bandwidth opt (Item 2).
+        bool pq_acked = false;
+        // Cached peer pq_pubkey (1184 B ML-KEM-768) from the bundle that
+        // bootstrapped this session. Used by SFrame setup (Item 1) so
+        // start_call_to_pub can encap against it without re-fetching the
+        // bundle. Empty when the peer didn't advertise PQ.
+        std::vector<std::uint8_t> peer_pq_pub;
     };
     std::map<std::string, Session> sessions;
     // Channels keyed by display-name. id is name -> generichash.
@@ -674,6 +691,13 @@ struct ChatClient::Impl {
         // 1:1 DM calls). Set when the call was started by mesh-dial on a
         // RoomRoster delta — used by hangup-fanout when leaving a room.
         std::string                         room_id;
+        // Tier-7 SFrame PQ: caller-side ML-KEM-768 ciphertext stashed by
+        // start_call_to_pub when it encaps against the peer's pq_pubkey.
+        // Spliced into the OFFER kind of MediaSignal so the callee can
+        // decap and arrive at the same hybrid SFrame base key. Empty when
+        // peer hasn't advertised PQ (or we're the callee — we don't encap,
+        // we decap the inbound offer's pq_ct instead).
+        std::vector<std::uint8_t>           sframe_pq_ct;
     };
     std::map<std::string, CallEntry> calls_by_peer;
     // peer-key → most-recent inbound audio RMS (dBFS), fed by each
@@ -2403,6 +2427,19 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 emit log("decrypt failed");
                                 continue;
                             }
+                            // Tier-7 PQ bandwidth opt (Item 2). A
+                            // successful decrypt proves the peer's
+                            // ratchet has bootstrapped on the hybrid
+                            // root — they don't need pq_ct again. Clear
+                            // it on this session so subsequent outbound
+                            // envelopes drop the 1088B overhead. Saves
+                            // ~1 KB per send for the lifetime of the
+                            // session; resets if a new init_alice fires.
+                            if (!sess.pq_acked) {
+                                sess.pq_acked = true;
+                                sess.pq_ct.clear();
+                                sess.pq_ct.shrink_to_fit();
+                            }
                             fb::crypto::PubKey peer_pub_arr{};
                             std::memcpy(peer_pub_arr.data(), sender_pub_bytes.data(), 32);
                             const QString peer_fp = QString::fromStdString(
@@ -3026,10 +3063,23 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     tbs.push_back({tb.mid(), s});
                                 }
 
+                                // Tier-7 SFrame PQ (Item 1): capture pq_ct
+                                // by value so the Qt-main lambda can pass
+                                // it to derive_hybrid_recv at sframe-setup
+                                // time. Empty on non-OFFER kinds or
+                                // pre-PQ callers — falls back to pure
+                                // X25519 SFrame base.
+                                std::vector<std::uint8_t> ms_pq_ct;
+                                if (!ms.pq_ct().empty()) {
+                                    ms_pq_ct.assign(ms.pq_ct().begin(), ms.pq_ct().end());
+                                }
+
                                 // Marshal the inbound dispatch onto the Qt
                                 // main thread — MediaCall lives there.
                                 QMetaObject::invokeMethod(this,
-                                    [this, peer_pub, kind, sig_payload, tbs, ms_call_id =
+                                    [this, peer_pub, kind, sig_payload, tbs,
+                                     ms_pq_ct = std::move(ms_pq_ct),
+                                     ms_call_id =
                                      std::array<std::uint8_t, 16>([&]{
                                         std::array<std::uint8_t, 16> a{};
                                         std::memcpy(a.data(), ms.call_id().data(), 16);
@@ -3155,13 +3205,25 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                             QObject::connect(call, &MediaCall::remoteVideoFrame,
                                                 this, &ChatClient::remoteVideoFrame);
                                             wire_call_levels(call, peer_key);
-                                            // SFrame: derive base key from X3DH(shared, peer_x25519).
+                                            // Tier-7 SFrame PQ (Item 1): callee
+                                            // side. Decap the caller's pq_ct
+                                            // from the inbound OFFER's
+                                            // MediaSignal.pq_ct → HKDF-combine
+                                            // with the X25519 ECDH → identical
+                                            // hybrid SFrame base. Empty pq_ct
+                                            // = pre-PQ caller, falls back to
+                                            // pure X25519 (same as pre-PQ
+                                            // codebase).
                                             std::array<std::uint8_t, 32> peer_x{};
                                             if (crypto_sign_ed25519_pk_to_curve25519(
                                                     peer_x.data(), peer_pub.data()) == 0) {
-                                                const auto shared = derive_shared_secret(
+                                                const auto shared = fb::handshake::derive_hybrid_recv(
                                                     impl_->x25519,
-                                                    std::span<const std::uint8_t, 32>(peer_x.data(), 32));
+                                                    std::span<const std::uint8_t, 32>(peer_x.data(), 32),
+                                                    std::span<const std::uint8_t, fb::crypto::pq::kMlKem768SecBytes>(
+                                                        impl_->pq_id.sec.data(), impl_->pq_id.sec.size()),
+                                                    std::span<const std::uint8_t>(
+                                                        ms_pq_ct.data(), ms_pq_ct.size()));
                                                 call->set_sframe_context(shared, ms_call_id);
                                             }
                                             call->receive_offer(sig_payload);
@@ -3346,7 +3408,16 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     impl_->sessions[p.send.peer];
                                 sess.peer_pub = p.peer_pub;
                                 sess.peer_x   = peer_x;
-                                sess.pq_ct    = std::move(hybrid.pq_ct);   // empty until DHT proto extends
+                                sess.pq_ct    = std::move(hybrid.pq_ct);
+                                // Tier-7 SFrame PQ (Item 1): cache the
+                                // peer's pq_pubkey from the DHT prekey
+                                // record so a subsequent call to this peer
+                                // gets the hybrid SFrame base.
+                                if (!pkey_rec_opt->pq_pubkey().empty()) {
+                                    sess.peer_pq_pub.assign(
+                                        pkey_rec_opt->pq_pubkey().begin(),
+                                        pkey_rec_opt->pq_pubkey().end());
+                                }
                                 sess.rat.emplace(
                                     fb::crypto::DoubleRatchet::init_alice(
                                         std::span<const std::uint8_t, 32>(
@@ -4196,7 +4267,8 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             std::span<const std::uint8_t, 16>(sig.call_id.data(), 16),
                             sig.kind,
                             std::span<const std::uint8_t>(sig.payload.data(), sig.payload.size()),
-                            sig.epoch, sig.track_bindings);
+                            sig.epoch, sig.track_bindings,
+                            std::span<const std::uint8_t>(sig.pq_ct.data(), sig.pq_ct.size()));
                         std::vector<std::uint8_t> envid(16);
                         randombytes_buf(envid.data(), envid.size());
                         const auto now_ms = static_cast<std::uint64_t>(
@@ -4959,6 +5031,15 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                     std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32),
                                     r.bundle());
                                 sess.pq_ct = std::move(hybrid.pq_ct);
+                                // Tier-7 SFrame PQ (Item 1): cache peer's
+                                // pq_pubkey on the Session so a future
+                                // start_call_to_pub can encap against it
+                                // without re-fetching the bundle.
+                                if (!r.bundle().pq_pubkey().empty()) {
+                                    sess.peer_pq_pub.assign(
+                                        r.bundle().pq_pubkey().begin(),
+                                        r.bundle().pq_pubkey().end());
+                                }
                                 sess.rat.emplace(fb::crypto::DoubleRatchet::init_alice(
                                     std::span<const std::uint8_t, 32>(
                                         hybrid.shared.data(), hybrid.shared.size()),
@@ -5457,10 +5538,34 @@ bool ChatClient::start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub_
         std::array<std::uint8_t, 32> peer_x{};
         if (crypto_sign_ed25519_pk_to_curve25519(
                 peer_x.data(), peer_pub_arr.data()) == 0) {
-            const auto shared = derive_shared_secret(
+            // Tier-7 SFrame PQ (Item 1). We're the caller — encap against
+            // the cached peer pq_pubkey from a DM session if we have one,
+            // and stash the pq_ct so it rides on the OFFER. If we have no
+            // DM session yet (rare — typically a fresh call without prior
+            // chat), the encap pubkey is empty and we fall back to pure
+            // X25519. The CallEntry::sframe_pq_ct lookup happens at OFFER-
+            // send time via calls_by_peer[peer_key].
+            std::span<const std::uint8_t> peer_pq_span;
+            for (const auto& [_name, s] : impl_->sessions) {
+                if (s.peer_pub == peer_pub_arr && !s.peer_pq_pub.empty()) {
+                    peer_pq_span = std::span<const std::uint8_t>(
+                        s.peer_pq_pub.data(), s.peer_pq_pub.size());
+                    break;
+                }
+            }
+            auto hyb = fb::handshake::derive_hybrid_send(
                 impl_->x25519,
-                std::span<const std::uint8_t, 32>(peer_x.data(), 32));
-            call->set_sframe_context(shared, call_id_arr);
+                std::span<const std::uint8_t, 32>(peer_x.data(), 32),
+                peer_pq_span);
+            call->set_sframe_context(hyb.shared, call_id_arr);
+            // Stash on the CallEntry so the OFFER send lambda below can
+            // splice it into the outgoing MediaSignal.pq_ct field.
+            if (!hyb.pq_ct.empty()) {
+                auto it = impl_->calls_by_peer.find(peer_key);
+                if (it != impl_->calls_by_peer.end()) {
+                    it->second.sframe_pq_ct = std::move(hyb.pq_ct);
+                }
+            }
         }
     }
 
@@ -5469,12 +5574,26 @@ bool ChatClient::start_call_to_pub(const std::array<std::uint8_t, 32>& peer_pub_
     // queue. peer_pub + call_id captured by VALUE so each MediaCall's
     // signaling routes to the right peer even with N concurrent calls.
     QObject::connect(call, &MediaCall::sendSignal, this,
-        [this, peer_pub_arr, call_id_arr](int kind, const QByteArray& bytes) {
+        [this, peer_pub_arr, call_id_arr, peer_key](int kind, const QByteArray& bytes) {
             PendingMediaSignal pms;
             pms.peer_pub = peer_pub_arr;
             pms.call_id  = call_id_arr;
             pms.kind     = static_cast<std::uint32_t>(kind);
             pms.payload.assign(bytes.constBegin(), bytes.constEnd());
+            // Tier-7 SFrame PQ (Item 1): splice the cached pq_ct into the
+            // OFFER kind, then clear it so retransmits / renegotiations
+            // don't re-ship the same encap. Subsequent OFFER kinds (rare,
+            // but possible on renegotiation) will fall back to pure
+            // X25519 SFrame base — acceptable because by then the call
+            // is established and the rotation cost outweighs the
+            // forward-secrecy benefit of a fresh encap.
+            if (kind == static_cast<int>(MediaCall::SignalKind::kOffer)) {
+                auto it = impl_->calls_by_peer.find(peer_key);
+                if (it != impl_->calls_by_peer.end() &&
+                    !it->second.sframe_pq_ct.empty()) {
+                    pms.pq_ct = std::move(it->second.sframe_pq_ct);
+                }
+            }
             {
                 std::lock_guard lk(impl_->mu);
                 impl_->media_queue.push_back(std::move(pms));

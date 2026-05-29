@@ -58,6 +58,16 @@ message MediaSignal {
     // not used on the wire — it would leak room topology to the server).
     message TrackBinding { string mid = 1; bytes sender_pubkey = 2; }
     repeated TrackBinding track_bindings = 5;
+
+    // Tier-7 PQ-hybrid for SFrame (Item 1). Set ONLY on the OFFER kind —
+    // the caller encaps against the callee's pq_pubkey (cached from the
+    // peer's PreKeyBundle), ships the 1088B ML-KEM-768 ciphertext here.
+    // The callee decaps with their pq_sec and HKDF-combines with the
+    // X25519 ECDH between the two static identities → identical hybrid
+    // SFrame base key on both sides. Empty on non-OFFER kinds; empty on
+    // OFFER when the peer hasn't advertised PQ (falls back to pure X25519
+    // SFrame base, same behavior as the pre-PQ codebase).
+    bytes pq_ct = 6;
 }
 
 // MLS (RFC 9420) handshake bytes wrapped for delivery via the Double

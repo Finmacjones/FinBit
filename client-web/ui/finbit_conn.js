@@ -10,6 +10,7 @@
 'use strict';
 
 import * as P from "./finbit_proto.js";
+import * as PQ from "./finbit_pq.js";
 import { CallSession } from "./media_call.js";
 import * as Outbox from "./outbox.js";
 
@@ -97,10 +98,32 @@ export class FinBitConnection {
             this._send(P.encodeHelloAck(sig));
             this.log(`signed challenge (${sh.serverRandom.length}B), sent HelloAck`);
         });
-        // 3. Upload prekey bundle.
+        // 3. Upload prekey bundle. Tier-7 PQ-hybrid: if the PQ adapter is
+        // wired (finbit_pq.pqEnabled() === true) we publish pq_pubkey +
+        // pq_pubkey_sig so PQ-aware peers can encap against us. The
+        // default adapter returns empty bytes → bundle is byte-identical
+        // to the pre-PQ form → peers fall back to X25519 (interop
+        // preserved, no harvest-now defense on those envelopes).
         const myPub = this.client.identity_pubkey();
         const myX = this.client.x25519_pub();
-        const bundle = P.encodePreKeyBundle(myPub, myX, Date.now());
+        let pqPubkey = null;
+        let pqPubkeySig = null;
+        if (PQ.pqEnabled()) {
+            try {
+                const id = PQ.derivePqIdentity(
+                    this.client.identity_seed(),
+                    (msg) => this.client.sign(msg));
+                pqPubkey = id.pub;
+                pqPubkeySig = id.pubkeySig;
+                this._pqIdentity = id;   // cached for inbound decap
+                this.log(`PQ adapter active: ML-KEM-768 pubkey published `
+                         + `(${pqPubkey.length}B)`);
+            } catch (e) {
+                this.log(`PQ adapter wired but derivePqIdentity threw: ${e.message}`);
+            }
+        }
+        const bundle = P.encodePreKeyBundle(myPub, myX, Date.now(),
+                                             pqPubkey, pqPubkeySig);
         this._send(P.encodeKeyBundleUpload(bundle));
         this.connected = true;
         this.handlers.onAuth(this.client.fingerprint());
@@ -138,17 +161,48 @@ export class FinBitConnection {
         return { queued: false };
     }
 
+    // Tier-7 PQ-hybrid (Item 3) — single seam used by every send/recv site
+    // that derives a session root from X25519. With the default PQ adapter
+    // (pqEnabled() === false), these short-circuit to the bit-identical
+    // pre-PQ behavior, so the wire is unchanged until a real ML-KEM is
+    // vendored into finbit_pq.js. See that file for the integration guide.
+    _hybridSharedForSend(peerX, peerBundle) {
+        const ssX = this.client.derive_shared_secret(peerX);
+        if (!PQ.pqEnabled() || !peerBundle
+            || !peerBundle.pqPubkey || peerBundle.pqPubkey.length === 0) {
+            return { shared: ssX, pqCt: null };
+        }
+        const { ct, ss } = PQ.encapForPeer(peerBundle.pqPubkey);
+        if (!ct || ct.length === 0 || !ss || ss.length === 0) {
+            return { shared: ssX, pqCt: null };
+        }
+        return { shared: PQ.combineX25519Mlkem768(ssX, ss), pqCt: ct };
+    }
+
+    _hybridSharedForRecv(peerX, envelopePqCt) {
+        const ssX = this.client.derive_shared_secret(peerX);
+        if (!PQ.pqEnabled() || !envelopePqCt || envelopePqCt.length === 0
+            || !this._pqIdentity || !this._pqIdentity.sec
+            || this._pqIdentity.sec.length === 0) {
+            return ssX;
+        }
+        const ssPq = PQ.decapWithOwn(envelopePqCt, this._pqIdentity.sec);
+        if (!ssPq || ssPq.length === 0) return ssX;
+        return PQ.combineX25519Mlkem768(ssX, ssPq);
+    }
+
     async _sendDmDirect(peerUsername, text) {
         // Fetch peer prekey if we don't already have a session.
         const peer = await this._fetchKeyBundle(peerUsername);
         const peerPub = peer.identityPub;
         const peerX = peer.signedPrekey;
         this.log(`peer ${peerUsername}: identityPub=${peerPub.length}B, signedPrekey=${peerX.length}B`);
+        let pqCtForEnvelope = null;
         if (!this.client.has_session(peerPub)) {
-            const shared = this._tryWasm("derive_shared_secret",
-                () => this.client.derive_shared_secret(peerX));
+            const { shared, pqCt } = this._hybridSharedForSend(peerX, peer);
             this._tryWasm("ratchet_init_alice",
                 () => this.client.ratchet_init_alice(peerPub, shared, peerX));
+            pqCtForEnvelope = pqCt;
         }
         // Wrap text in DmPayload, run the ratchet, build Envelope.
         const dmInner = P.encodeDmPayloadText(text);
@@ -160,6 +214,7 @@ export class FinBitConnection {
             senderPubkey: this.client.identity_pubkey(),
             recipientPubkey: peerPub,
             ciphertext: ratchetCt,
+            pqCt: pqCtForEnvelope,
         });
         this._send(envBytes);
         this.log(`sent ${text.length}B DM to ${peerUsername}`);
@@ -235,11 +290,12 @@ export class FinBitConnection {
         const peer = await this._fetchKeyBundle(peerUsername);
         const peerPub = peer.identityPub;
         const peerX = peer.signedPrekey;
+        let pqCtForEnvelope = null;
         if (!this.client.has_session(peerPub)) {
-            const shared = this._tryWasm("derive_shared_secret",
-                () => this.client.derive_shared_secret(peerX));
+            const { shared, pqCt } = this._hybridSharedForSend(peerX, peer);
             this._tryWasm("ratchet_init_alice",
                 () => this.client.ratchet_init_alice(peerPub, shared, peerX));
+            pqCtForEnvelope = pqCt;
         }
         const dmInner = P.encodeDmPayloadChannelKey({
             channelId, channelName: name, distribution,
@@ -252,6 +308,7 @@ export class FinBitConnection {
             senderPubkey: this.client.identity_pubkey(),
             recipientPubkey: peerPub,
             ciphertext: ratchetCt,
+            pqCt: pqCtForEnvelope,
         });
         this._send(envBytes);
         this.channels.get(hex(channelId)).members.add(hex(peerPub));
@@ -307,10 +364,13 @@ export class FinBitConnection {
         if (!this.connected) throw new Error("not connected");
         const peer = await this._fetchKeyBundle(peerUsername);
         const peerPub = peer.identityPub;
-        // Make sure a ratchet session exists so signal DMs flow.
+        // Make sure a ratchet session exists so signal DMs flow. Tier-7
+        // PQ-hybrid is folded in here too — when the adapter is wired, the
+        // first signal DM carries pq_ct on the envelope just like a plain
+        // DM. The call-startup MediaSignal flows through the same ratchet
+        // so signaling is automatically hybrid-protected.
         if (!this.client.has_session(peerPub)) {
-            const shared = this._tryWasm("derive_shared_secret",
-                () => this.client.derive_shared_secret(peer.signedPrekey));
+            const { shared } = this._hybridSharedForSend(peer.signedPrekey, peer);
             this._tryWasm("ratchet_init_alice",
                 () => this.client.ratchet_init_alice(peerPub, shared, peer.signedPrekey));
         }
@@ -508,8 +568,13 @@ export class FinBitConnection {
         }
         if (!env.userPubkey) return;
         if (!this.client.has_session(senderPub)) {
+            // Tier-7 PQ-hybrid recv: read envelope.pqCt (1088B when sender
+            // is PQ-aware), decap via the PQ adapter with our cached
+            // pq_sec, HKDF-combine with X25519 ECDH → same hybrid root
+            // the sender derived. Empty pqCt OR pqEnabled() === false
+            // falls back to pure X25519 (interop with pre-PQ senders).
             const peerX = this.client.ed25519_pub_to_x25519(senderPub);
-            const shared = this.client.derive_shared_secret(peerX);
+            const shared = this._hybridSharedForRecv(peerX, env.pqCt);
             this.client.ratchet_init_bob(senderPub, shared);
         }
         const inner = this.client.ratchet_decrypt(senderPub, env.ciphertext);

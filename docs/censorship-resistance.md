@@ -418,6 +418,37 @@ contact (chat_client `pkey_rec_opt->pq_pubkey()`) pass the bytes to
 `derive_hybrid_send`, which encapsulates and ships `pq_ct` on every send
 from the resulting session.
 
+**SFrame voice/video PQ** (`MediaSignal.pq_ct`): the SFrame base key for
+1:1 calls now uses the same hybrid construction. The caller (the side
+that runs `start_call_to_pub`) encapsulates against the cached
+`Session::peer_pq_pub` and stashes the resulting `pq_ct` in
+`CallEntry::sframe_pq_ct`; the `sendSignal` lambda splices it into the
+outbound OFFER's `MediaSignal.pq_ct`. The callee at the inbound-offer
+site reads `ms_pq_ct` and calls `fb::handshake::derive_hybrid_recv` →
+identical hybrid SFrame base on both sides. Empty `pq_ct` (peer is
+pre-PQ) gracefully falls back to pure-X25519 SFrame base — the
+pre-existing wire format.
+
+**PQ bandwidth optimization** (`Session::pq_acked`): every outbound
+envelope used to carry the 1088-byte `pq_ct` for the lifetime of a
+hybrid session. After the first successful inbound decrypt from a peer
+(which proves their ratchet bootstrapped on the same hybrid root), we
+clear `Session::pq_ct` — subsequent envelopes drop the field entirely.
+Saves ~1 KB per outbound after the first inbound; the bootstrap robustness
+(pq_ct riding on the first N sends until acked) is preserved.
+
+**Web client PQ adapter** (`client-web/ui/finbit_pq.js`): the browser
+WASM build doesn't link OpenSSL, so the web client integrates PQ via a
+single-file ESM adapter. The default implementation returns empty bytes
+for every PQ-shaped API, which cleanly triggers the X25519 fallback on
+every peer — so web clients still interop with PQ-aware desktops, they
+just don't get harvest-now-decrypt-later protection on their own
+envelopes. The wire surface is in place (`PreKeyBundle.pq_pubkey/_sig`,
+`Envelope.pq_ct` on both encode and decode paths); flipping to real PQ
+is a drop-in replacement of four functions documented at the top of
+`finbit_pq.js` (recommended: vendor `@noble/post-quantum`'s `ml-kem-768`
+as a sibling ESM module).
+
 ### Tier 8 — Reproducible builds + signed releases  ✅ shipped
 
 Supply-chain defense. Anyone can take a public commit SHA and rebuild the
