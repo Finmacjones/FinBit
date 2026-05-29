@@ -198,4 +198,86 @@ TEST(HybridKem, EndToEndPqxdhStyleMatch) {
 }
 #endif
 
+// ===========================================================================
+// ML-DSA-65 (FIPS-204) — post-quantum signature
+// ===========================================================================
+
+TEST(PqSig, AvailabilityTracksMlKemBuildFlag) {
+    EXPECT_EQ(pq::ml_dsa_65_available(), pq::ml_kem_768_available());
+}
+
+TEST(PqSig, KeygenSizes) {
+    auto kp = pq::keygen_ml_dsa_65();
+    EXPECT_EQ(kp.pub.size(), pq::kMlDsa65PubBytes);
+    EXPECT_EQ(kp.sec.size(), pq::kMlDsa65SecBytes);
+    bool any_pub_nz = false, any_sec_nz = false;
+    for (auto b : kp.pub) if (b) { any_pub_nz = true; break; }
+    for (auto b : kp.sec) if (b) { any_sec_nz = true; break; }
+    EXPECT_TRUE(any_pub_nz);
+    EXPECT_TRUE(any_sec_nz);
+}
+
+TEST(PqSig, SeededKeygenIsDeterministic) {
+    std::array<std::uint8_t, pq::kMlDsa65SeedBytes> seed{};
+    for (std::size_t i = 0; i < seed.size(); ++i) {
+        seed[i] = static_cast<std::uint8_t>(0xC0 ^ i);
+    }
+    auto a = pq::keygen_ml_dsa_65_from_seed(
+        std::span<const std::uint8_t, pq::kMlDsa65SeedBytes>(seed));
+    auto b = pq::keygen_ml_dsa_65_from_seed(
+        std::span<const std::uint8_t, pq::kMlDsa65SeedBytes>(seed));
+    EXPECT_EQ(a.pub, b.pub);
+    EXPECT_EQ(a.sec, b.sec);
+
+    seed[0] ^= 0xFF;
+    auto c = pq::keygen_ml_dsa_65_from_seed(
+        std::span<const std::uint8_t, pq::kMlDsa65SeedBytes>(seed));
+    EXPECT_NE(a.pub, c.pub);
+}
+
+TEST(PqSig, SignVerifyRoundTrip) {
+    auto kp = pq::keygen_ml_dsa_65();
+    const std::string msg = "FinBit hybrid signature test vector";
+    auto sig = pq::sign_ml_dsa_65(
+        std::span<const std::uint8_t, pq::kMlDsa65SecBytes>(kp.sec),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size()));
+    EXPECT_EQ(sig.size(), pq::kMlDsa65SigBytes);
+    EXPECT_TRUE(pq::verify_ml_dsa_65(
+        std::span<const std::uint8_t, pq::kMlDsa65PubBytes>(kp.pub),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size()),
+        std::span<const std::uint8_t, pq::kMlDsa65SigBytes>(sig)));
+}
+
+TEST(PqSig, VerifyRejectsTamperedMessage) {
+    auto kp = pq::keygen_ml_dsa_65();
+    const std::string msg  = "original";
+    const std::string msg2 = "tampered";
+    auto sig = pq::sign_ml_dsa_65(
+        std::span<const std::uint8_t, pq::kMlDsa65SecBytes>(kp.sec),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size()));
+    EXPECT_FALSE(pq::verify_ml_dsa_65(
+        std::span<const std::uint8_t, pq::kMlDsa65PubBytes>(kp.pub),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(msg2.data()), msg2.size()),
+        std::span<const std::uint8_t, pq::kMlDsa65SigBytes>(sig)));
+}
+
+TEST(PqSig, VerifyRejectsWrongPublicKey) {
+    auto kp_a = pq::keygen_ml_dsa_65();
+    auto kp_b = pq::keygen_ml_dsa_65();
+    const std::string msg = "signed by A";
+    auto sig = pq::sign_ml_dsa_65(
+        std::span<const std::uint8_t, pq::kMlDsa65SecBytes>(kp_a.sec),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size()));
+    EXPECT_FALSE(pq::verify_ml_dsa_65(
+        std::span<const std::uint8_t, pq::kMlDsa65PubBytes>(kp_b.pub),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size()),
+        std::span<const std::uint8_t, pq::kMlDsa65SigBytes>(sig)));
+}
+
 #endif  // FB_HAVE_ML_KEM

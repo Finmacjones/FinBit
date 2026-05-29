@@ -97,4 +97,70 @@ inline constexpr std::size_t kMlKem768SeedBytes = 64;
 [[nodiscard]] MlKem768Ss decap_ml_kem_768(std::span<const std::uint8_t, kMlKem768CtBytes> ct,
                                           std::span<const std::uint8_t, kMlKem768SecBytes> my_sec);
 
+// ===========================================================================
+// ML-DSA-65 (FIPS-204) — post-quantum digital signature.
+//
+// The signature companion to ML-KEM-768. Sec-level III (~AES-192 post-
+// quantum), matches the KEM in defensive strength. NOT a drop-in
+// replacement for Ed25519: signatures are 3309 bytes vs 64, and verify is
+// ~3-4x slower. Used by FinBit as the PQ HALF of a hybrid Ed25519+ML-DSA
+// signature: verifiers require both to pass, so an attacker with a
+// future CRQC who breaks Ed25519 (Shor's) still has to forge ML-DSA — a
+// PQ-hard problem — to spoof identity attestations like prekey-bundle
+// signed-prekey bindings.
+//
+// Sizes (FIPS-204):
+//   * Public key:    1952 bytes
+//   * Secret key:    4032 bytes
+//   * Seed:            32 bytes (ξ; deterministic keygen)
+//   * Signature:     3309 bytes
+//
+// OpenSSL 3.5+ ships ML-DSA-{44,65,87} in the default provider. The
+// FB_HAVE_ML_KEM probe also gates ML-DSA — they're packaged together
+// upstream.
+// ===========================================================================
+
+inline constexpr std::size_t kMlDsa65PubBytes  = 1952;
+inline constexpr std::size_t kMlDsa65SecBytes  = 4032;
+inline constexpr std::size_t kMlDsa65SeedBytes =   32;
+inline constexpr std::size_t kMlDsa65SigBytes  = 3309;
+
+using MlDsa65Pub  = std::array<std::uint8_t, kMlDsa65PubBytes>;
+using MlDsa65Sec  = std::array<std::uint8_t, kMlDsa65SecBytes>;
+using MlDsa65Sig  = std::array<std::uint8_t, kMlDsa65SigBytes>;
+
+struct MlDsa65Keypair {
+    MlDsa65Pub pub{};
+    MlDsa65Sec sec{};
+};
+
+// Build-time feature check. True when the OpenSSL provider exposes ML-DSA-65
+// (i.e. OpenSSL ≥ 3.5). Same FB_HAVE_ML_KEM gate as the KEM — they ship
+// together in the default provider.
+[[nodiscard]] bool ml_dsa_65_available() noexcept;
+
+// Fresh randomized keypair.
+[[nodiscard]] MlDsa65Keypair keygen_ml_dsa_65();
+
+// Deterministic keypair derived from a 32-byte FIPS-204 ξ seed. Used to
+// re-derive a stable PQ-sig identity from FinBit's Ed25519 seed.
+[[nodiscard]] MlDsa65Keypair keygen_ml_dsa_65_from_seed(
+    std::span<const std::uint8_t, kMlDsa65SeedBytes> seed);
+
+// Detached signature over `message`. ML-DSA produces a probabilistic
+// signature by default (different sig bytes for the same input) per
+// FIPS-204 — equivalent security to deterministic, just doesn't reveal
+// the message ordering through sig-byte equality.
+[[nodiscard]] MlDsa65Sig sign_ml_dsa_65(
+    std::span<const std::uint8_t, kMlDsa65SecBytes> sec,
+    std::span<const std::uint8_t> message);
+
+// Verify a detached signature. Returns true iff the signature is valid
+// under `pub` over `message`. Constant-time false on any failure mode
+// (malformed sig, wrong pubkey, OpenSSL EVP failure).
+[[nodiscard]] bool verify_ml_dsa_65(
+    std::span<const std::uint8_t, kMlDsa65PubBytes> pub,
+    std::span<const std::uint8_t> message,
+    std::span<const std::uint8_t, kMlDsa65SigBytes> sig) noexcept;
+
 }  // namespace fb::crypto::pq

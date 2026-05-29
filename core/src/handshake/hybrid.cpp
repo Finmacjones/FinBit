@@ -194,4 +194,51 @@ bool verify_sealed_sender(
         pk, std::span<const std::uint8_t>(msg.data(), msg.size()), sg);
 }
 
+// ---- Hybrid signatures (Ed25519 + ML-DSA-65) ------------------------------
+
+PqSigIdentity derive_pq_sig_identity(
+    const fb::crypto::Identity& id,
+    std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes> seed) {
+    PqSigIdentity p;
+    auto pq_seed = fb::crypto::derive_pq_sig_seed_from_identity_seed(seed);
+    auto kp = fb::crypto::pq::keygen_ml_dsa_65_from_seed(
+        std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65SeedBytes>(pq_seed));
+    p.pub = kp.pub;
+    p.sec = kp.sec;
+    p.pubkey_sig = id.sign(
+        std::span<const std::uint8_t>(p.pub.data(), p.pub.size()));
+    return p;
+}
+
+HybridSignature hybrid_sign(
+    const fb::crypto::Identity& classical,
+    const PqSigIdentity&        pq,
+    std::span<const std::uint8_t> message) {
+    HybridSignature out;
+    out.ed25519 = classical.sign(message);
+    out.pq = fb::crypto::pq::sign_ml_dsa_65(
+        std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65SecBytes>(
+            pq.sec.data(), pq.sec.size()),
+        message);
+    return out;
+}
+
+bool hybrid_verify(
+    std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>     ed25519_pub,
+    std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>     pq_pub,
+    std::span<const std::uint8_t> message,
+    const HybridSignature& sig) noexcept {
+    fb::crypto::PubKey edpub{};
+    std::memcpy(edpub.data(), ed25519_pub.data(), edpub.size());
+    const bool ok_ed = fb::crypto::Identity::verify(edpub, message, sig.ed25519);
+    const bool ok_pq = fb::crypto::pq::verify_ml_dsa_65(
+        std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>(pq_pub),
+        message,
+        std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65SigBytes>(
+            sig.pq.data(), sig.pq.size()));
+    // Force both checks to evaluate even when the first fails — defeats a
+    // timing observer learning whether the classical or PQ half is wrong.
+    return ok_ed & ok_pq;
+}
+
 }  // namespace fb::handshake

@@ -184,4 +184,68 @@ struct SealedSenderFields {
     std::span<const std::uint8_t> envelope_id,
     std::uint64_t timestamp_ms) noexcept;
 
+// ---------------------------------------------------------------------------
+// Hybrid signatures — Ed25519 + ML-DSA-65.
+//
+// Mirrors the PQ-KEM hybrid story (Tier 7) for the signing side. Every
+// hybrid-signed message carries BOTH an Ed25519 sig (fast, small, what the
+// rest of the world trusts) AND an ML-DSA-65 sig (slow, 3.3 KB, PQ-secure).
+// A verifier requires BOTH to pass — so an attacker with a future CRQC who
+// breaks Ed25519 (Shor's) still has to forge ML-DSA-65 (a PQ-hard lattice
+// problem) to spoof an identity attestation. Security = max(strengths).
+//
+// Where to use: long-term identity bindings (prekey-bundle signed_prekey
+// signature, pq_pubkey binding sig, identity-claim signatures, hello-ack).
+// Where NOT to use: per-envelope sigs like sealed_sender_sig (3.3 KB per
+// envelope is too heavy; the AEAD + ratchet provide adequate per-message
+// auth and the sealed sender's anti-replay binding is to the AEAD-
+// authenticated AAD).
+//
+// HONEST LIMITATION: the PQ pubkey itself (PqSigIdentity::pub) must be
+// distributed with a binding signature back to the Ed25519 identity — and
+// that binding sig is Ed25519-only today. A CRQC attacker can forge the
+// binding, swap in their own PqSigIdentity, then sign anything with it.
+// Full PQ-rooted identity is a documented next-tier upgrade (move identity
+// from Ed25519 to Ed25519+ML-DSA at the protocol root); this commit ships
+// the building blocks for that, plus partial defense against non-CRQC
+// future weaknesses in Ed25519.
+// ---------------------------------------------------------------------------
+
+struct PqSigIdentity {
+    fb::crypto::pq::MlDsa65Pub  pub{};
+    fb::crypto::pq::MlDsa65Sec  sec{};
+    fb::crypto::Sig             pubkey_sig{};   // Ed25519 binding to identity
+};
+
+// Derive the deterministic ML-DSA-65 keypair from the Ed25519 identity seed
+// via derive_pq_sig_seed_from_identity_seed. Mirrors derive_pq_identity
+// (which does the ML-KEM-768 equivalent). Both PQ-sig and PQ-KEM keypairs
+// can therefore be regenerated from the same 32-byte Ed25519 seed — no
+// extra at-rest secrets to persist.
+[[nodiscard]] PqSigIdentity derive_pq_sig_identity(
+    const fb::crypto::Identity& id,
+    std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes> seed);
+
+struct HybridSignature {
+    fb::crypto::Sig             ed25519{};
+    fb::crypto::pq::MlDsa65Sig  pq{};
+};
+
+// Sign `message` with both halves. Output is two parallel sigs the verifier
+// checks independently.
+[[nodiscard]] HybridSignature hybrid_sign(
+    const fb::crypto::Identity& classical,
+    const PqSigIdentity&        pq,
+    std::span<const std::uint8_t> message);
+
+// Verify a hybrid signature. Returns true iff BOTH sigs verify under their
+// respective pubkeys. Constant-time-ish: always evaluates both checks even
+// when the first fails (defeats timing-side-channel inference about which
+// half is wrong).
+[[nodiscard]] bool hybrid_verify(
+    std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>     ed25519_pub,
+    std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>     pq_pub,
+    std::span<const std::uint8_t> message,
+    const HybridSignature& sig) noexcept;
+
 }  // namespace fb::handshake

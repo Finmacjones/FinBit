@@ -77,4 +77,12 @@ private:
 [[nodiscard]] std::array<std::uint8_t, 64> derive_pq_seed_from_identity_seed(
     std::span<const std::uint8_t, kIdentitySeedBytes> seed);
 
+// Derive a 32-byte FIPS-204 ML-DSA-65 seed (ξ) deterministically from the
+// Ed25519 identity seed. Parallel to derive_pq_seed_from_identity_seed but
+// for signing — distinct info string ("FinBit-PQSIG-seed-v1") keeps the
+// two derivations domain-separated so the PQ-sig keypair is independent
+// of the PQ-KEM keypair even though both root in the same Ed25519 seed.
+[[nodiscard]] std::array<std::uint8_t, 32> derive_pq_sig_seed_from_identity_seed(
+    std::span<const std::uint8_t, kIdentitySeedBytes> seed);
+
 }  // namespace fb::crypto

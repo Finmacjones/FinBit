@@ -4319,6 +4319,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         const auto env_aad = envelope_aad_bytes(
                             std::span<const std::uint8_t>(envid.data(), envid.size()),
                             now_ms);
+                        const bool _sealed = peer_sess.pq_acked;
+                        if (_sealed) {
+                            pt = seal_dm_payload(std::move(pt), *impl_->identity,
+                                std::span<const std::uint8_t>(envid.data(), envid.size()),
+                                now_ms);
+                        }
                         auto inner = peer_sess.rat->encrypt(
                             std::span<const std::uint8_t>(pt.data(), pt.size()),
                             std::span<const std::uint8_t>(env_aad.data(),
@@ -4332,10 +4338,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         env->set_user_pubkey(std::string(
                             reinterpret_cast<const char*>(peer_sess.peer_pub.data()),
                             peer_sess.peer_pub.size()));
-                        env->set_sender_pubkey(std::string(
-                            reinterpret_cast<const char*>(
-                                impl_->identity->public_key().data()),
-                            impl_->identity->public_key().size()));
+                        if (!_sealed) {
+                            env->set_sender_pubkey(std::string(
+                                reinterpret_cast<const char*>(
+                                    impl_->identity->public_key().data()),
+                                impl_->identity->public_key().size()));
+                        }
                         env->set_ciphertext(std::string(inner.begin(), inner.end()));
                         if (!sess_pq_ct.empty()) {
                             env->set_pq_ct(std::string(sess_pq_ct.begin(), sess_pq_ct.end()));
@@ -4425,6 +4433,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         const auto env_aad = envelope_aad_bytes(
                             std::span<const std::uint8_t>(envid.data(), envid.size()),
                             now_ms);
+                        const bool _sealed = sess->pq_acked;
+                        if (_sealed) {
+                            pt = seal_dm_payload(std::move(pt), *impl_->identity,
+                                std::span<const std::uint8_t>(envid.data(), envid.size()),
+                                now_ms);
+                        }
                         auto inner = sess->rat->encrypt(
                             std::span<const std::uint8_t>(pt.data(), pt.size()),
                             std::span<const std::uint8_t>(env_aad.data(),
@@ -4438,9 +4452,11 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         env->set_user_pubkey(std::string(
                             reinterpret_cast<const char*>(sig.peer_pub.data()),
                             sig.peer_pub.size()));
-                        env->set_sender_pubkey(std::string(
-                            reinterpret_cast<const char*>(impl_->identity->public_key().data()),
-                            impl_->identity->public_key().size()));
+                        if (!_sealed) {
+                            env->set_sender_pubkey(std::string(
+                                reinterpret_cast<const char*>(impl_->identity->public_key().data()),
+                                impl_->identity->public_key().size()));
+                        }
                         env->set_ciphertext(std::string(inner.begin(), inner.end()));
                         if (!sess_pq_ct.empty()) {
                             env->set_pq_ct(std::string(sess_pq_ct.begin(), sess_pq_ct.end()));
@@ -4562,6 +4578,14 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 auto outer_aad = envelope_aad_bytes(
                                     std::span<const std::uint8_t>(
                                         envid.data(), envid.size()), ts);
+                                const bool _sealed = sess_direct.pq_acked;
+                                if (_sealed) {
+                                    inner = seal_dm_payload(std::move(inner),
+                                        *impl_->identity,
+                                        std::span<const std::uint8_t>(
+                                            envid.data(), envid.size()),
+                                        ts);
+                                }
                                 auto ct = sess_direct.rat->encrypt(
                                     std::span<const std::uint8_t>(
                                         inner.data(), inner.size()),
@@ -4574,10 +4598,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 env.set_user_pubkey(std::string(
                                     sess_direct.peer_pub.begin(),
                                     sess_direct.peer_pub.end()));
-                                env.set_sender_pubkey(std::string(
-                                    reinterpret_cast<const char*>(
-                                        impl_->identity->public_key().data()),
-                                    impl_->identity->public_key().size()));
+                                if (!_sealed) {
+                                    env.set_sender_pubkey(std::string(
+                                        reinterpret_cast<const char*>(
+                                            impl_->identity->public_key().data()),
+                                        impl_->identity->public_key().size()));
+                                }
                                 env.set_ciphertext(std::string(
                                     ct.begin(), ct.end()));
                                 if (!sess_direct.pq_ct.empty()) {

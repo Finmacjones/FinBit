@@ -179,4 +179,20 @@ std::array<std::uint8_t, 64> derive_pq_seed_from_identity_seed(
     return out;
 }
 
+std::array<std::uint8_t, 32> derive_pq_sig_seed_from_identity_seed(
+    std::span<const std::uint8_t, kIdentitySeedBytes> seed) {
+    constexpr char kInfo[] = "FinBit-PQSIG-seed-v1";
+    auto prk = hkdf_extract(
+        std::span<const std::uint8_t>(),
+        std::span<const std::uint8_t>(seed.data(), seed.size()));
+    auto okm = hkdf_expand(
+        prk,
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(kInfo), sizeof(kInfo) - 1),
+        32);
+    std::array<std::uint8_t, 32> out{};
+    std::memcpy(out.data(), okm.data(), 32);
+    return out;
+}
+
 }  // namespace fb::crypto

@@ -253,6 +253,112 @@ TEST(Handshake, SealedSenderRejectsEnvelopeIdReplay) {
         std::span<const std::uint8_t>(env_id_b.data(), env_id_b.size()), ts));
 }
 
+// ---------------------------------------------------------------------------
+// Hybrid signatures — Ed25519 + ML-DSA-65
+// ---------------------------------------------------------------------------
+
+#if defined(FB_HAVE_ML_KEM) && FB_HAVE_ML_KEM
+
+TEST(Handshake, PqSigIdentityDeterministicFromIdentitySeed) {
+    auto id = ident_from_byte(0xAB);
+    auto seed = seed_of_byte(0xAB);
+    auto a = derive_pq_sig_identity(id,
+        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+    auto b = derive_pq_sig_identity(id,
+        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+    EXPECT_EQ(a.pub, b.pub);
+    EXPECT_EQ(a.sec, b.sec);
+    EXPECT_EQ(a.pubkey_sig, b.pubkey_sig);   // Ed25519 deterministic per RFC 8032
+
+    // The binding sig actually verifies over pq.pub by the identity key.
+    EXPECT_TRUE(fb::crypto::Identity::verify(
+        id.public_key(),
+        std::span<const std::uint8_t>(a.pub.data(), a.pub.size()),
+        a.pubkey_sig));
+}
+
+TEST(Handshake, HybridSignVerifyRoundTrip) {
+    auto id = ident_from_byte(0x77);
+    auto seed = seed_of_byte(0x77);
+    auto pq = derive_pq_sig_identity(id,
+        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+
+    const std::string msg = "FinBit hybrid identity attestation";
+    auto sig = hybrid_sign(id, pq,
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size()));
+
+    EXPECT_TRUE(hybrid_verify(
+        std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>(
+            id.public_key().data(), id.public_key().size()),
+        std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>(
+            pq.pub.data(), pq.pub.size()),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size()),
+        sig));
+}
+
+TEST(Handshake, HybridVerifyRequiresBothHalves) {
+    auto id = ident_from_byte(0x88);
+    auto seed = seed_of_byte(0x88);
+    auto pq = derive_pq_sig_identity(id,
+        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+    const std::string msg = "double-rooted attestation";
+    auto sig = hybrid_sign(id, pq,
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size()));
+
+    auto msg_span = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size());
+
+    // Tamper the Ed25519 half — verify must fail (hybrid requires BOTH).
+    {
+        auto tampered = sig;
+        tampered.ed25519[0] ^= 0x01;
+        EXPECT_FALSE(hybrid_verify(
+            std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>(
+                id.public_key().data(), id.public_key().size()),
+            std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>(
+                pq.pub.data(), pq.pub.size()),
+            msg_span, tampered));
+    }
+    // Tamper the ML-DSA half — verify must fail (hybrid requires BOTH).
+    {
+        auto tampered = sig;
+        tampered.pq[100] ^= 0x80;
+        EXPECT_FALSE(hybrid_verify(
+            std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>(
+                id.public_key().data(), id.public_key().size()),
+            std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>(
+                pq.pub.data(), pq.pub.size()),
+            msg_span, tampered));
+    }
+}
+
+TEST(Handshake, HybridVerifyRejectsWrongMessage) {
+    auto id = ident_from_byte(0x99);
+    auto seed = seed_of_byte(0x99);
+    auto pq = derive_pq_sig_identity(id,
+        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+    const std::string original = "I, Alice, do hereby...";
+    const std::string substituted = "I, Alice, do something else...";
+    auto sig = hybrid_sign(id, pq,
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(original.data()),
+            original.size()));
+    EXPECT_FALSE(hybrid_verify(
+        std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>(
+            id.public_key().data(), id.public_key().size()),
+        std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>(
+            pq.pub.data(), pq.pub.size()),
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(substituted.data()),
+            substituted.size()),
+        sig));
+}
+
+#endif  // FB_HAVE_ML_KEM
+
 TEST(Handshake, BundleWithoutPqGracefullyFallsBack) {
     auto alice  = ident_from_byte(0xC0);
     auto bob    = ident_from_byte(0xC1);
