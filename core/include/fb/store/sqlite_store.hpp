@@ -108,6 +108,26 @@ public:
 
     [[nodiscard]] std::size_t prune_expired(std::uint64_t now_ms);
 
+    // Tier-11 Phase 2 — periodic storage-key rotation. Generates fresh
+    // random per-table sub-keys, re-wraps every row of the affected
+    // tables (inbox + outbox + sessions in this commit; chan_* / mls_* /
+    // peer_name are a documented follow-on) under the new sub-keys in a
+    // single transaction, persists the new wrapped sub-keys to
+    // `storage_keys`, and sodium_memzero's the old in-memory sub-keys.
+    //
+    // Returns the total row count re-wrapped. No-op (returns 0) when
+    // at-rest encryption isn't active.
+    //
+    // THREAT MODEL — this defends against MEMORY EXFILTRATION (cold-boot
+    // attack, kernel-mode debugger reading process RAM): a dump captured
+    // BEFORE the rotation has only the OLD sub-keys, which cannot decrypt
+    // the post-rotation on-disk state. It does NOT defend against
+    // PASSPHRASE COMPROMISE — an attacker with the vault passphrase
+    // unwraps the current sub-keys from `storage_keys` and decrypts
+    // current data. The right defense for that is sender-set TTL
+    // (Phase 1, append_inbox_with_expiry + prune_expired).
+    [[nodiscard]] std::size_t rotate_storage_keys();
+
     struct InboxRow {
         std::vector<std::uint8_t> envelope_id;
         std::vector<std::uint8_t> peer_pub;

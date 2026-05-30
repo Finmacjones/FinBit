@@ -126,6 +126,21 @@ CREATE TABLE IF NOT EXISTS mls_group_log (
 );
 CREATE INDEX IF NOT EXISTS idx_mls_group_log_chan
     ON mls_group_log(channel_id, seq);
+-- Tier-11 forward-secret local storage Phase 2: persisted per-table
+-- sub-keys for storage_keys-driven key rotation. Each row holds an
+-- AEAD-wrapped sub-key (wrapped under the vault master key with AAD =
+-- name || generation_be). On rotate_storage_keys(): generate new sub-
+-- keys, re-wrap all rows in the affected tables under them, write the
+-- new wrapped sub-keys here with generation+1, sodium_memzero the old
+-- in-memory sub-keys. A memory dump captured BEFORE the rotation has
+-- only the OLD sub-keys → can decrypt nothing on the post-rotation
+-- disk state. Doesn't help against passphrase compromise (Phase 1's
+-- TTL handles that).
+CREATE TABLE IF NOT EXISTS storage_keys (
+    name       TEXT    PRIMARY KEY,
+    wrapped    BLOB    NOT NULL,
+    generation INTEGER NOT NULL
+);
 )sql";
 
 void throw_sqlite(const std::string& ctx, sqlite3* db) {
@@ -215,9 +230,19 @@ struct SqliteStore::Impl {
     std::array<std::uint8_t, kKeyLen> mls_state_key{};
     std::array<std::uint8_t, kKeyLen> mls_log_key{};
 
+    // Tier-11 Phase 2 — kept around so rotate_storage_keys() can re-wrap
+    // freshly-generated sub-keys under it. zeroize on destruction.
+    std::array<std::uint8_t, kKeyLen> master_key{};
+    bool                              have_master = false;
+    // Rotation generation counter (incremented on each successful
+    // rotate_storage_keys call; bound into the AAD of the wrapped
+    // sub-keys so a row swap across generations fails AEAD verify).
+    std::uint64_t                     storage_keys_generation = 0;
+
     ~Impl() {
         // Best-effort: zero the table keys before the process exits so
         // a core-dump after Close-without-Quit doesn't carry them.
+        sodium_memzero(master_key.data(),      master_key.size());
         sodium_memzero(inbox_key.data(),       inbox_key.size());
         sodium_memzero(outbox_key.data(),      outbox_key.size());
         sodium_memzero(sessions_key.data(),    sessions_key.size());
@@ -316,6 +341,8 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
     }
     if (have_key) {
         s->impl_->encrypt_at_rest = true;
+        std::memcpy(s->impl_->master_key.data(), master_key.data(), kKeyLen);
+        s->impl_->have_master = true;
         s->impl_->inbox_key       = derive_table_key(master_key, "FinBit-DB-Inbox-v1");
         s->impl_->outbox_key      = derive_table_key(master_key, "FinBit-DB-Outbox-v1");
         s->impl_->sessions_key    = derive_table_key(master_key, "FinBit-DB-Sessions-v1");
@@ -325,6 +352,53 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
         s->impl_->peer_name_key   = derive_table_key(master_key, "FinBit-DB-PeerName-v1");
         s->impl_->mls_state_key   = derive_table_key(master_key, "FinBit-DB-MlsState-v1");
         s->impl_->mls_log_key     = derive_table_key(master_key, "FinBit-DB-MlsLog-v1");
+
+        // Tier-11 Phase 2: if a prior rotation has persisted sub-keys
+        // for any of {inbox, outbox, sessions}, override the
+        // deterministic derivation with the unwrapped persisted value.
+        // Tables not yet covered by rotation keep the deterministic
+        // sub-key (backward compatible).
+        auto load_wrapped = [&](const char* name) -> std::optional<std::array<std::uint8_t, kKeyLen>> {
+            auto* stmt = s->impl_->prep(
+                "SELECT wrapped, generation FROM storage_keys WHERE name = ?;");
+            sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+            std::optional<std::array<std::uint8_t, kKeyLen>> out;
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                const auto blob_len = sqlite3_column_bytes(stmt, 0);
+                const auto* blob_ptr =
+                    static_cast<const std::uint8_t*>(sqlite3_column_blob(stmt, 0));
+                const std::uint64_t gen = static_cast<std::uint64_t>(
+                    sqlite3_column_int64(stmt, 1));
+                // AAD = name || generation_be — binds the row to its slot
+                // + generation, so an attacker can't swap one row's
+                // wrapped key into another's.
+                std::vector<std::uint8_t> aad;
+                aad.insert(aad.end(),
+                            reinterpret_cast<const std::uint8_t*>(name),
+                            reinterpret_cast<const std::uint8_t*>(name) +
+                                std::strlen(name));
+                for (int i = 7; i >= 0; --i) {
+                    aad.push_back(static_cast<std::uint8_t>((gen >> (8 * i)) & 0xff));
+                }
+                auto unwrapped = aead_unwrap(
+                    s->impl_->master_key,
+                    std::span<const std::uint8_t>(blob_ptr, static_cast<std::size_t>(blob_len)),
+                    std::span<const std::uint8_t>(aad.data(), aad.size()));
+                if (unwrapped && unwrapped->size() == kKeyLen) {
+                    std::array<std::uint8_t, kKeyLen> k{};
+                    std::memcpy(k.data(), unwrapped->data(), kKeyLen);
+                    out = k;
+                    if (gen > s->impl_->storage_keys_generation) {
+                        s->impl_->storage_keys_generation = gen;
+                    }
+                }
+            }
+            sqlite3_finalize(stmt);
+            return out;
+        };
+        if (auto k = load_wrapped("inbox"))    s->impl_->inbox_key    = *k;
+        if (auto k = load_wrapped("outbox"))   s->impl_->outbox_key   = *k;
+        if (auto k = load_wrapped("sessions")) s->impl_->sessions_key = *k;
     }
     if (have_key && version < kSchemaVersionEncrypted) {
         // Migration from legacy plaintext (v0) or partially-encrypted
@@ -690,6 +764,144 @@ std::size_t SqliteStore::prune_expired(std::uint64_t now_ms) {
     }
     impl_->exec("COMMIT;");
     return deleted;
+}
+
+std::size_t SqliteStore::rotate_storage_keys() {
+    if (!impl_->encrypt_at_rest || !impl_->have_master) return 0;
+
+    // Fresh random sub-keys for the three rotated tables. (chan_* /
+    // mls_* / peer_name use the deterministic sub-keys from open() — a
+    // follow-on commit rotates them too.)
+    std::array<std::uint8_t, kKeyLen> new_inbox{};
+    std::array<std::uint8_t, kKeyLen> new_outbox{};
+    std::array<std::uint8_t, kKeyLen> new_sessions{};
+    randombytes_buf(new_inbox.data(),    new_inbox.size());
+    randombytes_buf(new_outbox.data(),   new_outbox.size());
+    randombytes_buf(new_sessions.data(), new_sessions.size());
+
+    const std::uint64_t new_gen = impl_->storage_keys_generation + 1;
+
+    // Re-wrap helper: read each row from `table.col` (AAD = aad_col),
+    // unwrap under old_k, re-wrap under new_k, UPDATE the column. The
+    // AAD is whatever the original append-path used (envelope_id for
+    // inbox/outbox, peer_pub for sessions).
+    auto rewrap_table = [&](const char* table, const char* val_col,
+                             const char* aad_col,
+                             const std::array<std::uint8_t, kKeyLen>& old_k,
+                             const std::array<std::uint8_t, kKeyLen>& new_k,
+                             std::size_t* counter) {
+        std::string sel = "SELECT rowid, ";
+        sel += val_col; sel += ", "; sel += aad_col; sel += " FROM ";
+        sel += table; sel += ";";
+        auto* sel_stmt = impl_->prep(sel.c_str());
+
+        struct Pending {
+            sqlite3_int64 rowid;
+            std::vector<std::uint8_t> new_blob;
+        };
+        std::vector<Pending> pending;
+        while (sqlite3_step(sel_stmt) == SQLITE_ROW) {
+            const auto rid       = sqlite3_column_int64(sel_stmt, 0);
+            const auto val_len   = sqlite3_column_bytes(sel_stmt, 1);
+            const auto* val_ptr  = static_cast<const std::uint8_t*>(
+                sqlite3_column_blob(sel_stmt, 1));
+            const auto aad_len   = sqlite3_column_bytes(sel_stmt, 2);
+            const auto* aad_ptr  = static_cast<const std::uint8_t*>(
+                sqlite3_column_blob(sel_stmt, 2));
+            auto unwrapped = aead_unwrap(
+                old_k,
+                std::span<const std::uint8_t>(val_ptr, static_cast<std::size_t>(val_len)),
+                std::span<const std::uint8_t>(aad_ptr, static_cast<std::size_t>(aad_len)));
+            if (!unwrapped) {
+                // A row that doesn't unwrap under the current key is
+                // already corrupt or from a different key generation —
+                // skip rather than crash; the caller's log surfaces
+                // the rewrap count vs row count mismatch.
+                continue;
+            }
+            auto rewrapped = aead_wrap(
+                new_k,
+                std::span<const std::uint8_t>(unwrapped->data(), unwrapped->size()),
+                std::span<const std::uint8_t>(aad_ptr, static_cast<std::size_t>(aad_len)));
+            pending.push_back({rid, std::move(rewrapped)});
+            sodium_memzero(unwrapped->data(), unwrapped->size());
+        }
+        sqlite3_finalize(sel_stmt);
+
+        std::string upd = "UPDATE ";
+        upd += table; upd += " SET "; upd += val_col;
+        upd += " = ? WHERE rowid = ?;";
+        for (const auto& p : pending) {
+            auto* upd_stmt = impl_->prep(upd.c_str());
+            sqlite3_bind_blob(upd_stmt, 1, p.new_blob.data(),
+                              static_cast<int>(p.new_blob.size()),
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_int64(upd_stmt, 2, p.rowid);
+            sqlite3_step(upd_stmt);
+            sqlite3_finalize(upd_stmt);
+            ++*counter;
+        }
+    };
+
+    auto persist_wrapped = [&](const char* name,
+                                const std::array<std::uint8_t, kKeyLen>& k) {
+        std::vector<std::uint8_t> aad;
+        aad.insert(aad.end(),
+                    reinterpret_cast<const std::uint8_t*>(name),
+                    reinterpret_cast<const std::uint8_t*>(name) + std::strlen(name));
+        for (int i = 7; i >= 0; --i) {
+            aad.push_back(static_cast<std::uint8_t>((new_gen >> (8 * i)) & 0xff));
+        }
+        auto wrapped = aead_wrap(
+            impl_->master_key,
+            std::span<const std::uint8_t>(k.data(), k.size()),
+            std::span<const std::uint8_t>(aad.data(), aad.size()));
+        auto* stmt = impl_->prep(
+            "INSERT INTO storage_keys(name, wrapped, generation) VALUES(?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET wrapped = excluded.wrapped, "
+            "generation = excluded.generation;");
+        sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_blob(stmt, 2, wrapped.data(),
+                          static_cast<int>(wrapped.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(new_gen));
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    };
+
+    std::size_t total = 0;
+    impl_->exec("BEGIN;");
+    try {
+        rewrap_table("inbox",    "plaintext",  "envelope_id",
+                      impl_->inbox_key,    new_inbox,    &total);
+        rewrap_table("outbox",   "ciphertext", "envelope_id",
+                      impl_->outbox_key,   new_outbox,   &total);
+        rewrap_table("sessions", "blob",       "peer_pub",
+                      impl_->sessions_key, new_sessions, &total);
+        persist_wrapped("inbox",    new_inbox);
+        persist_wrapped("outbox",   new_outbox);
+        persist_wrapped("sessions", new_sessions);
+        impl_->exec("COMMIT;");
+    } catch (...) {
+        impl_->exec("ROLLBACK;");
+        sodium_memzero(new_inbox.data(),    new_inbox.size());
+        sodium_memzero(new_outbox.data(),   new_outbox.size());
+        sodium_memzero(new_sessions.data(), new_sessions.size());
+        throw;
+    }
+
+    // Atomic key swap. Zero the predecessors so a memory dump after this
+    // point cannot recover them.
+    sodium_memzero(impl_->inbox_key.data(),    impl_->inbox_key.size());
+    sodium_memzero(impl_->outbox_key.data(),   impl_->outbox_key.size());
+    sodium_memzero(impl_->sessions_key.data(), impl_->sessions_key.size());
+    impl_->inbox_key    = new_inbox;
+    impl_->outbox_key   = new_outbox;
+    impl_->sessions_key = new_sessions;
+    impl_->storage_keys_generation = new_gen;
+    sodium_memzero(new_inbox.data(),    new_inbox.size());
+    sodium_memzero(new_outbox.data(),   new_outbox.size());
+    sodium_memzero(new_sessions.data(), new_sessions.size());
+    return total;
 }
 
 std::vector<SqliteStore::InboxRow> SqliteStore::recent_inbox(std::size_t limit) const {

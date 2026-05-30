@@ -500,6 +500,104 @@ TEST_F(TmpDb, LegacyAppendNeverExpires) {
     EXPECT_EQ(s->recent_inbox(100).size(), 1u);
 }
 
+// ---- Tier-11 Phase 2 — storage-key rotation -------------------------------
+
+TEST_F(TmpDb, RotateStorageKeysPreservesAllRows) {
+    std::array<std::uint8_t, 32> master_key{};
+    for (std::size_t i = 0; i < master_key.size(); ++i) master_key[i] = 0x77;
+    auto s = fb::store::SqliteStore::open(path,
+        std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+
+    // Seed: 3 inbox + 2 outbox + 1 session row.
+    auto peer = bytes({0xab, 0xcd});
+    auto pt_a = bytes({1, 2, 3});
+    auto pt_b = bytes({4, 5, 6, 7});
+    auto pt_c = bytes({8, 9});
+    auto sess = bytes({0x11, 0x22, 0x33, 0x44});
+    auto id1 = bytes({0xa1}), id2 = bytes({0xa2}), id3 = bytes({0xa3});
+    auto id4 = bytes({0xb1}), id5 = bytes({0xb2});
+    s->append_inbox(span_of(id1), span_of(peer), span_of(pt_a), 1000);
+    s->append_inbox(span_of(id2), span_of(peer), span_of(pt_b), 2000);
+    s->append_inbox(span_of(id3), span_of(peer), span_of(pt_c), 3000);
+    s->append_outbox(span_of(id4), span_of(peer), span_of(pt_a), 4000);
+    s->append_outbox(span_of(id5), span_of(peer), span_of(pt_b), 5000);
+    s->save_session(span_of(peer), span_of(sess));
+
+    // Rotate. Returns count of rows re-wrapped.
+    EXPECT_EQ(s->rotate_storage_keys(), 6u);   // 3 inbox + 2 outbox + 1 session
+
+    // All rows still readable + plaintext intact (the rotation re-wrapped
+    // under fresh sub-keys, but the same master_key unwraps them via the
+    // persisted storage_keys table).
+    auto inbox = s->recent_inbox(10);
+    ASSERT_EQ(inbox.size(), 3u);
+    // Sorted DESC by ts — newest first.
+    EXPECT_EQ(inbox[0].plaintext, pt_c);
+    EXPECT_EQ(inbox[1].plaintext, pt_b);
+    EXPECT_EQ(inbox[2].plaintext, pt_a);
+    auto outbox = s->recent_outbox(10);
+    ASSERT_EQ(outbox.size(), 2u);
+    auto loaded_sess = s->load_session(span_of(peer));
+    ASSERT_TRUE(loaded_sess.has_value());
+    EXPECT_EQ(*loaded_sess, sess);
+}
+
+TEST_F(TmpDb, RotateStorageKeysSurvivesReopen) {
+    std::array<std::uint8_t, 32> master_key{};
+    for (std::size_t i = 0; i < master_key.size(); ++i) master_key[i] = 0x99;
+    auto peer = bytes({0x01, 0x02});
+    auto pt   = bytes({0x42, 0x43, 0x44});
+    auto id   = bytes({0xde, 0xad});
+    {
+        auto s = fb::store::SqliteStore::open(path,
+            std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+        s->append_inbox(span_of(id), span_of(peer), span_of(pt), 1000);
+        EXPECT_EQ(s->rotate_storage_keys(), 1u);
+    }
+    // Reopen with the same master → the persisted (rotated) sub-keys
+    // are unwrapped from `storage_keys` and used for subsequent reads.
+    auto s2 = fb::store::SqliteStore::open(path,
+        std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+    auto inbox = s2->recent_inbox(10);
+    ASSERT_EQ(inbox.size(), 1u);
+    EXPECT_EQ(inbox.front().plaintext, pt);
+}
+
+TEST_F(TmpDb, RotateStorageKeysIsRepeatableAndRowsAlwaysReadable) {
+    std::array<std::uint8_t, 32> master_key{};
+    for (std::size_t i = 0; i < master_key.size(); ++i) master_key[i] = 0x55;
+    auto s = fb::store::SqliteStore::open(path,
+        std::span<const std::uint8_t>(master_key.data(), master_key.size()));
+
+    auto peer = bytes({0xfe});
+    auto pt   = bytes({0xaa, 0xbb});
+    auto id1  = bytes({0x01});
+    auto id2  = bytes({0x02});
+    s->append_inbox(span_of(id1), span_of(peer), span_of(pt), 100);
+
+    // First rotation moves the row from gen 0 → gen 1.
+    EXPECT_EQ(s->rotate_storage_keys(), 1u);
+    // Append a row under the new sub-keys.
+    s->append_inbox(span_of(id2), span_of(peer), span_of(pt), 200);
+    // Second rotation moves both rows from gen 1 → gen 2.
+    EXPECT_EQ(s->rotate_storage_keys(), 2u);
+
+    auto inbox = s->recent_inbox(10);
+    ASSERT_EQ(inbox.size(), 2u);
+    EXPECT_EQ(inbox[0].plaintext, pt);
+    EXPECT_EQ(inbox[1].plaintext, pt);
+}
+
+TEST_F(TmpDb, RotateStorageKeysIsNoopWhenUnencrypted) {
+    auto s = fb::store::SqliteStore::open(path);   // no master key
+    auto peer = bytes({0xee});
+    auto pt   = bytes({0x10});
+    auto id   = bytes({0x55});
+    s->append_inbox(span_of(id), span_of(peer), span_of(pt), 100);
+    EXPECT_EQ(s->rotate_storage_keys(), 0u);
+    EXPECT_EQ(s->recent_inbox(10).size(), 1u);
+}
+
 // Reopening an encrypted DB with NO key throws — protects against
 // silently treating the wrapped blobs as plaintext.
 TEST_F(TmpDb, AtRestRefusesUnkeyedReopen) {

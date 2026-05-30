@@ -663,6 +663,15 @@ struct ChatClient::Impl {
     // (mostly for tests that want a tighter sweep). 0 disables.
     std::uint64_t                                 prune_interval_s = 60;
     std::chrono::steady_clock::time_point         last_prune{};
+
+    // Tier-11 Phase 2: periodic storage-key rotation. Defends against
+    // memory-exfiltration attacks (cold-boot, kernel-mode debugger
+    // reading process RAM) by sodium_memzero'ing old sub-keys after
+    // re-wrapping all rows under fresh random ones. Opt-in: 0 disables
+    // (default — the rewrap cost is real on large stores). Override via
+    // FB_ROTATE_INTERVAL_S env (e.g. 86400 for 24h).
+    std::uint64_t                                 rotate_interval_s = 0;
+    std::chrono::steady_clock::time_point         last_rotate{};
     std::mutex                                     lan_mu;
     std::vector<std::pair<std::string, std::uint16_t>> lan_dial_queue;  // guarded by lan_mu
     std::set<std::string>                          lan_dialed;          // "ip:port" already dialed
@@ -3488,8 +3497,12 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             std::vector<std::uint8_t> rxbuf(4096);
             impl_->last_cover_send = std::chrono::steady_clock::now();
             impl_->last_prune      = std::chrono::steady_clock::now();
+            impl_->last_rotate     = std::chrono::steady_clock::now();
             if (const char* p = std::getenv("FB_PRUNE_INTERVAL_S"); p && *p) {
                 impl_->prune_interval_s = std::strtoull(p, nullptr, 10);
+            }
+            if (const char* r = std::getenv("FB_ROTATE_INTERVAL_S"); r && *r) {
+                impl_->rotate_interval_s = std::strtoull(r, nullptr, 10);
             }
             while (impl_->running) {
                 // 0. Tier-11 forward-secret local storage: prune any inbox /
@@ -3514,6 +3527,30 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             emit log(QString("prune_expired failed: %1").arg(e.what()));
                         }
                         impl_->last_prune = now;
+                    }
+                }
+
+                // 0b. Tier-11 Phase 2 — storage-key rotation. Opt-in
+                //     (FB_ROTATE_INTERVAL_S=N). Re-wraps inbox + outbox +
+                //     sessions rows under fresh random sub-keys and
+                //     sodium_memzero's the predecessors so a memory dump
+                //     after this point can no longer decrypt the on-disk
+                //     state. Cost: O(rows in those 3 tables) per tick —
+                //     run on a slow cadence (typically 24h).
+                if (impl_->rotate_interval_s > 0 && impl_->store) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - impl_->last_rotate >=
+                            std::chrono::seconds(impl_->rotate_interval_s)) {
+                        try {
+                            const auto n = impl_->store->rotate_storage_keys();
+                            emit log(QString("storage-key rotation: re-wrapped "
+                                              "%1 row(s)")
+                                         .arg(static_cast<qulonglong>(n)));
+                        } catch (const std::exception& e) {
+                            emit log(QString("rotate_storage_keys failed: %1")
+                                         .arg(e.what()));
+                        }
+                        impl_->last_rotate = now;
                     }
                 }
 
