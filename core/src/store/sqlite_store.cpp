@@ -1419,6 +1419,15 @@ std::optional<std::string> SqliteStore::peer_name(std::span<const std::uint8_t> 
     return out;
 }
 
+std::vector<std::vector<std::uint8_t>>
+SqliteStore::peer_pubkeys_for_username(const std::string& username) const {
+    std::vector<std::vector<std::uint8_t>> out;
+    for (const auto& p : all_cached_peers()) {
+        if (p.username == username) out.push_back(p.peer_pub);
+    }
+    return out;
+}
+
 std::vector<SqliteStore::CachedPeer> SqliteStore::all_cached_peers() const {
     auto* stmt = impl_->prep(
         "SELECT peer_pub, username FROM peer_name_cache ORDER BY learned_ms DESC;");

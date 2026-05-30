@@ -39,6 +39,7 @@
 #  include "embedded_relay.hpp"
 #endif
 #include "login_dialog.hpp"
+#include "verify_identity_dialog.hpp"
 #include "message_delegate.hpp"
 
 namespace fb::desktop {
@@ -412,6 +413,8 @@ MainWindow::MainWindow(QWidget* parent)
     QObject::connect(verify_btn_, &QPushButton::clicked, this, &MainWindow::onVerifyClicked);
     QObject::connect(log_toggle_, &QPushButton::clicked, this, &MainWindow::onToggleLog);
     QObject::connect(client_.get(), &ChatClient::log, this, &MainWindow::appendLog);
+    QObject::connect(client_.get(), &ChatClient::peerPubkeyChanged, this,
+                     &MainWindow::onPeerPubkeyChanged);
     QObject::connect(client_.get(), &ChatClient::messageReceived, this,
                      &MainWindow::appendIncoming);
     QObject::connect(client_.get(), &ChatClient::imageReceived, this,
@@ -1188,22 +1191,50 @@ void MainWindow::onPeerUsernameResolved(const QString& peer_fingerprint,
 }
 
 void MainWindow::onVerifyClicked() {
-    QString peer_fp;
+    // Resolve the selected conversation to a raw 32-byte peer pubkey so
+    // we can hand it to VerifyIdentityDialog (which computes the
+    // safety number against our identity + reads/writes the persisted
+    // verified flag).
+    QByteArray peer_pub;
+    QString    peer_label;
     if (current_conv_.startsWith("dm-pub:")) {
-        peer_fp = current_conv_.mid(7);
+        // dm-pub: keys carry the base64-encoded peer pubkey directly
+        // (ConvKey::dm_pub). Decode and use as-is.
+        const QString b64 = current_conv_.mid(7);
+        peer_pub  = QByteArray::fromBase64(b64.toUtf8(),
+                        QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals);
+        peer_label = b64;
+    } else if (current_conv_.startsWith("dm:")) {
+        const QString username = current_conv_.mid(3);
+        peer_pub   = client_->peerPubkeyForUsername(username);
+        peer_label = username;
     }
-    QString details;
-    details += QStringLiteral("Compare these two strings with your peer over a\n"
-                              "channel you trust (in person, video, voice). If they\n"
-                              "match, no MitM has tampered with the key exchange.\n\n");
-    details += QStringLiteral("Your fingerprint:\n   %1\n\n").arg(my_fingerprint_);
-    if (peer_fp.isEmpty()) {
-        details += QStringLiteral("Peer fingerprint:\n   (select a fingerprint-only DM\n"
-                                  "    in the sidebar to see the peer fingerprint)");
-    } else {
-        details += QStringLiteral("Peer fingerprint:\n   %1").arg(peer_fp);
+    if (peer_pub.size() != 32) {
+        QMessageBox::information(this, tr("Verify identity"),
+            tr("Select a DM in the sidebar first — there's no peer to "
+               "compare against on a channel view."));
+        return;
     }
-    QMessageBox::information(this, "Safety numbers", details);
+    VerifyIdentityDialog dlg(client_.get(), peer_label, peer_pub, this);
+    dlg.exec();
+}
+
+void MainWindow::onPeerPubkeyChanged(const QString& peerLabel,
+                                     const QByteArray& /*oldPubkey*/,
+                                     const QByteArray& /*newPubkey*/) {
+    // Tier-11 MITM warning. Triggered when chat_client sees a previously-
+    // known peer's pubkey arrive as a different value. Could be benign
+    // (the peer reinstalled, lost their device, etc.) — could be an
+    // active substitution attack. Either way, the user MUST re-verify
+    // in person before trusting the new key.
+    QMessageBox::warning(this, tr("Identity changed"),
+        tr("The identity key for \"%1\" has changed.\n\n"
+           "This typically means they reinstalled their app — but it "
+           "MIGHT mean an attacker has substituted their key. Compare "
+           "the new safety number with them over a channel you trust "
+           "(in person, voice call) BEFORE sending anything sensitive.\n\n"
+           "Their previous verification status has been cleared.")
+            .arg(peerLabel));
 }
 
 void MainWindow::onChannelCallRoster(const QString& channel,

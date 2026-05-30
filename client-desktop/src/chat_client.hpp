@@ -201,6 +201,14 @@ public:
     [[nodiscard]] QByteArray myIdentityPubkey() const;
     [[nodiscard]] QString    myFingerprint() const;
 
+    // Look up the most recent identity_pubkey we have cached for the
+    // given username. Returns an empty QByteArray when no cached peer
+    // matches. When multiple peers share the username (the MITM-detection
+    // case), returns the most-recent — but `peerPubkeyChanged` will have
+    // already fired on the second key_fetch_resp that introduced the
+    // mismatch, so the UI knows to warn.
+    [[nodiscard]] QByteArray peerPubkeyForUsername(const QString& username) const;
+
     // ---- Tier-11 Shamir social recovery ----
     //
     // Setup-side: enqueue a ShamirSharePush DM to a trusted contact.

@@ -319,6 +319,18 @@ std::vector<std::uint8_t> pack_text_payload(const std::string& text) {
     return out;
 }
 
+// Tier-11 MITM detection: at every bundle-consume site, compare the
+// newly-received identity_pubkey against any previously-cached pubkey
+// for this username. First contact → silent insert. Subsequent
+// mismatch → peerPubkeyChanged signal + clear the (now-stale)
+// verified flag for the OLD pubkey. Called BEFORE cache_peer_name so
+// the comparison is against the OLD state. Impl lives near
+// safetyNumberFor at the bottom of this TU.
+class ChatClient;
+void detect_pubkey_change(ChatClient* self, ::fb::store::SqliteStore* store,
+                          const std::string& username,
+                          std::span<const std::uint8_t, 32> new_pub);
+
 // Tier-11 Shamir helpers — pack ShamirSharePush / ShamirShareRequest into a
 // DmPayload. Both ride the same Double Ratchet path; the trustee's chat_client
 // persists incoming pushes to shamir_held_shares.
@@ -5105,6 +5117,14 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                                           sess.peer_pub.size()),
                             std::span<const std::uint8_t>(body.data(), body.size()),
                             now_ms);
+                        // Tier-11 MITM detection: before refreshing the
+                        // cache, check whether THIS username has been
+                        // associated with a DIFFERENT pubkey before.
+                        // First contact → silent insert; subsequent
+                        // mismatch → peerPubkeyChanged signal + clear
+                        // the (now-stale) verified flag for the old pub.
+                        detect_pubkey_change(this, impl_->store.get(), s.peer,
+                            std::span<const std::uint8_t, 32>(sess.peer_pub.data(), 32));
                         // Remember the username we used to send to this pubkey
                         // so the sidebar's DM list survives a restart.
                         impl_->store->cache_peer_name(
@@ -5257,6 +5277,9 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 std::vector<std::uint8_t> pk(r.pubkey().begin(),
                                                               r.pubkey().end());
                                 if (impl_->store) {
+                                    detect_pubkey_change(this, impl_->store.get(),
+                                        r.username(),
+                                        std::span<const std::uint8_t, 32>(pk.data(), 32));
                                     impl_->store->cache_peer_name(
                                         std::span<const std::uint8_t>(pk.data(), pk.size()),
                                         r.username());
@@ -6271,5 +6294,39 @@ QString ChatClient::myFingerprint() const {
     if (!impl_->identity) return {};
     return QString::fromStdString(impl_->identity->fingerprint());
 }
+
+void detect_pubkey_change(ChatClient* self, ::fb::store::SqliteStore* store,
+                           const std::string& username,
+                           std::span<const std::uint8_t, 32> new_pub) {
+    if (!self || !store || username.empty()) return;
+    auto prior = store->peer_pubkeys_for_username(username);
+    for (const auto& old_pub : prior) {
+        if (old_pub.size() != 32) continue;
+        if (std::memcmp(old_pub.data(), new_pub.data(), 32) == 0) continue;
+        QByteArray old_qb(reinterpret_cast<const char*>(old_pub.data()), 32);
+        QByteArray new_qb(reinterpret_cast<const char*>(new_pub.data()), 32);
+        const QString label = QString::fromStdString(username);
+        // Clear the old pubkey's verified flag — it's no longer the
+        // claim being made under this username, so the prior human
+        // verification doesn't apply.
+        store->set_peer_verified(
+            std::span<const std::uint8_t>(old_pub.data(), 32), false, 0);
+        QMetaObject::invokeMethod(self, [self, label, old_qb, new_qb] {
+            emit self->peerPubkeyChanged(label, old_qb, new_qb);
+        }, Qt::QueuedConnection);
+        return;   // one signal per fetch is enough
+    }
+}
+
+QByteArray ChatClient::peerPubkeyForUsername(const QString& username) const {
+    if (!impl_->store) return {};
+    auto matches = impl_->store->peer_pubkeys_for_username(username.toStdString());
+    if (matches.empty()) return {};
+    // Return the most-recent (peer_pubkeys_for_username is built on
+    // all_cached_peers which is already learned_ms DESC).
+    return QByteArray(reinterpret_cast<const char*>(matches.front().data()),
+                      static_cast<int>(matches.front().size()));
+}
+
 
 }  // namespace fb::desktop

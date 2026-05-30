@@ -141,6 +141,14 @@ public:
                                                 std::uint64_t verified_at_ms);
     [[nodiscard]] bool       peer_verified(std::span<const std::uint8_t> peer_pub) const;
 
+    // Reverse lookup of peer_name_cache: returns every peer_pub we've seen
+    // associated with `username` (typically 1; if >1, that's exactly the
+    // MITM-detection signal — multiple pubkeys claiming the same name).
+    // Scans the table and decrypts each row's username when at-rest
+    // encryption is on; O(table-size) but the cache is small.
+    [[nodiscard]] std::vector<std::vector<std::uint8_t>>
+        peer_pubkeys_for_username(const std::string& username) const;
+
     // Tier-11 Shamir social recovery (task #385) — trustee-side share
     // custody. When a peer DMs us a ShamirSharePush, the chat_client
     // calls save_shamir_share to persist it; on recovery, the peer DMs

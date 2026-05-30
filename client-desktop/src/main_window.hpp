@@ -85,6 +85,11 @@ private slots:
     void onDmListSelectionChanged();
     void onChannelSelectionChanged();
     void onVerifyClicked();
+    // Tier-11 MITM warning: pops a QMessageBox when chat_client detects
+    // a peer's pubkey has changed mid-conversation.
+    void onPeerPubkeyChanged(const QString& peerLabel,
+                              const QByteArray& oldPubkey,
+                              const QByteArray& newPubkey);
     void appendLog(const QString& s);
     void appendIncoming(const QString& peer_fp, const QString& peer_username,
                         const QString& text);
