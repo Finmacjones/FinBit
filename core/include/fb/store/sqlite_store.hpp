@@ -141,6 +141,26 @@ public:
                                                 std::uint64_t verified_at_ms);
     [[nodiscard]] bool       peer_verified(std::span<const std::uint8_t> peer_pub) const;
 
+    // Tier-11 Shamir social recovery (task #385) — trustee-side share
+    // custody. When a peer DMs us a ShamirSharePush, the chat_client
+    // calls save_shamir_share to persist it; on recovery, the peer DMs
+    // a ShamirShareRequest and we look up + reply with the held share.
+    // Identified by (peer_pub, setup_id) so a single peer can have
+    // multiple parallel Shamir setups (e.g. test setup + real setup).
+    struct ShamirHeldShare {
+        std::vector<std::uint8_t> peer_pub;
+        std::uint64_t             setup_id   = 0;
+        std::vector<std::uint8_t> share;        // encoded (1 + secret_size bytes)
+        std::uint32_t             threshold    = 0;
+        std::uint32_t             total        = 0;
+        std::string               label;
+        std::uint64_t             received_at_ms = 0;
+    };
+    void save_shamir_share(const ShamirHeldShare& share);
+    [[nodiscard]] std::optional<ShamirHeldShare> load_shamir_share(
+        std::span<const std::uint8_t> peer_pub, std::uint64_t setup_id) const;
+    [[nodiscard]] std::vector<ShamirHeldShare> list_shamir_shares() const;
+
     struct InboxRow {
         std::vector<std::uint8_t> envelope_id;
         std::vector<std::uint8_t> peer_pub;

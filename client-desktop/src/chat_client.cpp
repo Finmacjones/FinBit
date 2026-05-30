@@ -319,6 +319,35 @@ std::vector<std::uint8_t> pack_text_payload(const std::string& text) {
     return out;
 }
 
+// Tier-11 Shamir helpers — pack ShamirSharePush / ShamirShareRequest into a
+// DmPayload. Both ride the same Double Ratchet path; the trustee's chat_client
+// persists incoming pushes to shamir_held_shares.
+std::vector<std::uint8_t> pack_shamir_push_payload(
+    std::span<const std::uint8_t> share, std::uint64_t setup_id,
+    std::uint32_t threshold, std::uint32_t total, const std::string& label) {
+    fb::proto::DmPayload p;
+    auto* s = p.mutable_shamir_share_push();
+    s->set_share(std::string(share.begin(), share.end()));
+    s->set_setup_id(setup_id);
+    s->set_threshold(threshold);
+    s->set_total(total);
+    s->set_label(label);
+    std::vector<std::uint8_t> out(p.ByteSizeLong());
+    if (!p.SerializeToArray(out.data(), static_cast<int>(out.size()))) out.clear();
+    return out;
+}
+
+std::vector<std::uint8_t> pack_shamir_request_payload(
+    std::uint64_t setup_id, const std::string& reason) {
+    fb::proto::DmPayload p;
+    auto* r = p.mutable_shamir_share_request();
+    r->set_setup_id(setup_id);
+    r->set_reason(reason);
+    std::vector<std::uint8_t> out(p.ByteSizeLong());
+    if (!p.SerializeToArray(out.data(), static_cast<int>(out.size()))) out.clear();
+    return out;
+}
+
 // Pack an inline attachment (image / GIF / small file) into a serialized
 // DmPayload. Rides the same Double Ratchet path as text via PendingSend's
 // pre_packed_payload, so the relay only ever sees ciphertext.
@@ -2825,6 +2854,51 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                              .arg(peer_fp));
                                 emit channelJoined(
                                     QString::fromStdString(ck.channel_name()));
+                            } else if (payload.body_case() ==
+                                       fb::proto::DmPayload::kShamirSharePush) {
+                                const auto& sp = payload.shamir_share_push();
+                                if (impl_->store) {
+                                    fb::store::SqliteStore::ShamirHeldShare h;
+                                    h.peer_pub.assign(peer_pub_arr.begin(),
+                                                       peer_pub_arr.end());
+                                    h.setup_id  = sp.setup_id();
+                                    h.share.assign(sp.share().begin(), sp.share().end());
+                                    h.threshold = sp.threshold();
+                                    h.total     = sp.total();
+                                    h.label     = sp.label();
+                                    h.received_at_ms = static_cast<std::uint64_t>(
+                                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now()
+                                                .time_since_epoch()).count());
+                                    impl_->store->save_shamir_share(h);
+                                }
+                                QByteArray pub_qb(
+                                    reinterpret_cast<const char*>(peer_pub_arr.data()), 32);
+                                emit shamirShareReceived(
+                                    peer_fp, pub_qb,
+                                    static_cast<quint64>(sp.setup_id()),
+                                    sp.threshold(), sp.total(),
+                                    QString::fromStdString(sp.label()));
+                                emit log(QString("Shamir share received from %1 "
+                                                 "(setup %2, %3-of-%4, label \"%5\")")
+                                             .arg(peer_fp)
+                                             .arg(static_cast<qulonglong>(sp.setup_id()))
+                                             .arg(sp.threshold()).arg(sp.total())
+                                             .arg(QString::fromStdString(sp.label())));
+                            } else if (payload.body_case() ==
+                                       fb::proto::DmPayload::kShamirShareRequest) {
+                                const auto& rq = payload.shamir_share_request();
+                                QByteArray pub_qb(
+                                    reinterpret_cast<const char*>(peer_pub_arr.data()), 32);
+                                emit shamirShareRequestReceived(
+                                    peer_fp, pub_qb,
+                                    static_cast<quint64>(rq.setup_id()),
+                                    QString::fromStdString(rq.reason()));
+                                emit log(QString("Shamir share REQUEST from %1 "
+                                                 "(setup %2, reason \"%3\")")
+                                             .arg(peer_fp)
+                                             .arg(static_cast<qulonglong>(rq.setup_id()))
+                                             .arg(QString::fromStdString(rq.reason())));
                             } else if (payload.body_case() ==
                                        fb::proto::DmPayload::kMlsInviteRequest) {
                                 const auto& m = payload.mls_invite_request();
@@ -5401,6 +5475,43 @@ void ChatClient::send_to_peer(const QString& peer, const QString& text) {
     {
         std::lock_guard lk(impl_->mu);
         impl_->queue.push_back({peer.toStdString(), text.toStdString(), {}});
+    }
+    impl_->cv.notify_all();
+}
+
+void ChatClient::sendShamirShareTo(const QString& peerUsername,
+                                    const QByteArray& share,
+                                    quint64 setupId, quint32 threshold,
+                                    quint32 total, const QString& label) {
+    if (share.isEmpty()) {
+        emit errorOccurred("sendShamirShareTo: empty share");
+        return;
+    }
+    auto packed = pack_shamir_push_payload(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(share.constData()),
+            static_cast<std::size_t>(share.size())),
+        setupId, threshold, total, label.toStdString());
+    PendingSend ps;
+    ps.peer = peerUsername.toStdString();
+    ps.pre_packed_payload = std::move(packed);
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->queue.push_back(std::move(ps));
+    }
+    impl_->cv.notify_all();
+}
+
+void ChatClient::requestShamirShareFrom(const QString& peerUsername,
+                                          quint64 setupId,
+                                          const QString& reason) {
+    auto packed = pack_shamir_request_payload(setupId, reason.toStdString());
+    PendingSend ps;
+    ps.peer = peerUsername.toStdString();
+    ps.pre_packed_payload = std::move(packed);
+    {
+        std::lock_guard lk(impl_->mu);
+        impl_->queue.push_back(std::move(ps));
     }
     impl_->cv.notify_all();
 }

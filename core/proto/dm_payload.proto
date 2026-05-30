@@ -152,18 +152,55 @@ message RoomKey {
     bytes  secret  = 3;   // 32-byte room_secret
 }
 
+// Tier-11 Shamir social recovery — distributed-DM share custody.
+//
+// Setup flow (the seed-owner runs this once):
+//   1. shamir::split(my_seed, M, N) → N shares.
+//   2. Pick N trusted contacts.
+//   3. Send each contact a ShamirSharePush with their assigned share
+//      (the share + setup metadata so the contact knows which setup
+//      it belongs to and can reply with the right share later).
+//
+// Recovery flow (the seed-owner has lost their device + recovery code):
+//   1. Authenticate to M of the N trustees out of band (in person,
+//      voice call, etc. — the recovery client doesn't yet have the
+//      ratchets to talk to them on its own).
+//   2. Each trustee sends a ShamirSharePush of the held share through
+//      a NEW conversation (the recoverer authenticates via the
+//      out-of-band channel, NOT by being already-known to the trustee).
+//   3. Recoverer feeds the M shares to shamir::combine → recovers seed.
+//
+// Async variant (after the recoverer has bootstrapped a new identity):
+//   ShamirShareRequest → each trustee, who can manually approve and
+//   reply via ShamirSharePush. The trustees see the request as a
+//   "Foo is asking for your stored share" UI prompt.
+message ShamirSharePush {
+    bytes  share      = 1;   // encoded share bytes (1-byte x + N y-bytes)
+    uint64 setup_id   = 2;   // sender-chosen u64 distinguishing N parallel setups
+    uint32 threshold  = 3;   // M — informational, helps the holder show context
+    uint32 total      = 4;   // N — informational
+    string label      = 5;   // optional sender-chosen label ("primary seed", "test")
+}
+
+message ShamirShareRequest {
+    uint64 setup_id   = 1;   // the setup ID the requester is recovering
+    string reason     = 2;   // optional human-readable note ("lost my phone")
+}
+
 message DmPayload {
     oneof body {
-        string                  text               = 1;
-        ChannelKeyDistribution  channel_key        = 2;
-        MediaSignal             media_signal       = 3;
-        MlsInviteRequest        mls_invite_request = 4;
-        MlsKeyPackage           mls_key_package    = 5;
-        MlsWelcome              mls_welcome        = 6;
-        MlsCommit               mls_commit         = 7;
-        MlsProposal             mls_proposal       = 8;
-        Attachment              attachment         = 9;
-        RoomKey                 room_key           = 10;
+        string                  text                  = 1;
+        ChannelKeyDistribution  channel_key           = 2;
+        MediaSignal             media_signal          = 3;
+        MlsInviteRequest        mls_invite_request    = 4;
+        MlsKeyPackage           mls_key_package       = 5;
+        MlsWelcome              mls_welcome           = 6;
+        MlsCommit               mls_commit            = 7;
+        MlsProposal             mls_proposal          = 8;
+        Attachment              attachment            = 9;
+        RoomKey                 room_key              = 10;
+        ShamirSharePush         shamir_share_push     = 11;
+        ShamirShareRequest      shamir_share_request  = 12;
     }
 
     // ---- Sealed sender (Signal-style metadata defense) -------------------

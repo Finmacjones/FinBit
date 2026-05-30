@@ -201,6 +201,34 @@ public:
     [[nodiscard]] QByteArray myIdentityPubkey() const;
     [[nodiscard]] QString    myFingerprint() const;
 
+    // ---- Tier-11 Shamir social recovery ----
+    //
+    // Setup-side: enqueue a ShamirSharePush DM to a trusted contact.
+    // The contact's chat_client persists the share to its sqlite store
+    // (shamir_held_shares table) and notifies the user via the
+    // shamirShareReceived signal.
+    //
+    // Recovery-side: enqueue a ShamirShareRequest DM to a trustee.
+    // The trustee's UI prompts them with shamirShareRequestReceived;
+    // if they approve, their client sends back a ShamirSharePush
+    // carrying the held share.
+    //
+    // Both methods route via the existing PendingSend queue (username
+    // identifies the recipient — the worker does the key-fetch +
+    // ratchet bootstrap as needed). Take a username rather than a raw
+    // pubkey so they integrate cleanly with how the rest of chat_client
+    // addresses peers; the UI's wizard picks contacts from the contact
+    // list (already keyed by username).
+    void sendShamirShareTo(const QString&    peerUsername,
+                            const QByteArray& share,
+                            quint64           setupId,
+                            quint32           threshold,
+                            quint32           total,
+                            const QString&    label);
+    void requestShamirShareFrom(const QString&    peerUsername,
+                                  quint64           setupId,
+                                  const QString&    reason);
+
     // History entry returned by load_recent_history().
     struct HistoryEntry {
         bool        outgoing;        // true = me → peer; false = peer → me
@@ -252,6 +280,26 @@ signals:
     void peerPubkeyChanged(QString peerLabel,
                             QByteArray oldPubkey,
                             QByteArray newPubkey);
+
+    // Tier-11 Shamir social recovery — receive-side notifications.
+    // shamirShareReceived: a peer DM'd us their share for safekeeping.
+    //   The trustee's chat_client has already persisted to the sqlite
+    //   store; this signal lets the UI confirm "you're now holding a
+    //   share for <peer>".
+    // shamirShareRequestReceived: a peer is asking us to send back the
+    //   share we're holding. The UI prompts the user; on approval, the
+    //   caller calls sendShamirShareTo with the share looked up from
+    //   the store (load_shamir_share).
+    void shamirShareReceived(QString    peerFingerprint,
+                              QByteArray peerPubkey,
+                              quint64    setupId,
+                              quint32    threshold,
+                              quint32    total,
+                              QString    label);
+    void shamirShareRequestReceived(QString    peerFingerprint,
+                                     QByteArray peerPubkey,
+                                     quint64    setupId,
+                                     QString    reason);
     // MLS handshake inbound — one signal per DmPayload variant. The
     // chat client just surfaces these; orchestration (calling
     // MlsGroup::add_member, completing PendingMlsJoin, applying

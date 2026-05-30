@@ -152,6 +152,22 @@ CREATE TABLE IF NOT EXISTS peer_verified (
     verified       INTEGER NOT NULL DEFAULT 0,
     verified_at_ms INTEGER NOT NULL DEFAULT 0
 );
+-- Tier-11 Shamir social recovery: trustee-side share custody. Each row
+-- is a Shamir share that some peer entrusted to this user. Identified
+-- by (peer_pub, setup_id) so a single peer can have multiple parallel
+-- setups. On a future ShamirShareRequest from that peer (or any user
+-- the trustee authenticates out-of-band), the UI looks the share up
+-- and the user approves sending it back.
+CREATE TABLE IF NOT EXISTS shamir_held_shares (
+    peer_pub       BLOB    NOT NULL,
+    setup_id       INTEGER NOT NULL,
+    share          BLOB    NOT NULL,
+    threshold      INTEGER NOT NULL,
+    total          INTEGER NOT NULL,
+    label          TEXT    NOT NULL DEFAULT '',
+    received_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (peer_pub, setup_id)
+);
 )sql";
 
 void throw_sqlite(const std::string& ctx, sqlite3* db) {
@@ -797,6 +813,84 @@ bool SqliteStore::peer_verified(std::span<const std::uint8_t> peer_pub) const {
     bool out = false;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
         out = sqlite3_column_int(stmt, 0) != 0;
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+// ---- Shamir held-share custody --------------------------------------------
+
+void SqliteStore::save_shamir_share(const ShamirHeldShare& s) {
+    auto* stmt = impl_->prep(
+        "INSERT INTO shamir_held_shares(peer_pub, setup_id, share, threshold, "
+        "total, label, received_at_ms) VALUES(?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(peer_pub, setup_id) DO UPDATE SET "
+        "share = excluded.share, threshold = excluded.threshold, "
+        "total = excluded.total, label = excluded.label, "
+        "received_at_ms = excluded.received_at_ms;");
+    bind_blob(stmt, 1,
+        std::span<const std::uint8_t>(s.peer_pub.data(), s.peer_pub.size()));
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(s.setup_id));
+    bind_blob(stmt, 3,
+        std::span<const std::uint8_t>(s.share.data(), s.share.size()));
+    sqlite3_bind_int(stmt, 4, static_cast<int>(s.threshold));
+    sqlite3_bind_int(stmt, 5, static_cast<int>(s.total));
+    sqlite3_bind_text(stmt, 6, s.label.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 7, static_cast<sqlite3_int64>(s.received_at_ms));
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+std::optional<SqliteStore::ShamirHeldShare>
+SqliteStore::load_shamir_share(std::span<const std::uint8_t> peer_pub,
+                                std::uint64_t setup_id) const {
+    auto* stmt = impl_->prep(
+        "SELECT share, threshold, total, label, received_at_ms FROM "
+        "shamir_held_shares WHERE peer_pub = ? AND setup_id = ?;");
+    bind_blob(stmt, 1, peer_pub);
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(setup_id));
+    std::optional<ShamirHeldShare> out;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        ShamirHeldShare s;
+        s.peer_pub.assign(peer_pub.begin(), peer_pub.end());
+        s.setup_id = setup_id;
+        const auto sh_len = sqlite3_column_bytes(stmt, 0);
+        const auto* sh_ptr = static_cast<const std::uint8_t*>(
+            sqlite3_column_blob(stmt, 0));
+        s.share.assign(sh_ptr, sh_ptr + sh_len);
+        s.threshold      = static_cast<std::uint32_t>(sqlite3_column_int(stmt, 1));
+        s.total          = static_cast<std::uint32_t>(sqlite3_column_int(stmt, 2));
+        const auto* lbl  = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        s.label          = lbl ? lbl : "";
+        s.received_at_ms = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 4));
+        out = std::move(s);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+std::vector<SqliteStore::ShamirHeldShare> SqliteStore::list_shamir_shares() const {
+    auto* stmt = impl_->prep(
+        "SELECT peer_pub, setup_id, share, threshold, total, label, "
+        "received_at_ms FROM shamir_held_shares ORDER BY received_at_ms DESC;");
+    std::vector<ShamirHeldShare> out;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        ShamirHeldShare s;
+        const auto pp_len = sqlite3_column_bytes(stmt, 0);
+        const auto* pp_ptr = static_cast<const std::uint8_t*>(
+            sqlite3_column_blob(stmt, 0));
+        s.peer_pub.assign(pp_ptr, pp_ptr + pp_len);
+        s.setup_id = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 1));
+        const auto sh_len = sqlite3_column_bytes(stmt, 2);
+        const auto* sh_ptr = static_cast<const std::uint8_t*>(
+            sqlite3_column_blob(stmt, 2));
+        s.share.assign(sh_ptr, sh_ptr + sh_len);
+        s.threshold      = static_cast<std::uint32_t>(sqlite3_column_int(stmt, 3));
+        s.total          = static_cast<std::uint32_t>(sqlite3_column_int(stmt, 4));
+        const auto* lbl  = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+        s.label          = lbl ? lbl : "";
+        s.received_at_ms = static_cast<std::uint64_t>(sqlite3_column_int64(stmt, 6));
+        out.push_back(std::move(s));
     }
     sqlite3_finalize(stmt);
     return out;

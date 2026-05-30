@@ -500,6 +500,82 @@ TEST_F(TmpDb, LegacyAppendNeverExpires) {
     EXPECT_EQ(s->recent_inbox(100).size(), 1u);
 }
 
+// ---- Tier-11 Shamir held-share custody -------------------------------------
+
+TEST_F(TmpDb, SaveAndLoadShamirShareRoundTrip) {
+    auto s = fb::store::SqliteStore::open(path);
+    fb::store::SqliteStore::ShamirHeldShare h;
+    h.peer_pub.assign({0xaa, 0xbb, 0xcc});
+    h.setup_id       = 0xdeadbeef;
+    h.share.assign({0x01, 0x02, 0x03, 0x04, 0x05});
+    h.threshold      = 3;
+    h.total          = 5;
+    h.label          = "primary";
+    h.received_at_ms = 100000;
+    s->save_shamir_share(h);
+
+    auto loaded = s->load_shamir_share(
+        std::span<const std::uint8_t>(h.peer_pub.data(), h.peer_pub.size()),
+        h.setup_id);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->peer_pub, h.peer_pub);
+    EXPECT_EQ(loaded->setup_id, h.setup_id);
+    EXPECT_EQ(loaded->share,    h.share);
+    EXPECT_EQ(loaded->threshold, 3u);
+    EXPECT_EQ(loaded->total,     5u);
+    EXPECT_EQ(loaded->label,    "primary");
+    EXPECT_EQ(loaded->received_at_ms, 100000u);
+}
+
+TEST_F(TmpDb, ShamirShareCompositeKeyAllowsMultipleSetupsPerPeer) {
+    auto s = fb::store::SqliteStore::open(path);
+    fb::store::SqliteStore::ShamirHeldShare a, b;
+    a.peer_pub = b.peer_pub = bytes({0x11}).empty() ? std::vector<std::uint8_t>{0x11} : std::vector<std::uint8_t>{0x11};
+    a.peer_pub = {0x11}; b.peer_pub = {0x11};
+    a.setup_id = 1; b.setup_id = 2;
+    a.share = {0xa}; b.share = {0xb};
+    a.threshold = a.total = b.threshold = b.total = 2;
+    a.received_at_ms = 10; b.received_at_ms = 20;
+    s->save_shamir_share(a);
+    s->save_shamir_share(b);
+    EXPECT_EQ(s->list_shamir_shares().size(), 2u);
+
+    auto la = s->load_shamir_share(
+        std::span<const std::uint8_t>(a.peer_pub.data(), a.peer_pub.size()), 1);
+    auto lb = s->load_shamir_share(
+        std::span<const std::uint8_t>(b.peer_pub.data(), b.peer_pub.size()), 2);
+    ASSERT_TRUE(la.has_value());
+    ASSERT_TRUE(lb.has_value());
+    EXPECT_EQ(la->share, std::vector<std::uint8_t>{0xa});
+    EXPECT_EQ(lb->share, std::vector<std::uint8_t>{0xb});
+}
+
+TEST_F(TmpDb, ShamirShareUpsertReplacesPrior) {
+    auto s = fb::store::SqliteStore::open(path);
+    fb::store::SqliteStore::ShamirHeldShare h;
+    h.peer_pub = {0x22}; h.setup_id = 1;
+    h.share = {0xc0}; h.threshold = h.total = 1; h.received_at_ms = 1;
+    s->save_shamir_share(h);
+
+    // Same composite key — different share bytes (rotation / re-setup).
+    h.share = {0xc1, 0xc2};
+    h.received_at_ms = 2;
+    s->save_shamir_share(h);
+    auto loaded = s->load_shamir_share(
+        std::span<const std::uint8_t>(h.peer_pub.data(), h.peer_pub.size()), 1);
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->share, (std::vector<std::uint8_t>{0xc1, 0xc2}));
+    EXPECT_EQ(loaded->received_at_ms, 2u);
+    EXPECT_EQ(s->list_shamir_shares().size(), 1u);
+}
+
+TEST_F(TmpDb, ShamirShareMissingLookupReturnsNullopt) {
+    auto s = fb::store::SqliteStore::open(path);
+    auto p = bytes({0xff});
+    EXPECT_FALSE(s->load_shamir_share(span_of(p), 42).has_value());
+    EXPECT_TRUE(s->list_shamir_shares().empty());
+}
+
 // ---- Tier-11 Phase 2 — storage-key rotation -------------------------------
 
 TEST_F(TmpDb, RotateStorageKeysPreservesAllRows) {
