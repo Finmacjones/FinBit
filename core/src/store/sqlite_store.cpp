@@ -292,6 +292,13 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
     };
     try_add_column(
         "ALTER TABLE chan_state ADD COLUMN crypto INTEGER NOT NULL DEFAULT 0;");
+    // Tier-11 forward-secret local storage: per-row expiry. Legacy rows
+    // default to 0 (never expire), so existing DBs are unaffected until
+    // a sender starts setting DmPayload.ttl_ms.
+    try_add_column(
+        "ALTER TABLE inbox  ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0;");
+    try_add_column(
+        "ALTER TABLE outbox ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0;");
     s->impl_->exec("PRAGMA journal_mode = WAL;");
     s->impl_->exec("PRAGMA synchronous = NORMAL;");
 
@@ -595,6 +602,29 @@ void SqliteStore::append_inbox(std::span<const std::uint8_t> envelope_id,
     sqlite3_finalize(stmt);
 }
 
+void SqliteStore::append_inbox_with_expiry(std::span<const std::uint8_t> envelope_id,
+                                            std::span<const std::uint8_t> peer_pub,
+                                            std::span<const std::uint8_t> plaintext,
+                                            std::uint64_t timestamp_ms,
+                                            std::uint64_t expires_at_ms) {
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = plaintext;
+    if (impl_->encrypt_at_rest) {
+        wrapped = aead_wrap(impl_->inbox_key, plaintext, envelope_id);
+        stored  = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
+    auto* stmt = impl_->prep(
+        "INSERT OR IGNORE INTO inbox(envelope_id, peer_pub, plaintext, ts_ms, expires_at_ms) "
+        "VALUES(?, ?, ?, ?, ?);");
+    bind_blob(stmt, 1, envelope_id);
+    bind_blob(stmt, 2, peer_pub);
+    bind_blob(stmt, 3, stored);
+    sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(timestamp_ms));
+    sqlite3_bind_int64(stmt, 5, static_cast<sqlite3_int64>(expires_at_ms));
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
 void SqliteStore::append_outbox(std::span<const std::uint8_t> envelope_id,
                                 std::span<const std::uint8_t> peer_pub,
                                 std::span<const std::uint8_t> ciphertext,
@@ -618,6 +648,48 @@ void SqliteStore::append_outbox(std::span<const std::uint8_t> envelope_id,
     sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(timestamp_ms));
     sqlite3_step(stmt);
     sqlite3_finalize(stmt);
+}
+
+void SqliteStore::append_outbox_with_expiry(std::span<const std::uint8_t> envelope_id,
+                                             std::span<const std::uint8_t> peer_pub,
+                                             std::span<const std::uint8_t> ciphertext,
+                                             std::uint64_t timestamp_ms,
+                                             std::uint64_t expires_at_ms) {
+    std::vector<std::uint8_t> wrapped;
+    std::span<const std::uint8_t> stored = ciphertext;
+    if (impl_->encrypt_at_rest) {
+        wrapped = aead_wrap(impl_->outbox_key, ciphertext, envelope_id);
+        stored  = std::span<const std::uint8_t>(wrapped.data(), wrapped.size());
+    }
+    auto* stmt = impl_->prep(
+        "INSERT OR IGNORE INTO outbox(envelope_id, peer_pub, ciphertext, ts_ms, expires_at_ms) "
+        "VALUES(?, ?, ?, ?, ?);");
+    bind_blob(stmt, 1, envelope_id);
+    bind_blob(stmt, 2, peer_pub);
+    bind_blob(stmt, 3, stored);
+    sqlite3_bind_int64(stmt, 4, static_cast<sqlite3_int64>(timestamp_ms));
+    sqlite3_bind_int64(stmt, 5, static_cast<sqlite3_int64>(expires_at_ms));
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+std::size_t SqliteStore::prune_expired(std::uint64_t now_ms) {
+    // Sweep both tables in one transaction. Rows with expires_at_ms = 0
+    // (the default, set by the legacy append_* overloads) are exempt.
+    impl_->exec("BEGIN;");
+    std::size_t deleted = 0;
+    for (const char* table : {"inbox", "outbox"}) {
+        std::string sql = "DELETE FROM ";
+        sql += table;
+        sql += " WHERE expires_at_ms > 0 AND expires_at_ms <= ?;";
+        auto* stmt = impl_->prep(sql.c_str());
+        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(now_ms));
+        sqlite3_step(stmt);
+        deleted += static_cast<std::size_t>(sqlite3_changes(impl_->db));
+        sqlite3_finalize(stmt);
+    }
+    impl_->exec("COMMIT;");
+    return deleted;
 }
 
 std::vector<SqliteStore::InboxRow> SqliteStore::recent_inbox(std::size_t limit) const {

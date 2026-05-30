@@ -656,6 +656,13 @@ struct ChatClient::Impl {
     // docs/censorship-resistance.md (Tier 9).
     std::uint64_t                                 cover_interval_s = 0;
     std::chrono::steady_clock::time_point         last_cover_send{};
+
+    // Tier-11 forward-secret local storage: tick the SQLCipher prune on a
+    // gentle cadence (default 60s). prune_expired sweeps both inbox + outbox
+    // for rows past their expires_at_ms. Set FB_PRUNE_INTERVAL_S to tune
+    // (mostly for tests that want a tighter sweep). 0 disables.
+    std::uint64_t                                 prune_interval_s = 60;
+    std::chrono::steady_clock::time_point         last_prune{};
     std::mutex                                     lan_mu;
     std::vector<std::pair<std::string, std::uint16_t>> lan_dial_queue;  // guarded by lan_mu
     std::set<std::string>                          lan_dialed;          // "ip:port" already dialed
@@ -2656,13 +2663,25 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                                                      env.envelope_id().end());
                                     std::vector<std::uint8_t> raw_text(payload.text().begin(),
                                                                         payload.text().end());
-                                    impl_->store->append_inbox(
-                                        std::span<const std::uint8_t>(envid.data(),
-                                                                       envid.size()),
-                                        std::span<const std::uint8_t>(peer_pub_arr.data(), 32),
-                                        std::span<const std::uint8_t>(raw_text.data(),
-                                                                       raw_text.size()),
-                                        rx_ms);
+                                    // Tier-11 forward-secret local storage:
+                                    // sender's DmPayload.ttl_ms (0 = never)
+                                    // becomes expires_at_ms = rx_ms + ttl_ms
+                                    // on this row. The worker's periodic
+                                    // prune sweeps expired rows.
+                                    const std::uint64_t ttl = payload.ttl_ms();
+                                    if (ttl > 0) {
+                                        impl_->store->append_inbox_with_expiry(
+                                            std::span<const std::uint8_t>(envid.data(), envid.size()),
+                                            std::span<const std::uint8_t>(peer_pub_arr.data(), 32),
+                                            std::span<const std::uint8_t>(raw_text.data(), raw_text.size()),
+                                            rx_ms, rx_ms + ttl);
+                                    } else {
+                                        impl_->store->append_inbox(
+                                            std::span<const std::uint8_t>(envid.data(), envid.size()),
+                                            std::span<const std::uint8_t>(peer_pub_arr.data(), 32),
+                                            std::span<const std::uint8_t>(raw_text.data(), raw_text.size()),
+                                            rx_ms);
+                                    }
                                 }
                                 emit messageReceived(
                                     peer_fp, cached_username,
@@ -3468,7 +3487,36 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // Main I/O loop.
             std::vector<std::uint8_t> rxbuf(4096);
             impl_->last_cover_send = std::chrono::steady_clock::now();
+            impl_->last_prune      = std::chrono::steady_clock::now();
+            if (const char* p = std::getenv("FB_PRUNE_INTERVAL_S"); p && *p) {
+                impl_->prune_interval_s = std::strtoull(p, nullptr, 10);
+            }
             while (impl_->running) {
+                // 0. Tier-11 forward-secret local storage: prune any inbox /
+                //    outbox rows whose sender-set TTL has passed. Cheap when
+                //    nothing's due (a single indexed DELETE WHERE per table).
+                if (impl_->prune_interval_s > 0 && impl_->store) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - impl_->last_prune >=
+                            std::chrono::seconds(impl_->prune_interval_s)) {
+                        try {
+                            const auto now_ms = static_cast<std::uint64_t>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now()
+                                        .time_since_epoch()).count());
+                            const auto n = impl_->store->prune_expired(now_ms);
+                            if (n > 0) {
+                                emit log(QString("forward-secret storage: "
+                                                  "pruned %1 expired row(s)")
+                                             .arg(static_cast<qulonglong>(n)));
+                            }
+                        } catch (const std::exception& e) {
+                            emit log(QString("prune_expired failed: %1").arg(e.what()));
+                        }
+                        impl_->last_prune = now;
+                    }
+                }
+
                 // 0a. Cover-traffic heartbeat. Opt-in (FB_COVER_TRAFFIC=N).
                 //     A passive observer (ISP, Tor exit, global adversary)
                 //     learns a surprising amount from message timing alone —

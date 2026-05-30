@@ -132,6 +132,12 @@ struct Args {
     bool        shamir_combine = false;
     int         shamir_m       = 0;        // threshold (M)
     int         shamir_n       = 0;        // total shares (N)
+
+    // Tier-11 sender-set TTL (forward-secret local storage). 0 = never expire.
+    // When set on --send (and friends), the inner DmPayload.ttl_ms is filled;
+    // recipient's chat_client persists with expires_at_ms = ts + ttl, and a
+    // periodic prune_expired sweeps the SQLCipher store.
+    std::uint64_t ttl_ms = 0;
     int  room_epoch = 1;
     // Call-signaling test mode (headless, no real media). Mirrors the
     // desktop's group-call lazy bootstrap: --call-offer starts from a
@@ -281,6 +287,11 @@ bool parse(int argc, char** argv, Args& a) {
             a.shamir_n = std::atoi(n.c_str());
         }
         else if (s == "--shamir-combine") { a.shamir_combine = true; }
+        else if (s == "--ttl-ms") {
+            std::string v;
+            if (!next(v)) return false;
+            a.ttl_ms = std::strtoull(v.c_str(), nullptr, 10);
+        }
         else if (s == "--room-epoch") { std::string v;
                                         if (!next(v)) return false;
                                         a.room_epoch = std::atoi(v.c_str()); }
@@ -403,9 +414,11 @@ std::vector<std::uint8_t> serialize(const google::protobuf::MessageLite& m) {
 }
 
 // Pack a plain text DM body into a DmPayload protobuf.
-std::vector<std::uint8_t> pack_text_payload(const std::string& text) {
+std::vector<std::uint8_t> pack_text_payload(const std::string& text,
+                                              std::uint64_t ttl_ms = 0) {
     fb::proto::DmPayload p;
     p.set_text(text);
+    if (ttl_ms > 0) p.set_ttl_ms(ttl_ms);
     return serialize(p);
 }
 
@@ -1410,7 +1423,7 @@ int main(int argc, char** argv) {
         auto rat = fb::crypto::DoubleRatchet::init_alice(shared, std::span<const std::uint8_t, 32>(peer_x));
         // Inner DM body is now a serialized DmPayload protobuf so receivers
         // can route between text and channel-key invites.
-        const auto pt = pack_text_payload(args.text);
+        const auto pt = pack_text_payload(args.text, args.ttl_ms);
         std::vector<std::uint8_t> envid(16);
         randombytes_buf(envid.data(), envid.size());
         const auto now_ms = static_cast<std::uint64_t>(

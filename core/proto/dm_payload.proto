@@ -197,4 +197,19 @@ message DmPayload {
     // subsequent envelopes from this sender are sealed.
     bytes sealed_sender_pubkey = 100;
     bytes sealed_sender_sig    = 101;
+
+    // ---- Forward-secret local storage (Tier 11) -----------------------
+    // Sender-set lifetime hint in milliseconds (0 = never expire). The
+    // recipient's client persists the inbox row with expires_at_ms =
+    // envelope.timestamp_ms + ttl_ms, and a periodic sweep deletes
+    // rows where expires_at_ms is in the past. Defends against device
+    // seizure recovering historical content the sender intended to be
+    // ephemeral. Sender's own outbox is treated symmetrically (a sender
+    // who sets TTL probably wants the message gone from their own
+    // sent-folder too).
+    //
+    // HONEST LIMIT: this is cooperative — a malicious recipient client
+    // can ignore ttl_ms. The defense is against passive device-seizure
+    // forensics, not against a recipient who deliberately archives.
+    uint64 ttl_ms              = 102;
 }

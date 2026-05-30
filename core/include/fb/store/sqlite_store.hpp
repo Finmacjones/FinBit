@@ -90,6 +90,24 @@ public:
                        std::span<const std::uint8_t> peer_pub,
                        std::span<const std::uint8_t> ciphertext, std::uint64_t timestamp_ms);
 
+    // Tier-11 forward-secret local storage. Overloads that record an
+    // explicit expiry (absolute ms since epoch — 0 = never). prune_expired
+    // sweeps both inbox + outbox in a single transaction and returns the
+    // number of rows it deleted. The periodic sweep is driven by the
+    // chat_client worker; the store stays a passive data layer.
+    void append_inbox_with_expiry(std::span<const std::uint8_t> envelope_id,
+                                   std::span<const std::uint8_t> peer_pub,
+                                   std::span<const std::uint8_t> plaintext,
+                                   std::uint64_t timestamp_ms,
+                                   std::uint64_t expires_at_ms);
+    void append_outbox_with_expiry(std::span<const std::uint8_t> envelope_id,
+                                    std::span<const std::uint8_t> peer_pub,
+                                    std::span<const std::uint8_t> ciphertext,
+                                    std::uint64_t timestamp_ms,
+                                    std::uint64_t expires_at_ms);
+
+    [[nodiscard]] std::size_t prune_expired(std::uint64_t now_ms);
+
     struct InboxRow {
         std::vector<std::uint8_t> envelope_id;
         std::vector<std::uint8_t> peer_pub;

@@ -451,6 +451,55 @@ TEST_F(TmpDb, ChanDeleteAlsoDropsMlsTables) {
     EXPECT_FALSE(s->mls_group_load(span_of(channel_id)).has_value());
 }
 
+// ---- Tier-11 forward-secret local storage (TTL + prune_expired) ----------
+
+TEST_F(TmpDb, AppendWithExpiryAndPruneRemovesPastDueRows) {
+    auto s = fb::store::SqliteStore::open(path);
+    auto peer = bytes({0xbe, 0xef});
+    auto pt   = bytes({0x01, 0x02, 0x03});
+
+    // Three rows: two expire at 1000ms, one expires at 5000ms,
+    // one never expires (legacy append_inbox).
+    auto id1 = bytes({0x01});
+    auto id2 = bytes({0x02});
+    auto id3 = bytes({0x03});
+    auto id4 = bytes({0x04});
+    s->append_inbox_with_expiry(span_of(id1), span_of(peer), span_of(pt), 100, 1000);
+    s->append_inbox_with_expiry(span_of(id2), span_of(peer), span_of(pt), 200, 1000);
+    s->append_outbox_with_expiry(span_of(id3), span_of(peer), span_of(pt), 300, 5000);
+    s->append_inbox(span_of(id4), span_of(peer), span_of(pt), 400);   // never expires
+
+    // Sweep at now = 2000ms — id1+id2 (expired) get deleted; id3 and id4 survive.
+    EXPECT_EQ(s->prune_expired(2000), 2u);
+    auto inbox = s->recent_inbox(100);
+    EXPECT_EQ(inbox.size(), 1u);
+    EXPECT_EQ(inbox.front().envelope_id, std::vector<std::uint8_t>{0x04});
+
+    // Sweep at now = 6000ms — id3 (expires at 5000) goes.
+    EXPECT_EQ(s->prune_expired(6000), 1u);
+}
+
+TEST_F(TmpDb, PruneExpiredIsNoOpWhenNothingDue) {
+    auto s = fb::store::SqliteStore::open(path);
+    auto peer = bytes({0xff});
+    auto pt   = bytes({0xaa});
+    auto id   = bytes({0x99});
+    s->append_inbox_with_expiry(span_of(id), span_of(peer), span_of(pt), 100, 5000);
+    EXPECT_EQ(s->prune_expired(1000), 0u);
+    EXPECT_EQ(s->recent_inbox(100).size(), 1u);
+}
+
+TEST_F(TmpDb, LegacyAppendNeverExpires) {
+    auto s = fb::store::SqliteStore::open(path);
+    auto peer = bytes({0xee});
+    auto pt   = bytes({0xbb});
+    auto id   = bytes({0x77});
+    s->append_inbox(span_of(id), span_of(peer), span_of(pt), 100);
+    // Sweep arbitrarily far into the future — legacy row (expires_at_ms = 0) survives.
+    EXPECT_EQ(s->prune_expired(std::uint64_t{1} << 60), 0u);
+    EXPECT_EQ(s->recent_inbox(100).size(), 1u);
+}
+
 // Reopening an encrypted DB with NO key throws — protects against
 // silently treating the wrapped blobs as plaintext.
 TEST_F(TmpDb, AtRestRefusesUnkeyedReopen) {
