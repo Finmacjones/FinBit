@@ -90,6 +90,9 @@ private slots:
     void onPeerPubkeyChanged(const QString& peerLabel,
                               const QByteArray& oldPubkey,
                               const QByteArray& newPubkey);
+    // Tier-11 Shamir social-recovery setup wizard. Reads my_username_ +
+    // current contacts from dm_list_, hands off to ShamirSetupWizard.
+    void onSocialRecoverySetupClicked();
     void appendLog(const QString& s);
     void appendIncoming(const QString& peer_fp, const QString& peer_username,
                         const QString& text);

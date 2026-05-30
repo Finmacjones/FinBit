@@ -40,6 +40,7 @@
 #endif
 #include "login_dialog.hpp"
 #include "verify_identity_dialog.hpp"
+#include "shamir_setup_wizard.hpp"
 #include "message_delegate.hpp"
 
 namespace fb::desktop {
@@ -437,8 +438,10 @@ MainWindow::MainWindow(QWidget* parent)
     // so we don't disturb the existing 4-column layout.
     auto* identity_menu = menuBar()->addMenu("&Identity");
     auto* recover_act   = identity_menu->addAction("Show recovery &code…");
+    auto* social_act    = identity_menu->addAction("Set up &social recovery…");
     auto* signout_act   = identity_menu->addAction("&Sign out");
     QObject::connect(recover_act, &QAction::triggered, this, &MainWindow::onShowRecoveryCode);
+    QObject::connect(social_act,  &QAction::triggered, this, &MainWindow::onSocialRecoverySetupClicked);
     QObject::connect(signout_act, &QAction::triggered, this, &MainWindow::onSignOut);
 
     // CRT effects: a click-through scanline/flicker overlay over the whole
@@ -1217,6 +1220,36 @@ void MainWindow::onVerifyClicked() {
     }
     VerifyIdentityDialog dlg(client_.get(), peer_label, peer_pub, this);
     dlg.exec();
+}
+
+void MainWindow::onSocialRecoverySetupClicked() {
+    if (my_username_.isEmpty()) {
+        QMessageBox::information(this, tr("Social recovery"),
+            tr("Sign in first."));
+        return;
+    }
+    // Collect candidate contacts from the existing DM sidebar — anyone
+    // we already have a conversation with is a candidate trustee. The
+    // wizard's MultiSelection picker lets the user pick the subset to
+    // entrust.
+    QStringList contacts;
+    for (int i = 0; i < dm_list_->count(); ++i) {
+        const QString key = dm_list_->item(i)->data(Qt::UserRole).toString();
+        if (key.startsWith("dm:")) {
+            contacts.append(key.mid(3));
+        }
+        // dm-pub: entries aren't usable as Shamir trustees yet — we'd
+        // need a username for the existing send path; skip silently.
+    }
+    if (contacts.isEmpty()) {
+        QMessageBox::information(this, tr("Social recovery"),
+            tr("You need at least one contact in the DM sidebar (with a "
+               "resolved username) to set up social recovery. Send a DM "
+               "to your trusted contacts first, then come back here."));
+        return;
+    }
+    ShamirSetupWizard wiz(client_.get(), my_username_, contacts, this);
+    wiz.exec();
 }
 
 void MainWindow::onPeerPubkeyChanged(const QString& peerLabel,
