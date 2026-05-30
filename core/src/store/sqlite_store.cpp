@@ -141,6 +141,17 @@ CREATE TABLE IF NOT EXISTS storage_keys (
     wrapped    BLOB    NOT NULL,
     generation INTEGER NOT NULL
 );
+-- Tier-11 MITM verification: "human verified this peer's identity"
+-- bit. Set true when the user has compared the safety number with the
+-- peer out-of-band; clears (or stays false) otherwise. The UI uses it
+-- to render a ✓ badge AND to warn-on-pubkey-change when an already-
+-- verified peer's pubkey changes (typically: someone reinstalled,
+-- maybe not — re-verify in person).
+CREATE TABLE IF NOT EXISTS peer_verified (
+    peer_pub       BLOB    PRIMARY KEY,
+    verified       INTEGER NOT NULL DEFAULT 0,
+    verified_at_ms INTEGER NOT NULL DEFAULT 0
+);
 )sql";
 
 void throw_sqlite(const std::string& ctx, sqlite3* db) {
@@ -764,6 +775,31 @@ std::size_t SqliteStore::prune_expired(std::uint64_t now_ms) {
     }
     impl_->exec("COMMIT;");
     return deleted;
+}
+
+void SqliteStore::set_peer_verified(std::span<const std::uint8_t> peer_pub,
+                                     bool verified, std::uint64_t verified_at_ms) {
+    auto* stmt = impl_->prep(
+        "INSERT INTO peer_verified(peer_pub, verified, verified_at_ms) "
+        "VALUES(?, ?, ?) ON CONFLICT(peer_pub) DO UPDATE SET "
+        "verified = excluded.verified, verified_at_ms = excluded.verified_at_ms;");
+    bind_blob(stmt, 1, peer_pub);
+    sqlite3_bind_int(stmt, 2, verified ? 1 : 0);
+    sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(verified_at_ms));
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+bool SqliteStore::peer_verified(std::span<const std::uint8_t> peer_pub) const {
+    auto* stmt = impl_->prep(
+        "SELECT verified FROM peer_verified WHERE peer_pub = ?;");
+    bind_blob(stmt, 1, peer_pub);
+    bool out = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        out = sqlite3_column_int(stmt, 0) != 0;
+    }
+    sqlite3_finalize(stmt);
+    return out;
 }
 
 std::size_t SqliteStore::rotate_storage_keys() {

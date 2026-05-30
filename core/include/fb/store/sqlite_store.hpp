@@ -128,6 +128,19 @@ public:
     // (Phase 1, append_inbox_with_expiry + prune_expired).
     [[nodiscard]] std::size_t rotate_storage_keys();
 
+    // Tier-11 MITM verification (task #384) — persisted "this peer's
+    // identity has been verified out-of-band" flag. The crypto side
+    // (safety_number, hybrid binding sigs) catches automated MITM at
+    // first contact; this is the human-layer record that the user has
+    // ALSO compared the safety number with the peer over a trusted
+    // channel (in-person, voice call, signed-document, etc.). The flag
+    // is per-peer and persists across restarts so the UI's ✓ badge +
+    // warn-on-pubkey-change banner survive.
+    void                     set_peer_verified(std::span<const std::uint8_t> peer_pub,
+                                                bool verified,
+                                                std::uint64_t verified_at_ms);
+    [[nodiscard]] bool       peer_verified(std::span<const std::uint8_t> peer_pub) const;
+
     struct InboxRow {
         std::vector<std::uint8_t> envelope_id;
         std::vector<std::uint8_t> peer_pub;

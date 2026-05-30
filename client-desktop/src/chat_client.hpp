@@ -241,6 +241,17 @@ public:
 signals:
     void connected(QString fingerprint);
     void log(QString line);
+
+    // Tier-11 MITM detection — fired when an already-known peer's
+    // identity pubkey appears as a different value (e.g. a key-fetch
+    // response carries a pubkey distinct from the one a previously-
+    // verified session was bound to). The UI shows a "identity
+    // changed — re-verify in person" banner and clears the verified
+    // flag for that peer. `peerLabel` is whatever human-readable
+    // identifier we have (username if cached, else fingerprint).
+    void peerPubkeyChanged(QString peerLabel,
+                            QByteArray oldPubkey,
+                            QByteArray newPubkey);
     // MLS handshake inbound — one signal per DmPayload variant. The
     // chat client just surfaces these; orchestration (calling
     // MlsGroup::add_member, completing PendingMlsJoin, applying

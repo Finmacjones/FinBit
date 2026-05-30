@@ -6109,11 +6109,21 @@ QString ChatClient::safetyNumberFor(const QByteArray& peerPub) const {
 
 bool ChatClient::isPeerVerified(const QByteArray& peerPub) const {
     if (peerPub.size() != 32) return false;
+    // Persisted source-of-truth — sqlite store. The in-memory map stays
+    // as a fast-path cache (populated lazily on first read after open).
     std::array<std::uint8_t, 32> key{};
     std::memcpy(key.data(), peerPub.constData(), 32);
+    {
+        std::lock_guard lk(impl_->mu);
+        auto it = impl_->verified_peers.find(key);
+        if (it != impl_->verified_peers.end()) return it->second;
+    }
+    if (!impl_->store) return false;
+    const bool persisted = impl_->store->peer_verified(
+        std::span<const std::uint8_t>(key.data(), 32));
     std::lock_guard lk(impl_->mu);
-    auto it = impl_->verified_peers.find(key);
-    return it != impl_->verified_peers.end() && it->second;
+    impl_->verified_peers[key] = persisted;
+    return persisted;
 }
 
 void ChatClient::setPeerVerified(const QByteArray& peerPub, bool verified) {
@@ -6124,14 +6134,18 @@ void ChatClient::setPeerVerified(const QByteArray& peerPub, bool verified) {
         std::lock_guard lk(impl_->mu);
         impl_->verified_peers[key] = verified;
     }
+    if (impl_->store) {
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        impl_->store->set_peer_verified(
+            std::span<const std::uint8_t>(key.data(), 32),
+            verified, now_ms);
+    }
+    fb::crypto::PubKey p{};
+    std::memcpy(p.data(), key.data(), 32);
     emit log(QString("peer fingerprint %1 marked %2")
-                 .arg(QString::fromStdString(
-                     fb::crypto::Identity::fingerprint(
-                         [&] {
-                             fb::crypto::PubKey p{};
-                             std::memcpy(p.data(), key.data(), 32);
-                             return p;
-                         }())))
+                 .arg(QString::fromStdString(fb::crypto::Identity::fingerprint(p)))
                  .arg(verified ? "verified" : "unverified"));
 }
 
