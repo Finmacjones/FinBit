@@ -93,6 +93,9 @@ private slots:
     // Tier-11 Shamir social-recovery setup wizard. Reads my_username_ +
     // current contacts from dm_list_, hands off to ShamirSetupWizard.
     void onSocialRecoverySetupClicked();
+    // Trustee read-back: shows the shares this user holds for others so
+    // they can read the hex out to a recoverer over a trusted channel.
+    void onViewHeldSharesClicked();
     void appendLog(const QString& s);
     void appendIncoming(const QString& peer_fp, const QString& peer_username,
                         const QString& text);

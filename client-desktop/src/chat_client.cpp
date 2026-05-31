@@ -6328,5 +6328,35 @@ QByteArray ChatClient::peerPubkeyForUsername(const QString& username) const {
                       static_cast<int>(matches.front().size()));
 }
 
+QList<ChatClient::HeldShare> ChatClient::heldShamirShares() const {
+    QList<HeldShare> out;
+    if (!impl_->store) return out;
+    for (const auto& s : impl_->store->list_shamir_shares()) {
+        HeldShare h;
+        // Resolve the depositor's pubkey to a username if cached, else
+        // fall back to the fingerprint so the trustee can recognise them.
+        auto name = impl_->store->peer_name(
+            std::span<const std::uint8_t>(s.peer_pub.data(), s.peer_pub.size()));
+        if (name && !name->empty()) {
+            h.peerLabel = QString::fromStdString(*name);
+        } else if (s.peer_pub.size() == 32) {
+            fb::crypto::PubKey p{};
+            std::memcpy(p.data(), s.peer_pub.data(), 32);
+            h.peerLabel = QString::fromStdString(fb::crypto::Identity::fingerprint(p));
+        } else {
+            h.peerLabel = QStringLiteral("(unknown)");
+        }
+        h.setupId   = static_cast<quint64>(s.setup_id);
+        h.threshold = s.threshold;
+        h.total     = s.total;
+        h.label     = QString::fromStdString(s.label);
+        h.shareHex  = QString::fromLatin1(
+            QByteArray(reinterpret_cast<const char*>(s.share.data()),
+                       static_cast<int>(s.share.size())).toHex());
+        out.push_back(std::move(h));
+    }
+    return out;
+}
+
 
 }  // namespace fb::desktop

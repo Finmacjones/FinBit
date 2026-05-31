@@ -237,6 +237,22 @@ public:
                                   quint64           setupId,
                                   const QString&    reason);
 
+    // Trustee-side read-back. Lists every Shamir share this user is
+    // holding on behalf of others, with the share encoded as hex so the
+    // user can read it out to a recoverer over a trusted out-of-band
+    // channel (the from-scratch recovery path doesn't have a live
+    // ratchet to the recoverer). `peerLabel` is the depositor's cached
+    // username if known, else their fingerprint.
+    struct HeldShare {
+        QString peerLabel;
+        quint64 setupId;
+        quint32 threshold;
+        quint32 total;
+        QString label;
+        QString shareHex;
+    };
+    [[nodiscard]] QList<HeldShare> heldShamirShares() const;
+
     // History entry returned by load_recent_history().
     struct HistoryEntry {
         bool        outgoing;        // true = me → peer; false = peer → me

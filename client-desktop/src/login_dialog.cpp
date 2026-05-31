@@ -19,6 +19,7 @@
 #include <QtConcurrent>
 
 #include "fb/crypto/identity.hpp"
+#include "fb/crypto/shamir.hpp"
 #include "bip39.hpp"
 
 namespace fb::desktop {
@@ -27,6 +28,7 @@ namespace {
 constexpr int kPaneCreate  = 0;
 constexpr int kPaneSignIn  = 1;
 constexpr int kPaneRecover = 2;
+constexpr int kPaneShamir  = 3;
 }  // namespace
 
 LoginDialog::LoginDialog(QWidget* parent) : QDialog(parent) {
@@ -158,6 +160,57 @@ LoginDialog::LoginDialog(QWidget* parent) : QDialog(parent) {
         connect(back, &QPushButton::clicked, this, [this] {
             show_pane(list_vault_usernames().isEmpty() ? kPaneCreate : kPaneSignIn);
         });
+        auto* toShamir = new QPushButton("Recover from trustees", w);
+        toShamir->setObjectName("linkBtn");
+        toShamir->setFlat(true);
+        connect(toShamir, &QPushButton::clicked, this, &LoginDialog::onShamirPane);
+        auto* links = new QHBoxLayout;
+        links->addStretch();
+        links->addWidget(back);
+        links->addWidget(toShamir);
+        links->addStretch();
+        form->addRow(links);
+        panes_->addWidget(w);
+    }
+
+    // ---- Social-recovery (Shamir) pane ----------------------------------
+    {
+        auto* w = new QWidget(this);
+        auto* form = new QFormLayout(w);
+        shamir_user_ = new QLineEdit(w);
+        shamir_user_->setPlaceholderText("alice");
+        shamir_user_->setValidator(new QRegularExpressionValidator(
+            QRegularExpression("[A-Za-z0-9._-]{1,32}"), w));
+        shamir_shares_ = new QPlainTextEdit(w);
+        shamir_shares_->setPlaceholderText(
+            "Paste one share per line (hex). Ask your trustees to open\n"
+            "Identity ▸ Shares I hold and read theirs to you. Any M of\n"
+            "the N shares you distributed will reconstruct your identity.");
+        shamir_shares_->setMaximumHeight(110);
+        shamir_pass_ = new QLineEdit(w);
+        shamir_pass_->setEchoMode(QLineEdit::Password);
+        shamir_pass_->setPlaceholderText("new passphrase");
+        form->addRow("Username", shamir_user_);
+        form->addRow("Shares", shamir_shares_);
+        form->addRow("Passphrase", shamir_pass_);
+        auto* hint = new QLabel(
+            "Shamir recovery is offline: the math runs entirely on this "
+            "device once you've collected enough shares. No server sees "
+            "the shares or the recovered seed.", w);
+        hint->setStyleSheet("color:#8e9297; font-size:11px;");
+        hint->setWordWrap(true);
+        form->addRow(hint);
+        shamir_btn_ = new QPushButton("Recombine & restore", w);
+        shamir_btn_->setDefault(true);
+        connect(shamir_btn_, &QPushButton::clicked, this, &LoginDialog::onShamirAccept);
+        form->addRow("", shamir_btn_);
+
+        auto* back = new QPushButton("Back", w);
+        back->setObjectName("linkBtn");
+        back->setFlat(true);
+        connect(back, &QPushButton::clicked, this, [this] {
+            show_pane(list_vault_usernames().isEmpty() ? kPaneCreate : kPaneSignIn);
+        });
         auto* links = new QHBoxLayout;
         links->addStretch();
         links->addWidget(back);
@@ -188,6 +241,8 @@ void LoginDialog::show_pane(int idx) {
         subtitle_->setText("create your local identity");
     } else if (idx == kPaneSignIn) {
         subtitle_->setText("enter your passphrase");
+    } else if (idx == kPaneShamir) {
+        subtitle_->setText("recombine shares from your trustees");
     } else {
         subtitle_->setText("restore from recovery code");
     }
@@ -201,6 +256,7 @@ void LoginDialog::show_error(const QString& msg) {
 void LoginDialog::onCreatePane()  { show_pane(kPaneCreate);  create_user_->setFocus(); }
 void LoginDialog::onSignInPane()  { show_pane(kPaneSignIn);  signin_pass_->setFocus(); }
 void LoginDialog::onRecoverPane() { show_pane(kPaneRecover); recover_hex_->setFocus(); }
+void LoginDialog::onShamirPane()  { show_pane(kPaneShamir);  shamir_shares_->setFocus(); }
 
 // Argon2id MODERATE costs ~1-2 s of CPU on a desktop. Running it on the
 // Qt main thread (as we did originally) freezes the entire window —
@@ -321,6 +377,125 @@ void LoginDialog::onRecoverAccept() {
                 accept();
             } catch (const std::exception& e) {
                 busy(recover_btn_, false);
+                show_error(QString::fromStdString(std::string("restore failed: ") + e.what()));
+            }
+        });
+    watcher->setFuture(QtConcurrent::run(
+        [pass, seed_copy]() { return seal_seed(pass, seed_copy); }));
+}
+
+void LoginDialog::onShamirAccept() {
+    const QString user = shamir_user_->text().trimmed();
+    const QString pass = shamir_pass_->text();
+    if (user.isEmpty()) { show_error("username required"); return; }
+    if (pass.isEmpty()) { show_error("passphrase required (recovered vaults must be encrypted)"); return; }
+
+    // Parse one hex-encoded share per non-blank line. Each share is a
+    // 1-byte x-coordinate followed by the 32 y-bytes for a 32-byte seed
+    // = 33 bytes = 66 hex chars. We don't hard-code that here; decode_share
+    // validates the structure.
+    std::vector<fb::crypto::shamir::Share> shares;
+    const QStringList lines = shamir_shares_->toPlainText().split(
+        QRegularExpression("[\\r\\n]+"), Qt::SkipEmptyParts);
+    for (const QString& raw : lines) {
+        const QString line = raw.trimmed();
+        if (line.isEmpty()) continue;
+        // QByteArray::fromHex silently skips non-hex; guard against a
+        // malformed paste (odd length / stray characters) producing a
+        // truncated share that would combine to garbage.
+        const QString compact = QString(line).remove(QRegularExpression("\\s"));
+        if (compact.size() % 2 != 0 ||
+            compact.contains(QRegularExpression("[^0-9A-Fa-f]"))) {
+            show_error(QString("share is not valid hex: \"%1…\"")
+                           .arg(line.left(12)));
+            return;
+        }
+        const QByteArray bytes = QByteArray::fromHex(compact.toUtf8());
+        try {
+            shares.push_back(fb::crypto::shamir::decode_share(
+                std::span<const std::uint8_t>(
+                    reinterpret_cast<const std::uint8_t*>(bytes.constData()),
+                    static_cast<std::size_t>(bytes.size()))));
+        } catch (const std::exception& e) {
+            show_error(QString("bad share: %1").arg(e.what()));
+            return;
+        }
+    }
+    if (shares.size() < 2) {
+        show_error("paste at least the threshold number of shares "
+                   "(one per line) — you need M of your N shares");
+        return;
+    }
+
+    // Recombine. If the user supplied fewer than the original threshold,
+    // combine() still returns *a* value — but it will be the wrong seed.
+    // We can't detect that here without the original fingerprint, so we
+    // surface the recovered fingerprint after sealing and tell the user
+    // to verify it matches their known identity.
+    Seed seed{};
+    try {
+        const auto recovered = fb::crypto::shamir::combine(
+            std::span<const fb::crypto::shamir::Share>(shares.data(), shares.size()));
+        if (recovered.size() != seed.size()) {
+            show_error(QString("recovered secret is %1 bytes, expected %2 — "
+                               "wrong shares or wrong setup")
+                           .arg(recovered.size()).arg(seed.size()));
+            return;
+        }
+        std::memcpy(seed.data(), recovered.data(), seed.size());
+    } catch (const std::exception& e) {
+        show_error(QString("recombine failed: %1 (duplicate or "
+                           "mismatched shares?)").arg(e.what()));
+        return;
+    }
+
+    // Derive the fingerprint so the user can sanity-check the recovery
+    // BEFORE committing to an overwrite.
+    QString recovered_fp;
+    {
+        auto id = fb::crypto::Identity::from_seed(
+            std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(
+                seed.data(), seed.size()));
+        recovered_fp = QString::fromStdString(id.fingerprint());
+    }
+    const auto confirm = QMessageBox::question(
+        this, "Confirm recovered identity",
+        QString("Recombined to identity fingerprint:\n\n   %1\n\n"
+                "Does this match the identity you're recovering? If you "
+                "supplied too few shares, this will be the WRONG identity "
+                "— cancel and collect more shares.\n\nProceed to seal a "
+                "new vault for '%2'?").arg(recovered_fp).arg(user),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (confirm != QMessageBox::Yes) {
+        sodium_memzero(seed.data(), seed.size());
+        return;
+    }
+
+    if (QFileInfo::exists(vault_path_for(user))) {
+        const auto r = QMessageBox::question(
+            this, "Overwrite existing vault?",
+            QString("A vault for '%1' already exists on this device. "
+                    "Restoring will overwrite it. Proceed?").arg(user),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+        if (r != QMessageBox::Yes) { sodium_memzero(seed.data(), seed.size()); return; }
+    }
+    busy(shamir_btn_, true, "deriving key…");
+
+    const Seed seed_copy = seed;
+    sodium_memzero(seed.data(), seed.size());
+    auto* watcher = new QFutureWatcher<VaultBlob>(this);
+    QObject::connect(watcher, &QFutureWatcher<VaultBlob>::finished, this,
+        [this, watcher, user, seed_copy]() {
+            std::unique_ptr<QFutureWatcher<VaultBlob>> w(watcher);
+            try {
+                VaultBlob blob = w->result();
+                save_vault_file(vault_path_for(user), blob);
+                username_ = user;
+                seed_     = seed_copy;
+                busy(shamir_btn_, false);
+                accept();
+            } catch (const std::exception& e) {
+                busy(shamir_btn_, false);
                 show_error(QString::fromStdString(std::string("restore failed: ") + e.what()));
             }
         });

@@ -43,9 +43,11 @@ private slots:
     void onCreatePane();
     void onSignInPane();
     void onRecoverPane();
+    void onShamirPane();
     void onCreateAccept();
     void onSignInAccept();
     void onRecoverAccept();
+    void onShamirAccept();
 
 private:
     void show_pane(int idx);
@@ -71,6 +73,15 @@ private:
     QPlainTextEdit*  recover_hex_  = nullptr;
     QLineEdit*       recover_pass_ = nullptr;
     QPushButton*     recover_btn_  = nullptr;
+
+    // Social-recovery (Shamir) pane — Tier-11. Recombines M shares
+    // collected out-of-band from trustees into the original seed, then
+    // seals a fresh vault. Self-contained: no network needed, since the
+    // recoverer pastes the shares the trustees read out to them.
+    QLineEdit*       shamir_user_  = nullptr;
+    QPlainTextEdit*  shamir_shares_ = nullptr;
+    QLineEdit*       shamir_pass_  = nullptr;
+    QPushButton*     shamir_btn_   = nullptr;
 
     QString username_;
     Seed    seed_{};

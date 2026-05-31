@@ -18,6 +18,8 @@
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QListWidgetItem>
+#include <QDialog>
+#include <QFontDatabase>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPixmap>
@@ -439,9 +441,11 @@ MainWindow::MainWindow(QWidget* parent)
     auto* identity_menu = menuBar()->addMenu("&Identity");
     auto* recover_act   = identity_menu->addAction("Show recovery &code…");
     auto* social_act    = identity_menu->addAction("Set up &social recovery…");
+    auto* held_act      = identity_menu->addAction("Shares I &hold…");
     auto* signout_act   = identity_menu->addAction("&Sign out");
     QObject::connect(recover_act, &QAction::triggered, this, &MainWindow::onShowRecoveryCode);
     QObject::connect(social_act,  &QAction::triggered, this, &MainWindow::onSocialRecoverySetupClicked);
+    QObject::connect(held_act,    &QAction::triggered, this, &MainWindow::onViewHeldSharesClicked);
     QObject::connect(signout_act, &QAction::triggered, this, &MainWindow::onSignOut);
 
     // CRT effects: a click-through scanline/flicker overlay over the whole
@@ -1250,6 +1254,52 @@ void MainWindow::onSocialRecoverySetupClicked() {
     }
     ShamirSetupWizard wiz(client_.get(), my_username_, contacts, this);
     wiz.exec();
+}
+
+void MainWindow::onViewHeldSharesClicked() {
+    const auto held = client_->heldShamirShares();
+    if (held.isEmpty()) {
+        QMessageBox::information(this, tr("Shares I hold"),
+            tr("You're not currently holding any recovery shares for "
+               "other people. When a contact sets up social recovery and "
+               "picks you as a trustee, their share appears here."));
+        return;
+    }
+    // Build a read-only listing. The user reads the relevant share's hex
+    // out to the recoverer over a trusted channel (phone, in person).
+    QString body;
+    for (const auto& h : held) {
+        body += tr("Depositor: %1\n").arg(h.peerLabel);
+        if (!h.label.isEmpty()) body += tr("Label:     %1\n").arg(h.label);
+        body += tr("Setup:     0x%1   (%2-of-%3)\n")
+                    .arg(QString::number(h.setupId, 16))
+                    .arg(h.threshold).arg(h.total);
+        body += tr("Share:     %1\n\n").arg(h.shareHex);
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Shares I hold"));
+    dlg.setModal(true);
+    dlg.resize(560, 360);
+    auto* l = new QVBoxLayout(&dlg);
+    auto* intro = new QLabel(tr(
+        "These are recovery shares people have entrusted to you. If one "
+        "of them has lost their device, verify their identity over a "
+        "channel you trust, then read them the matching <b>Share</b> "
+        "line. Never post a share where others can see it."), &dlg);
+    intro->setWordWrap(true);
+    intro->setTextFormat(Qt::RichText);
+    l->addWidget(intro);
+    auto* view = new QPlainTextEdit(&dlg);
+    view->setReadOnly(true);
+    view->setPlainText(body);
+    QFont mono = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    view->setFont(mono);
+    l->addWidget(view, /*stretch=*/1);
+    auto* close = new QPushButton(tr("Close"), &dlg);
+    QObject::connect(close, &QPushButton::clicked, &dlg, &QDialog::accept);
+    l->addWidget(close);
+    dlg.exec();
 }
 
 void MainWindow::onPeerPubkeyChanged(const QString& peerLabel,
