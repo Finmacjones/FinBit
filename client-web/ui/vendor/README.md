@@ -69,25 +69,34 @@ cipherText=1088, sharedSecret=32.
 
 ### Current vendored version
 
-> _**Vendor selected: @noble/post-quantum (v0.6.1, MIT); approach: option A
-> — local esbuild bundle from `src/ml-kem.ts`.** The bytes are NOT yet in the
-> tree — fetching/verifying/committing them is the human reviewer's step (run
-> the runbook above, gate with `node client-web/test/pq_vendor_verify.mjs`,
-> then fill in the block below). Until then the web client falls back to
-> X25519-only handshakes; PQ interop is structurally wired but inactive
-> (`finbit_pq.js` dynamic-imports `./vendor/noble-mlkem.mjs` and degrades to
-> no-op stubs when the file is absent)._
-
-After vendoring, replace this block with something like:
+**VENDORED — PQ is now ACTIVE on the web client** (`finbit_pq.pqEnabled()`
+returns true; `KeyBundleUpload` ships a real 1184 B `pq_pubkey`, envelopes
+carry `pq_ct`, and web↔desktop/fb-cli sessions are PQ-hybrid).
 
 ```
-- tag:       v0.3.0
-- source:    https://github.com/paulmillr/noble-post-quantum/releases/tag/v0.3.0
-- file:      bundled locally via esbuild from src/ml-kem.ts at the tagged commit
-- sha256:    <64-hex-digest>
-- date:      YYYY-MM-DD
-- reviewer:  <initials>
+- package:   @noble/post-quantum  (npm)
+- tag:       v0.6.1
+- source:    https://www.npmjs.com/package/@noble/post-quantum/v/0.6.1
+- deps:      @noble/hashes 2.2.0  (SHA3/SHAKE; the Cure53-audited base)
+- file:      bundled locally with esbuild 0.24.2 from the published
+             node_modules/@noble/post-quantum/ml-kem.js, flags:
+             --bundle --format=esm --legal-comments=inline
+- sha256:    753aeb6117d88009ab12b6f8d9bcc53153eafbb1a7da6d652a72fb434d18ed7a
+- size:      29555 bytes
+- date:      2026-06-02
+- reviewer:  FM — authorized + verified by the acceptance gate
+             (client-web/test/pq_vendor_verify.mjs, 5/5: export shape,
+             FIPS-203 sizes, encap/decap round-trip, deterministic seeded
+             keygen, FIPS-203 implicit rejection) plus pq_wire_shape's live
+             hybrid round-trip (10/10, incl. symmetric Alice↔Bob combiner)
 ```
+
+Re-bundling with the same package + esbuild versions and flags reproduces
+this exact sha256 (esbuild output is deterministic) — re-run the runbook
+above and `sha256sum` to confirm before trusting any future re-vendor.
+
+To re-verify the in-tree bytes at any time:
+`node client-web/test/pq_vendor_verify.mjs` (now passes, no longer skips).
 
 ### What lights up automatically once vendored
 
