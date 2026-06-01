@@ -21,10 +21,12 @@ cipherText=1088, sharedSecret=32.
 
 ### Recommended workflow
 
-1. **Pick a release.** The current upstream is
-   [`paulmillr/noble-post-quantum`](https://github.com/paulmillr/noble-post-quantum).
-   Choose a tag (e.g. `v0.3.0`) and read its CHANGELOG for any
-   security-relevant notes.
+1. **Pick a release.** **Selected vendor: `paulmillr/noble-post-quantum`**
+   (MIT; pure-JS; exact drop-in for the `finbit_pq.js` seam; supports the
+   64-byte deterministic seeded keygen FinBit requires; sits on the
+   Cure53-audited `@noble/hashes` SHA3/SHAKE base). Current tag at decision
+   time: **`v0.6.1`** (Apr 2026) — pin a specific tag (never `latest`) and
+   read its CHANGELOG for security-relevant notes.
 
 2. **Decide on bundling.** The upstream library is published as ESM with
    external imports (`@noble/hashes/sha3.js`, `@noble/hashes/utils.js`, and
@@ -47,6 +49,15 @@ cipherText=1088, sharedSecret=32.
 3. **Verify.**
    - Compute SHA-256: `sha256sum client-web/ui/vendor/noble-mlkem.mjs`
    - Record the hash in this README under "Current vendored version" below.
+   - Run the **FinBit acceptance gate** — export shape, FIPS-203 sizes,
+     encap/decap round-trip, **deterministic seeded keygen** (mandatory:
+     FinBit derives the PQ keypair from the identity seed), and FIPS-203
+     implicit rejection (a distinctive behaviour a stub/tampered bundle
+     won't reproduce):
+     ```
+     node client-web/test/pq_vendor_verify.mjs
+     ```
+     It skips cleanly when no vendor file is present, so it's safe in CI.
    - Run the upstream's own test vectors against the local bundle if
      feasible (noble exports `__tests` for that purpose).
    - For FIPS-203 conformance, cross-check with the NIST CAVP test vectors
@@ -58,10 +69,14 @@ cipherText=1088, sharedSecret=32.
 
 ### Current vendored version
 
-> _Not yet vendored. Web client falls back to X25519-only handshakes; PQ
-> interop is structurally wired but inactive. See finbit_pq.js — the
-> dynamic import at the top tries `./vendor/noble-mlkem.mjs` and silently
-> degrades to no-op stubs when the file is absent._
+> _**Vendor selected: @noble/post-quantum (v0.6.1, MIT); approach: option A
+> — local esbuild bundle from `src/ml-kem.ts`.** The bytes are NOT yet in the
+> tree — fetching/verifying/committing them is the human reviewer's step (run
+> the runbook above, gate with `node client-web/test/pq_vendor_verify.mjs`,
+> then fill in the block below). Until then the web client falls back to
+> X25519-only handshakes; PQ interop is structurally wired but inactive
+> (`finbit_pq.js` dynamic-imports `./vendor/noble-mlkem.mjs` and degrades to
+> no-op stubs when the file is absent)._
 
 After vendoring, replace this block with something like:
 

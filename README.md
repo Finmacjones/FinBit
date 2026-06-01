@@ -30,9 +30,11 @@ captures anytime.)*
 ## What's real today
 
 - **DMs** — Signal Double Ratchet over libsodium, AES-256-GCM (native) /
-  XChaCha20-Poly1305 (WASM, no AES-NI). Server only ever sees ciphertext —
-  and in serverless mode it sees nothing at all (see "Serverless overlay"
-  below). 183 native tests + 9 web smokes + 10 end-to-end shell demos pass.
+  XChaCha20-Poly1305 (WASM, no AES-NI), now with a **post-quantum hybrid**
+  root key (ML-KEM-768 ‖ X25519, see below). Server only ever sees
+  ciphertext — and in serverless mode it sees nothing at all (see
+  "Serverless overlay" below). 390 native tests + 12 web smokes + 15
+  end-to-end shell demos pass.
 - **Inline images & GIFs (DMs + channels)** — the 📎 attach button sends
   an image or GIF, rendered inline in the chat (animated for GIFs). In a
   DM it rides the Double Ratchet as a `DmPayload.attachment`; in a channel
@@ -56,7 +58,7 @@ captures anytime.)*
     UI checkbox in the channel-create dialog. Surviving restart via
     an operation-replay persistence layer above `mls::State` (the
     only acknowledged limitation in the v0 MLS path is now closed —
-    193 MLS-build tests pass including end-to-end alice/bob
+    401 MLS-build tests pass including end-to-end alice/bob
     restoration after process restart). See
     `docs/security-audit.md §10` for the design.
 - **Login** — Argon2id-protected identity vault on disk. v2 format binds
@@ -100,6 +102,45 @@ captures anytime.)*
   user_version = 3` marks the encrypted schema; opening without a key
   throws. Migrations from legacy plaintext run inside a single
   transaction.
+- **Post-quantum hybrid key exchange (ML-KEM-768)** — every DM session
+  derives its root key from `HKDF(X25519-ECDH ‖ ML-KEM-768-shared,
+  salt="FinBit-hybrid-v1")`, so a "harvest-now-decrypt-later" adversary
+  recording traffic today can't read it once a quantum computer can break
+  X25519. Native (desktop + fb-cli) auto-enables it when OpenSSL 3.5+ is
+  present (FIPS-203 ML-KEM in the default provider — detected at CMake
+  configure → `FB_HAVE_ML_KEM`); peers without it fall back to classical
+  X25519, and that fallback is downgrade-protected — a stripped KEM key
+  inside a PQ-signed bundle is rejected. The web client is structurally
+  wired but dormant until a reviewer vendors the noble ML-KEM bundle
+  (see `client-web/ui/vendor/README.md`).
+- **Post-quantum signatures (ML-DSA-65)** — `PreKeyBundle`s carry ML-DSA-65
+  (FIPS-204) public keys + signatures alongside Ed25519, so the bundle
+  authentication that bootstraps a session is itself PQ-safe. Long-term
+  ML-KEM / ML-DSA secrets are zeroized on drop.
+- **Sealed sender** — Signal-style metadata defense: once a session is
+  PQ-acked, the relay-visible `Envelope` omits `sender_pubkey` entirely;
+  the real sender identity rides inside the encrypted `DmPayload` under a
+  domain-separated signature bound to the envelope id, timestamp, and
+  recipient. The relay routes by recipient but can't see who sent what.
+- **Identity verification (safety numbers)** — a per-peer safety number
+  (shown in a Qt dialog via the **Verify** button) for out-of-band
+  comparison; verified status is persisted, and a peer's pubkey changing
+  mid-conversation raises a warning.
+- **Social recovery (Shamir M-of-N)** — split your identity seed into N
+  shares over GF(256) and hand them to trusted contacts as in-protocol DM
+  payloads; recover by collecting any M back. Desktop has setup + recovery
+  wizards; fb-cli has `--shamir-split` / `--shamir-combine`.
+- **Forward-secret local storage** — per-table storage sub-keys (HKDF)
+  wrapped under the vault master key, with sender-set TTL pruning and
+  periodic key rotation; `secure_delete = ON` + a WAL checkpoint after
+  prune/rotate so removed ciphertext doesn't linger in the freelist.
+- **Tor / SOCKS5 transport** — route all traffic through a local SOCKS5
+  proxy (`FB_SOCKS=127.0.0.1:9050`) with hostname resolution at the proxy
+  (no client-side DNS leak) and per-peer stream isolation via Tor's
+  `IsolateSOCKSAuth`; `.onion` relays work.
+- **Amnesia mode** — `fb_server --amnesia` never persists to disk even
+  when `--offline-db` is set; pair with `docs/warrant-canary.md` so
+  operators can publish a signed canary.
 - **WebSocket transport** on the server (`--ws-port`) so browser clients
   connect natively.
 - **TLS transport** — three flavours, all using one OpenSSL link on the
@@ -252,6 +293,7 @@ captures anytime.)*
 | Subsystem | Blocker |
 |---|---|
 | SFU mode for >6-participant calls | mediasoup or Janus integration; full-mesh works for small rooms today |
+| Post-quantum on the web client | structurally wired but dormant — needs a human reviewer to vendor the noble ML-KEM-768 bundle into `client-web/ui/vendor/`; native (desktop + fb-cli) is already PQ-hybrid on OpenSSL 3.5+ |
 | Android client | NDK not installed in this dev env (Kotlin/Compose scaffold ready) |
 | iOS client | not started |
 | Desktop UI for `PeerNet` config | currently env-var driven (`FB_PEER_LISTEN_PORT/CERT/KEY`, `FB_PEER_DIALER_*`, `FB_PEER_PUBLIC_ADDR`, `FB_GOSSIP_PORT`, `FB_OFFLINE_RELAYS`). A "Network…" preferences panel is a small follow-up — the underlying P2P + DHT + offline-relay stack is fully wired and tested. |
@@ -293,7 +335,7 @@ sudo apt install cmake build-essential libsodium-dev libsqlite3-dev \
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # 183 native tests
+ctest --test-dir build --output-on-failure   # 390 native tests
 ```
 
 For the MLS opt-in path:
@@ -302,7 +344,7 @@ For the MLS opt-in path:
 scripts/fetch-mlspp.sh                       # vendor + apply patches
 cmake -S . -B build-mls -DFB_FEATURE_MLS=ON
 cmake --build build-mls -j
-ctest --test-dir build-mls --output-on-failure   # 193 native tests
+ctest --test-dir build-mls --output-on-failure   # 401 native tests
 ```
 
 ### 3. Run a local relay
@@ -399,8 +441,8 @@ fb.example.com {
 ### Native tests
 
 ```bash
-ctest --test-dir build --output-on-failure       # 183 tests, default
-ctest --test-dir build-mls --output-on-failure   # 193 tests, FB_FEATURE_MLS=ON
+ctest --test-dir build --output-on-failure       # 390 tests, default
+ctest --test-dir build-mls --output-on-failure   # 401 tests, FB_FEATURE_MLS=ON
 ```
 
 The default build covers crypto KAT, ratchet behaviour (including
@@ -412,7 +454,7 @@ round-trip, **DhtNode publish/lookup over an in-process bridge**,
 across two loopback instances** (skipped when `openssl(1)` isn't on
 PATH), bootstrap-file parser, plus the rest.
 
-The MLS build adds 10 more tests on top of that — `MlsFacade` for the
+The MLS build adds 11 more tests on top of that — `MlsFacade` for the
 wrapper layer (create / two-member add / three-member multi-broadcast /
 persistence seed + log replay), the matching `TmpDb.MlsGroup*`
 SQLite-table round-trips, and `MlsPersistTmpDb` integration tests that
@@ -446,8 +488,11 @@ NODE=~/emsdk/node/22.16.0_64bit/bin/node    # or your system node
 $NODE test/wasm_roundtrip.js                # crypto self-test
 $NODE test/wasm_channel_node.mjs            # SenderKeys (no server)
 $NODE test/seal_seed_node.mjs               # vault round-trip
+$NODE test/bip39_node.mjs                   # BIP39 recovery-phrase round-trip
 $NODE test/media_signal_node.mjs            # call signaling + SFrame
+$NODE test/pq_wire_shape_node.mjs           # PQ-hybrid envelope wire shape
 $NODE test/key_fetch_correlation_node.mjs   # request_id correlation
+$NODE test/web_dm_node.mjs                  # 2-client DM via server
 $NODE test/web_channel_node.mjs             # 2-client channel via server
 $NODE test/username_takeover_node.mjs       # impostor rejection
 $NODE test/auth_security_node.mjs           # 5 server-auth attacks
@@ -464,15 +509,20 @@ Each spins up the necessary processes, runs a scripted exchange, and asserts
 a randomized plaintext marker never appears in any relay's logs:
 
 ```bash
-tools/e2e/dm_roundtrip.sh                       # 1:1 DM via Double Ratchet
+tools/e2e/dm_roundtrip.sh                       # 1:1 DM via Double Ratchet (PQ-hybrid)
 tools/e2e/channel_inband_roundtrip.sh           # channel via DM-delivered SenderKeys
 tools/e2e/legacy_channel_file_mode_roundtrip.sh # channel join via shared dist file
+tools/e2e/image_roundtrip.sh                    # inline image/GIF attachment round-trip
+tools/e2e/call_signal_roundtrip.sh              # WebRTC SDP/ICE signaling over the ratchet
+tools/e2e/roomkey_roundtrip.sh                  # voice-room key distribution
 tools/e2e/p2p_roundtrip.sh                      # 4-peer P2P, no central server
 tools/e2e/offline_persist.sh                    # queued DM survives restart
 tools/e2e/server_persist_full.sh                # directory + prekeys + queue persist
 tools/e2e/username_resolve.sh                   # pubkey → username resolution
 tools/e2e/web_dm_roundtrip.sh                   # browser-style WebSocket DM
 tools/e2e/wss_dm_roundtrip.sh                   # full TLS round-trip via --tls-raw-port
+tools/e2e/wss_native_dm_roundtrip.sh            # native RFC 6455 WSS DM (browser-identical)
+tools/e2e/fronting_dm_roundtrip.sh              # domain-fronted DM (SNI ≠ Host)
 tools/e2e/peer_envelope_relay.sh                # PeerEnvelope (DHT/gossip) via central
                                                 # server's Frame.peer relay
 ```
@@ -528,7 +578,25 @@ subsystem.
   username cache are AEAD-wrapped per row using XChaCha20-Poly1305 keys
   derived from the vault seed via HKDF. A stolen data dir without the
   passphrase yields no message content. `PRAGMA user_version = 3` marks
-  the encrypted schema; opening without a key throws.
+  the encrypted schema; opening without a key throws. Per-table sub-keys
+  are wrapped under the vault master key and rotated periodically, with
+  `secure_delete` + WAL checkpointing so pruned ciphertext doesn't linger.
+- **Post-quantum hybrid.** DM session roots combine X25519 with ML-KEM-768
+  (FIPS-203) under HKDF, and prekey bundles are authenticated with ML-DSA-65
+  (FIPS-204) alongside Ed25519 — so neither the session key nor the bundle
+  that bootstraps it falls to a future quantum adversary. Native auto-enables
+  it on OpenSSL 3.5+; the classical fallback is downgrade-protected against a
+  KEM-stripping MITM.
+- **Sealed sender.** On a PQ-acked session the relay-visible envelope carries
+  no sender pubkey; the sender identity is inside the encrypted payload,
+  signed under a domain tag bound to the envelope id, timestamp, and
+  recipient. The relay can route but can't attribute.
+- **Active MITM verification.** A per-peer safety number is shown for
+  out-of-band comparison; the verified state is persisted and a pubkey change
+  mid-conversation is flagged.
+- **Social recovery (Shamir).** The identity seed can be split M-of-N over
+  GF(256) and entrusted to contacts; any M shares reconstruct it, fewer than
+  M reveal nothing.
 - **Voice + video has two layers.** DTLS-SRTP between peers (mandatory in
   WebRTC) plus SFrame on encoded audio/video frames, keyed per call from
   HKDF(X3DH-shared, info="FinBit-SFrame-call-v1-" ‖ hex(call_id)). For

@@ -91,7 +91,9 @@ MQTT: Paho's Java client (no native dep).
 FCM delivers opaque ciphertext blobs. The notification handler wakes the
 process, calls into `fb::core` via JNI to decrypt, then posts a system
 notification with the resulting plaintext. The FCM payload itself
-contains no plaintext content.
+contains no plaintext content. The full privacy design (what the push
+provider can and can't infer, and how FinBit minimises it) is pre-locked
+in [`docs/push-notifications.md`](../docs/push-notifications.md).
 
 ## Verification
 

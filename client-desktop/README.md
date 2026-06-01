@@ -13,11 +13,24 @@ code is portable.
 - **Discord-style 3-column UI** — server rail, channels panel, chat area,
   rich message rows with avatars + timestamps.
 - **DMs + channels** — full Phase 0/1 functionality through the relay.
+  DM sessions are **post-quantum hybrid** (ML-KEM-768 ‖ X25519) when the
+  build links OpenSSL 3.5+, with **sealed sender** hiding the sender pubkey
+  from the relay once the session is PQ-acked.
 - **1:1 voice + video** — GStreamer `webrtcbin` underneath. Opus + VP8;
   signaling via the existing Double Ratchet. Interoperates with the web
   client (both speak standard SDP/trickle ICE).
-- **Identity menu** — show recovery code (with confirm + clipboard),
-  sign out (closes connection, zeroes seed, returns to login).
+- **Identity verification** — a **Verify** button shows the per-peer safety
+  number for out-of-band comparison; the verified state is persisted and a
+  peer's pubkey changing mid-conversation raises a warning.
+- **Social recovery** — an Identity-menu wizard splits your seed M-of-N
+  (Shamir over GF(256)) and distributes shares to trusted contacts as DM
+  payloads; the recovery wizard requests M shares back and rebuilds the
+  vault.
+- **Tor / SOCKS5** — set `FB_SOCKS=127.0.0.1:9050` to route through a local
+  proxy with no DNS leak and per-peer Tor stream isolation.
+- **Identity menu** — show recovery code (with confirm + clipboard), set up
+  social recovery, sign out (closes connection, zeroes seed, returns to
+  login).
 
 ## Build prereqs
 
@@ -57,9 +70,15 @@ src/
   chat_client.{hpp,cpp}    QObject wrapping fb::core stack on a worker thread
   identity_vault.{hpp,cpp} Argon2id + XChaCha20 vault primitives (matches web)
   login_dialog.{hpp,cpp}   Create / Sign in / Recover panes
+  verify_identity_dialog.{hpp,cpp}  safety-number compare + verified-status persist
+  shamir_setup_wizard.{hpp,cpp}     Shamir social-recovery setup + recovery wizards
+  bip39*.{hpp,cpp}         BIP39 recovery-phrase encode/decode + wordlist
   media_call.{hpp,cpp}     GStreamer webrtcbin wrapper
+  room_forwarder.{hpp,cpp} voice-room mesh-dial / forwarder helper
+  embedded_relay.hpp       optional in-process fb_server for solo testing
   message_delegate.{hpp,cpp}  rich message-row renderer
   avatar.{hpp,cpp}         FNV-1a-hue avatar generator
+  crt_overlay.{hpp,cpp}    phosphor/CRT scanline + flicker effect overlay
   discord_theme.{hpp,cpp}  the QSS that gives us the dark Discord look
 ```
 

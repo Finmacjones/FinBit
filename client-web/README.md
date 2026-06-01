@@ -13,8 +13,15 @@ Emscripten, drives a Discord-style HTML/CSS/JS UI on top.
   tunneled through the existing ratchet, SFrame layered on top via
   Insertable Streams (Chromium-only — Firefox falls back to DTLS-SRTP
   with a console warning).
-- **Recovery code** — 64-char hex of the seed; portable to/from the
-  desktop client.
+- **Recovery code** — 64-char hex of the seed (or a BIP39 phrase);
+  portable to/from the desktop client.
+- **Post-quantum hybrid — wired but dormant.** The ML-KEM-768 send/receive
+  path (`finbit_pq.js`) is fully wired and the wire format already reserves
+  the `pq_pubkey` / `pq_ct` fields, but it stays inactive — falling back to
+  X25519-only handshakes — until a reviewer vendors the noble ML-KEM-768
+  bundle into `ui/vendor/` (a deliberate supply-chain decision; see
+  `ui/vendor/README.md`). Native peers see no difference: empty PQ fields
+  cleanly trigger their X25519 fallback.
 
 ## Layout
 
@@ -65,8 +72,11 @@ All Node smokes (run with `~/emsdk/node/22.16.0_64bit/bin/node`):
 | `wasm_roundtrip.js` | no | XChaCha20 AEAD round-trip + tamper |
 | `wasm_channel_node.mjs` | no | SenderKeys group encrypt/decrypt |
 | `seal_seed_node.mjs` | no | vault seal/open round-trip |
+| `bip39_node.mjs` | no | BIP39 recovery-phrase round-trip + KAT |
 | `media_signal_node.mjs` | no | call signaling proto + SFrame |
+| `pq_wire_shape_node.mjs` | no | PQ-hybrid `pq_pubkey` / `pq_ct` wire surface |
 | `key_fetch_correlation_node.mjs` | no | request_id correlation |
+| `web_dm_node.mjs` | yes | 2-client DM via WebSocket ↔ fb-cli |
 | `web_channel_node.mjs` | yes | 2-client channel via WebSocket |
 | `username_takeover_node.mjs` | yes | server rejects impostor |
 | `auth_security_node.mjs` | yes | 5 server-auth attacks |
