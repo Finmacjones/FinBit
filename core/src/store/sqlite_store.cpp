@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <chrono>
 #include <string>
@@ -243,6 +244,17 @@ std::optional<std::vector<std::uint8_t>> aead_unwrap(
 struct SqliteStore::Impl {
     sqlite3* db = nullptr;
 
+    // F1 (Tier-11 audit): the store is shared between the chat_client
+    // worker thread (writes inbox/outbox/sessions, prune, rotate) and the
+    // Qt main thread (reads via the MITM / history / shamir accessors).
+    // SQLite SERIALIZED mode makes the sqlite3_* calls memory-safe, but it
+    // does NOT protect the in-Impl table sub-key arrays + generation
+    // counter (read on every wrap/unwrap, rewritten under rotate) — a
+    // torn read there yields at-rest decrypt corruption. Lock every public
+    // method on this recursive_mutex (recursive because some public
+    // methods call others, e.g. peer_pubkeys_for_username → all_cached_peers).
+    std::recursive_mutex mu;
+
     // At-rest encryption state. encrypt_at_rest is true exactly when
     // open() received a non-empty master_key. inbox_key / outbox_key
     // are derived once at open via HKDF; nullptr keys when disabled.
@@ -331,6 +343,14 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
     if (sqlite3_open(path.c_str(), &s->impl_->db) != SQLITE_OK) {
         throw_sqlite("open", s->impl_->db);
     }
+    // F1 (Tier-11 audit): with WAL + two threads, a writer on one thread
+    // during a reader's transaction on the other can surface SQLITE_BUSY,
+    // which exec()/prep() turn into a thrown exception. A 5s busy timeout
+    // makes SQLite block-and-retry instead of failing, so the brief
+    // contention windows (a write landing while a read holds the shared
+    // lock) don't crash the caller. Our own recursive_mutex serialises
+    // most access; this covers the residual checkpoint/WAL interplay.
+    sqlite3_busy_timeout(s->impl_->db, 5000);
     s->impl_->exec(kSchema);
     // Idempotent column adds for legacy DBs created before each MLS-
     // related column shipped. SQLite's CREATE TABLE IF NOT EXISTS
@@ -588,6 +608,7 @@ std::vector<std::uint8_t> column_blob(sqlite3_stmt* stmt, int idx) {
 
 void SqliteStore::save_identity(std::span<const std::uint8_t> pub,
                                 std::span<const std::uint8_t> sec, const std::string& username) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "INSERT OR REPLACE INTO identities(username, pub, sec) VALUES(?, ?, ?);");
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
@@ -602,6 +623,7 @@ void SqliteStore::save_identity(std::span<const std::uint8_t> pub,
 
 std::optional<std::vector<std::uint8_t>> SqliteStore::load_identity_pub(
     const std::string& username) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep("SELECT pub FROM identities WHERE username = ?;");
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
     std::optional<std::vector<std::uint8_t>> out;
@@ -612,6 +634,7 @@ std::optional<std::vector<std::uint8_t>> SqliteStore::load_identity_pub(
 
 std::optional<std::vector<std::uint8_t>> SqliteStore::load_identity_sec(
     const std::string& username) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep("SELECT sec FROM identities WHERE username = ?;");
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
     std::optional<std::vector<std::uint8_t>> out;
@@ -622,6 +645,7 @@ std::optional<std::vector<std::uint8_t>> SqliteStore::load_identity_sec(
 
 void SqliteStore::remember_peer(std::span<const std::uint8_t> peer_pub,
                                 const std::string& username) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "INSERT OR REPLACE INTO peer_keys(username, pub) VALUES(?, ?);");
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
@@ -632,6 +656,7 @@ void SqliteStore::remember_peer(std::span<const std::uint8_t> peer_pub,
 
 std::optional<std::vector<std::uint8_t>> SqliteStore::lookup_peer(
     const std::string& username) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep("SELECT pub FROM peer_keys WHERE username = ?;");
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
     std::optional<std::vector<std::uint8_t>> out;
@@ -642,6 +667,7 @@ std::optional<std::vector<std::uint8_t>> SqliteStore::lookup_peer(
 
 void SqliteStore::save_session(std::span<const std::uint8_t> peer_pub,
                                std::span<const std::uint8_t> blob) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     std::vector<std::uint8_t> wrapped;
     std::span<const std::uint8_t> stored = blob;
     if (impl_->encrypt_at_rest) {
@@ -662,6 +688,7 @@ void SqliteStore::save_session(std::span<const std::uint8_t> peer_pub,
 
 std::optional<std::vector<std::uint8_t>> SqliteStore::load_session(
     std::span<const std::uint8_t> peer_pub) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep("SELECT blob FROM sessions WHERE peer_pub = ?;");
     bind_blob(stmt, 1, peer_pub);
     std::optional<std::vector<std::uint8_t>> out;
@@ -684,6 +711,7 @@ void SqliteStore::append_inbox(std::span<const std::uint8_t> envelope_id,
                                std::span<const std::uint8_t> peer_pub,
                                std::span<const std::uint8_t> plaintext,
                                std::uint64_t timestamp_ms) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     // When at-rest encryption is on, wrap the plaintext column with the
     // inbox sub-key and bind envelope_id as AAD so a row can't be moved.
     std::vector<std::uint8_t> wrapped;
@@ -708,6 +736,7 @@ void SqliteStore::append_inbox_with_expiry(std::span<const std::uint8_t> envelop
                                             std::span<const std::uint8_t> plaintext,
                                             std::uint64_t timestamp_ms,
                                             std::uint64_t expires_at_ms) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     std::vector<std::uint8_t> wrapped;
     std::span<const std::uint8_t> stored = plaintext;
     if (impl_->encrypt_at_rest) {
@@ -730,6 +759,7 @@ void SqliteStore::append_outbox(std::span<const std::uint8_t> envelope_id,
                                 std::span<const std::uint8_t> peer_pub,
                                 std::span<const std::uint8_t> ciphertext,
                                 std::uint64_t timestamp_ms) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     // The column is named `ciphertext` but historically held plaintext
     // bytes (see chat_client.cpp comment). With at-rest encryption on,
     // it now stores genuine ciphertext: nonce || aead(plaintext, AAD =
@@ -756,6 +786,7 @@ void SqliteStore::append_outbox_with_expiry(std::span<const std::uint8_t> envelo
                                              std::span<const std::uint8_t> ciphertext,
                                              std::uint64_t timestamp_ms,
                                              std::uint64_t expires_at_ms) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     std::vector<std::uint8_t> wrapped;
     std::span<const std::uint8_t> stored = ciphertext;
     if (impl_->encrypt_at_rest) {
@@ -775,6 +806,7 @@ void SqliteStore::append_outbox_with_expiry(std::span<const std::uint8_t> envelo
 }
 
 std::size_t SqliteStore::prune_expired(std::uint64_t now_ms) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     // Sweep both tables in one transaction. Rows with expires_at_ms = 0
     // (the default, set by the legacy append_* overloads) are exempt.
     impl_->exec("BEGIN;");
@@ -795,6 +827,7 @@ std::size_t SqliteStore::prune_expired(std::uint64_t now_ms) {
 
 void SqliteStore::set_peer_verified(std::span<const std::uint8_t> peer_pub,
                                      bool verified, std::uint64_t verified_at_ms) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "INSERT INTO peer_verified(peer_pub, verified, verified_at_ms) "
         "VALUES(?, ?, ?) ON CONFLICT(peer_pub) DO UPDATE SET "
@@ -807,6 +840,7 @@ void SqliteStore::set_peer_verified(std::span<const std::uint8_t> peer_pub,
 }
 
 bool SqliteStore::peer_verified(std::span<const std::uint8_t> peer_pub) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "SELECT verified FROM peer_verified WHERE peer_pub = ?;");
     bind_blob(stmt, 1, peer_pub);
@@ -821,6 +855,7 @@ bool SqliteStore::peer_verified(std::span<const std::uint8_t> peer_pub) const {
 // ---- Shamir held-share custody --------------------------------------------
 
 void SqliteStore::save_shamir_share(const ShamirHeldShare& s) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "INSERT INTO shamir_held_shares(peer_pub, setup_id, share, threshold, "
         "total, label, received_at_ms) VALUES(?, ?, ?, ?, ?, ?, ?) "
@@ -844,6 +879,7 @@ void SqliteStore::save_shamir_share(const ShamirHeldShare& s) {
 std::optional<SqliteStore::ShamirHeldShare>
 SqliteStore::load_shamir_share(std::span<const std::uint8_t> peer_pub,
                                 std::uint64_t setup_id) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "SELECT share, threshold, total, label, received_at_ms FROM "
         "shamir_held_shares WHERE peer_pub = ? AND setup_id = ?;");
@@ -870,6 +906,7 @@ SqliteStore::load_shamir_share(std::span<const std::uint8_t> peer_pub,
 }
 
 std::vector<SqliteStore::ShamirHeldShare> SqliteStore::list_shamir_shares() const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "SELECT peer_pub, setup_id, share, threshold, total, label, "
         "received_at_ms FROM shamir_held_shares ORDER BY received_at_ms DESC;");
@@ -897,6 +934,7 @@ std::vector<SqliteStore::ShamirHeldShare> SqliteStore::list_shamir_shares() cons
 }
 
 std::size_t SqliteStore::rotate_storage_keys() {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     if (!impl_->encrypt_at_rest || !impl_->have_master) return 0;
 
     // Fresh random sub-keys for the three rotated tables. (chan_* /
@@ -1035,6 +1073,7 @@ std::size_t SqliteStore::rotate_storage_keys() {
 }
 
 std::vector<SqliteStore::InboxRow> SqliteStore::recent_inbox(std::size_t limit) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt =
         impl_->prep("SELECT envelope_id, peer_pub, plaintext, ts_ms FROM inbox "
                     "ORDER BY ts_ms DESC LIMIT ?;");
@@ -1069,6 +1108,7 @@ std::vector<SqliteStore::InboxRow> SqliteStore::recent_inbox(std::size_t limit) 
 }
 
 std::vector<SqliteStore::OutboxRow> SqliteStore::recent_outbox(std::size_t limit) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt =
         impl_->prep("SELECT envelope_id, peer_pub, ciphertext, ts_ms FROM outbox "
                     "ORDER BY ts_ms DESC LIMIT ?;");
@@ -1098,6 +1138,7 @@ std::vector<SqliteStore::OutboxRow> SqliteStore::recent_outbox(std::size_t limit
 
 void SqliteStore::record_carry(std::span<const std::uint8_t> peer_pub,
                                std::int64_t delta_bytes) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "INSERT INTO carry_ledger(peer_pub, delta_bytes) VALUES(?, ?) "
         "ON CONFLICT(peer_pub) DO UPDATE SET delta_bytes = delta_bytes + excluded.delta_bytes;");
@@ -1108,6 +1149,7 @@ void SqliteStore::record_carry(std::span<const std::uint8_t> peer_pub,
 }
 
 std::int64_t SqliteStore::carry_balance(std::span<const std::uint8_t> peer_pub) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep("SELECT delta_bytes FROM carry_ledger WHERE peer_pub = ?;");
     bind_blob(stmt, 1, peer_pub);
     std::int64_t out = 0;
@@ -1119,6 +1161,7 @@ std::int64_t SqliteStore::carry_balance(std::span<const std::uint8_t> peer_pub) 
 void SqliteStore::srv_offline_enqueue(std::span<const std::uint8_t> recipient_pub,
                                       std::span<const std::uint8_t> envelope_bytes,
                                       std::uint64_t timestamp_ms) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "INSERT INTO srv_offline(recipient_pub, envelope, ts_ms) VALUES(?, ?, ?);");
     bind_blob(stmt, 1, recipient_pub);
@@ -1133,6 +1176,7 @@ void SqliteStore::srv_offline_enqueue(std::span<const std::uint8_t> recipient_pu
 
 void SqliteStore::srv_register_user(const std::string& username,
                                      std::span<const std::uint8_t> pubkey) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "INSERT INTO srv_directory(username, pubkey) VALUES(?, ?) "
         "ON CONFLICT(username) DO UPDATE SET pubkey = excluded.pubkey;");
@@ -1144,6 +1188,7 @@ void SqliteStore::srv_register_user(const std::string& username,
 
 std::optional<std::vector<std::uint8_t>> SqliteStore::srv_resolve_username(
     const std::string& username) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep("SELECT pubkey FROM srv_directory WHERE username = ?;");
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_TRANSIENT);
     std::optional<std::vector<std::uint8_t>> out;
@@ -1154,6 +1199,7 @@ std::optional<std::vector<std::uint8_t>> SqliteStore::srv_resolve_username(
 
 std::optional<std::string> SqliteStore::srv_reverse_resolve_pubkey(
     std::span<const std::uint8_t> pubkey) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep("SELECT username FROM srv_directory WHERE pubkey = ? LIMIT 1;");
     bind_blob(stmt, 1, pubkey);
     std::optional<std::string> out;
@@ -1167,6 +1213,7 @@ std::optional<std::string> SqliteStore::srv_reverse_resolve_pubkey(
 
 void SqliteStore::srv_put_prekey_bundle(std::span<const std::uint8_t> owner_pub,
                                         std::span<const std::uint8_t> bundle_blob) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "INSERT INTO srv_prekey_bundles(owner_pub, bundle, updated_ms) VALUES(?, ?, "
         "(strftime('%s','now') * 1000)) "
@@ -1180,6 +1227,7 @@ void SqliteStore::srv_put_prekey_bundle(std::span<const std::uint8_t> owner_pub,
 
 std::optional<std::vector<std::uint8_t>> SqliteStore::srv_get_prekey_bundle(
     std::span<const std::uint8_t> owner_pub) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep("SELECT bundle FROM srv_prekey_bundles WHERE owner_pub = ?;");
     bind_blob(stmt, 1, owner_pub);
     std::optional<std::vector<std::uint8_t>> out;
@@ -1191,6 +1239,7 @@ std::optional<std::vector<std::uint8_t>> SqliteStore::srv_get_prekey_bundle(
 void SqliteStore::chan_save(const std::string& name, std::span<const std::uint8_t> channel_id,
                              std::span<const std::uint8_t> own_dist,
                              ChannelCrypto crypto) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     std::vector<std::uint8_t> wrapped;
     std::span<const std::uint8_t> stored = own_dist;
     if (impl_->encrypt_at_rest && !own_dist.empty()) {
@@ -1213,6 +1262,7 @@ void SqliteStore::chan_save(const std::string& name, std::span<const std::uint8_
 }
 
 std::vector<SqliteStore::ChannelRow> SqliteStore::chan_list() const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "SELECT name, channel_id, own_dist, crypto FROM chan_state "
         "ORDER BY name;");
@@ -1245,6 +1295,7 @@ std::vector<SqliteStore::ChannelRow> SqliteStore::chan_list() const {
 void SqliteStore::chan_save_peer(std::span<const std::uint8_t> channel_id,
                                   std::span<const std::uint8_t> peer_pub,
                                   std::span<const std::uint8_t> peer_dist) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     std::vector<std::uint8_t> wrapped;
     std::span<const std::uint8_t> stored = peer_dist;
     if (impl_->encrypt_at_rest) {
@@ -1269,6 +1320,7 @@ void SqliteStore::chan_save_peer(std::span<const std::uint8_t> channel_id,
 
 std::vector<SqliteStore::ChannelPeerRow> SqliteStore::chan_peers(
     std::span<const std::uint8_t> channel_id) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "SELECT peer_pub, peer_dist FROM chan_peers WHERE channel_id = ?;");
     bind_blob(stmt, 1, channel_id);
@@ -1300,6 +1352,7 @@ void SqliteStore::chan_append_inbox(std::span<const std::uint8_t> channel_id,
                                      std::span<const std::uint8_t> sender_pub,
                                      std::span<const std::uint8_t> plaintext,
                                      std::uint64_t timestamp_ms) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     std::vector<std::uint8_t> wrapped;
     std::span<const std::uint8_t> stored = plaintext;
     if (impl_->encrypt_at_rest) {
@@ -1319,6 +1372,7 @@ void SqliteStore::chan_append_inbox(std::span<const std::uint8_t> channel_id,
 
 void SqliteStore::chan_delete(const std::string& name,
                               std::span<const std::uint8_t> channel_id) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     impl_->exec("BEGIN");
     auto exec_one = [&](const char* sql, auto bind_fn) {
         auto* stmt = impl_->prep(sql);
@@ -1350,6 +1404,7 @@ void SqliteStore::chan_delete(const std::string& name,
 
 std::vector<SqliteStore::ChannelInboxRow> SqliteStore::chan_recent_inbox(
     std::span<const std::uint8_t> channel_id, std::size_t limit) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "SELECT channel_id, sender_pub, plaintext, ts_ms FROM chan_inbox "
         "WHERE channel_id = ? ORDER BY ts_ms DESC LIMIT ?;");
@@ -1380,6 +1435,7 @@ std::vector<SqliteStore::ChannelInboxRow> SqliteStore::chan_recent_inbox(
 
 void SqliteStore::cache_peer_name(std::span<const std::uint8_t> peer_pub,
                                    const std::string& username) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "INSERT INTO peer_name_cache(peer_pub, username, learned_ms) VALUES(?, ?, "
         "(strftime('%s','now') * 1000)) "
@@ -1400,6 +1456,7 @@ void SqliteStore::cache_peer_name(std::span<const std::uint8_t> peer_pub,
 }
 
 std::optional<std::string> SqliteStore::peer_name(std::span<const std::uint8_t> peer_pub) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep("SELECT username FROM peer_name_cache WHERE peer_pub = ?;");
     bind_blob(stmt, 1, peer_pub);
     std::optional<std::string> out;
@@ -1421,14 +1478,16 @@ std::optional<std::string> SqliteStore::peer_name(std::span<const std::uint8_t> 
 
 std::vector<std::vector<std::uint8_t>>
 SqliteStore::peer_pubkeys_for_username(const std::string& username) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     std::vector<std::vector<std::uint8_t>> out;
-    for (const auto& p : all_cached_peers()) {
+    for (const auto& p : all_cached_peers()) {   // recursive_mutex: re-locks OK
         if (p.username == username) out.push_back(p.peer_pub);
     }
     return out;
 }
 
 std::vector<SqliteStore::CachedPeer> SqliteStore::all_cached_peers() const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "SELECT peer_pub, username FROM peer_name_cache ORDER BY learned_ms DESC;");
     std::vector<CachedPeer> out;
@@ -1455,6 +1514,7 @@ std::vector<SqliteStore::CachedPeer> SqliteStore::all_cached_peers() const {
 
 std::vector<std::vector<std::uint8_t>> SqliteStore::srv_offline_drain(
     std::span<const std::uint8_t> recipient_pub) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "SELECT id, envelope FROM srv_offline WHERE recipient_pub = ? ORDER BY id ASC;");
     bind_blob(stmt, 1, recipient_pub);
@@ -1505,6 +1565,7 @@ std::vector<std::uint8_t> mls_log_aad(std::span<const std::uint8_t> channel_id,
 
 void SqliteStore::mls_group_save(std::span<const std::uint8_t> channel_id,
                                   std::span<const std::uint8_t> seed_blob) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     std::vector<std::uint8_t> wrapped;
     std::span<const std::uint8_t> stored = seed_blob;
     if (impl_->encrypt_at_rest) {
@@ -1530,6 +1591,7 @@ void SqliteStore::mls_group_save(std::span<const std::uint8_t> channel_id,
 void SqliteStore::mls_group_op_append(std::span<const std::uint8_t> channel_id,
                                         std::int64_t seq,
                                         std::span<const std::uint8_t> op_blob) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     std::vector<std::uint8_t> wrapped;
     std::span<const std::uint8_t> stored = op_blob;
     auto aad_vec = mls_log_aad(channel_id, seq);
@@ -1562,6 +1624,7 @@ void SqliteStore::mls_group_op_append(std::span<const std::uint8_t> channel_id,
 
 std::optional<SqliteStore::MlsGroupSnapshot> SqliteStore::mls_group_load(
     std::span<const std::uint8_t> channel_id) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     MlsGroupSnapshot snap;
 
     // 1. Seed.
@@ -1625,6 +1688,7 @@ std::optional<SqliteStore::MlsGroupSnapshot> SqliteStore::mls_group_load(
 }
 
 void SqliteStore::mls_group_delete(std::span<const std::uint8_t> channel_id) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto exec_one = [&](const char* sql) {
         auto* stmt = impl_->prep(sql);
         bind_blob(stmt, 1, channel_id);

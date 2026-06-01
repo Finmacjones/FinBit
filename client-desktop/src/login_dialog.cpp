@@ -410,16 +410,20 @@ void LoginDialog::onShamirAccept() {
                            .arg(line.left(12)));
             return;
         }
-        const QByteArray bytes = QByteArray::fromHex(compact.toUtf8());
+        QByteArray bytes = QByteArray::fromHex(compact.toUtf8());
         try {
             shares.push_back(fb::crypto::shamir::decode_share(
                 std::span<const std::uint8_t>(
                     reinterpret_cast<const std::uint8_t*>(bytes.constData()),
                     static_cast<std::size_t>(bytes.size()))));
         } catch (const std::exception& e) {
+            sodium_memzero(bytes.data(), static_cast<std::size_t>(bytes.size()));
             show_error(QString("bad share: %1").arg(e.what()));
             return;
         }
+        // F6 (audit): the pasted share bytes are secret material — wipe the
+        // QByteArray (no auto-zeroize) now that decode_share copied them.
+        sodium_memzero(bytes.data(), static_cast<std::size_t>(bytes.size()));
     }
     if (shares.size() < 2) {
         show_error("paste at least the threshold number of shares "
@@ -434,19 +438,27 @@ void LoginDialog::onShamirAccept() {
     // to verify it matches their known identity.
     Seed seed{};
     try {
-        const auto recovered = fb::crypto::shamir::combine(
+        auto recovered = fb::crypto::shamir::combine(
             std::span<const fb::crypto::shamir::Share>(shares.data(), shares.size()));
         if (recovered.size() != seed.size()) {
+            sodium_memzero(recovered.data(), recovered.size());
             show_error(QString("recovered secret is %1 bytes, expected %2 — "
                                "wrong shares or wrong setup")
                            .arg(recovered.size()).arg(seed.size()));
             return;
         }
         std::memcpy(seed.data(), recovered.data(), seed.size());
+        // F6 (audit): wipe the combine() output now that it's in `seed`.
+        sodium_memzero(recovered.data(), recovered.size());
     } catch (const std::exception& e) {
         show_error(QString("recombine failed: %1 (duplicate or "
                            "mismatched shares?)").arg(e.what()));
         return;
+    }
+    // F6 (audit): the parsed shares' y-bytes are secret-derived — wipe them
+    // now that combine() consumed them.
+    for (auto& sh : shares) {
+        sodium_memzero(sh.y.data(), sh.y.size());
     }
 
     // Derive the fingerprint so the user can sanity-check the recovery

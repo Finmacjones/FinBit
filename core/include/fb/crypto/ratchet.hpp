@@ -79,6 +79,27 @@ public:
     [[nodiscard]] std::optional<std::vector<std::uint8_t>> try_decrypt(
         std::span<const std::uint8_t> ratchet_msg, std::span<const std::uint8_t> aad);
 
+    // Cheap O(1), NON-MUTATING pre-filter for the sealed-sender try-all
+    // path (audit finding H1). Parses the RatchetMessage header only and
+    // returns true iff this message plausibly belongs to THIS session's
+    // current receive chain — i.e. header_dh_pub == our current peer DH
+    // AND the implied skip distance (pn/n) is within kMaxSkip. Lets the
+    // recipient skip the expensive try_decrypt (which derives up to
+    // kMaxSkip message keys BEFORE the MAC check) for sessions that
+    // obviously don't match, turning O(N · kMaxSkip) into O(N) header
+    // parses + O(1) full attempts. A `false` here never causes a missed
+    // message: a genuinely-matching message always has header_dh ==
+    // dhr_pub for the in-order/small-skip case; the rare
+    // just-DH-ratcheted case falls back to the full try-all (still
+    // bounded by the same kMaxSkip cap this method enforces).
+    //
+    // Returns false on a malformed header or an out-of-window skip
+    // distance — the latter is the DoS guard: an attacker-crafted
+    // header with pn=n=2^32-1 is rejected here without deriving a
+    // single key.
+    [[nodiscard]] bool header_matches_recv_chain(
+        std::span<const std::uint8_t> ratchet_msg) const noexcept;
+
     // PIMPL — full definition lives in ratchet.cpp. Public so internal
     // helpers in the .cpp can take `State&` without friend declarations;
     // the type is forward-only here so consumers see no internals.

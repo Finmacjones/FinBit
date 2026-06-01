@@ -699,18 +699,16 @@ int fb::server::run_relay(const RelayConfig& cfg, std::atomic<bool>& stop) {
                     fb::proto::Frame outf;
                     auto* fwd = outf.mutable_envelope();
                     *fwd = env;
-                    // Rewrite Envelope.sender_pubkey to the authenticated
-                    // pubkey for this connection. Without this, an
-                    // authenticated client can craft an Envelope with
-                    // sender_pubkey set to anyone else, producing
-                    // spurious "decrypt failed from <victim>" log
-                    // entries on the receiver. The ratchet AEAD still
-                    // authenticates the real sender, so impersonation
-                    // doesn't succeed at the message-content layer —
-                    // but the server should not relay a mismatched
-                    // sender claim either. Mirrors the PeerEnvelope
-                    // sender_pubkey rewrite at line ~720.
-                    if (!c.bound_user_pub.empty()) {
+                    // Anti-spoof rewrite — but ONLY when the client made a
+                    // sender claim. If the client provided a non-empty
+                    // sender_pubkey, overwrite it with the authenticated
+                    // pubkey so a sender can't claim to be someone else.
+                    // If the client deliberately left it EMPTY (sealed
+                    // sender, Tier 11), leave it empty — the ratchet AEAD
+                    // authenticates the real sender end-to-end, so the
+                    // anti-spoof rationale doesn't apply, and re-stamping
+                    // would defeat the whole metadata-privacy feature.
+                    if (!c.bound_user_pub.empty() && !env.sender_pubkey().empty()) {
                         fwd->set_sender_pubkey(std::string(
                             reinterpret_cast<const char*>(
                                 c.bound_user_pub.data()),
@@ -750,10 +748,12 @@ int fb::server::run_relay(const RelayConfig& cfg, std::atomic<bool>& stop) {
                 fb::proto::Frame outf;
                 auto* fwd = outf.mutable_envelope();
                 *fwd = env;
-                // See channel-envelope branch above — rewrite
-                // sender_pubkey to the authenticated pubkey so the
-                // server doesn't relay a mismatched sender claim.
-                if (!c.bound_user_pub.empty()) {
+                // See channel-envelope branch above — overwrite a
+                // CLAIMED sender_pubkey with the authenticated one, but
+                // honour a deliberately-empty (sealed-sender) field by
+                // leaving it empty. The offline-queue copy below is `fwd`,
+                // so sealed envelopes stay sealed at rest too.
+                if (!c.bound_user_pub.empty() && !env.sender_pubkey().empty()) {
                     fwd->set_sender_pubkey(std::string(
                         reinterpret_cast<const char*>(
                             c.bound_user_pub.data()),

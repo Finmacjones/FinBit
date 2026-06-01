@@ -311,14 +311,24 @@ std::optional<Seed> open_seed_dual(const QString& passphrase,
     if (blob.size() != kVaultDualBytes) {
         return std::nullopt;
     }
+    // F5 (audit): try BOTH halves regardless of which succeeds first.
+    // Short-circuiting on the first success leaked WHICH half matched via
+    // timing — the real passphrase finished after 1 Argon2id (~0.7s), the
+    // decoy after 2 (~1.4s). Under coercion the adversary measures the
+    // unlock latency and learns whether they were handed the real or the
+    // decoy credential, defeating the whole plausible-deniability property.
+    // Running both Argon2id derivations every time makes the latency
+    // constant (== 2 derivations) regardless of which (or neither)
+    // passphrase was given.
     VaultBlob first(blob.begin(), blob.begin() + kVaultBlobBytes);
-    if (auto s = open_seed(passphrase, first)) {
-        return s;
-    }
     VaultBlob second(blob.begin() + kVaultBlobBytes, blob.end());
-    return open_seed(passphrase, second);
-    // Either half may succeed. The caller cannot distinguish which —
-    // exactly the property we want for plausible-deniability under coercion.
+    auto a = open_seed(passphrase, first);
+    auto b = open_seed(passphrase, second);
+    // Prefer the real (first) slot if it matched; else the decoy. Both
+    // derivations ran, so the choice here is data-dependent but NOT
+    // timing-dependent — an observer can't tell which branch was taken.
+    if (a) return a;
+    return b;
 }
 
 // ---- Multi-persona vault (N-blob) -----------------------------------------
@@ -354,17 +364,24 @@ std::optional<Seed> open_seed_multi(const QString& passphrase,
         blob.size() % kVaultBlobBytes != 0) {
         return std::nullopt;
     }
+    // F5 (audit): run Argon2id against EVERY slot regardless of an early
+    // match, so unlock latency is constant (== slot_count derivations) and
+    // doesn't reveal which persona's passphrase was supplied. See
+    // open_seed_dual for the coercion rationale. We keep the FIRST slot
+    // that matched (lowest index), but only after all derivations ran.
     const std::size_t slot_count = blob.size() / kVaultBlobBytes;
+    std::optional<Seed> matched;
     for (std::size_t i = 0; i < slot_count; ++i) {
         const auto first = blob.begin() +
             static_cast<std::ptrdiff_t>(i * kVaultBlobBytes);
         const auto last  = first + static_cast<std::ptrdiff_t>(kVaultBlobBytes);
         VaultBlob slot(first, last);
-        if (auto s = open_seed(passphrase, slot)) {
-            return s;
+        auto s = open_seed(passphrase, slot);
+        if (s && !matched) {
+            matched = s;   // keep the first match; do NOT break — run all slots
         }
     }
-    return std::nullopt;
+    return matched;
 }
 
 }  // namespace fb::desktop

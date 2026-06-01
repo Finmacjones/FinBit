@@ -16,6 +16,8 @@
 
 #include "fb/crypto/ratchet.hpp"
 
+#include "ratchet.pb.h"
+
 #include <gtest/gtest.h>
 #include <sodium.h>
 
@@ -189,6 +191,88 @@ TEST(Ratchet, TryDecryptOnRightSessionAdvancesStateLikeDecrypt) {
     // Replay of e1 (now consumed) is rejected — proves the message-counter
     // advance from the prior try_decrypt actually committed.
     EXPECT_FALSE(p.bob.try_decrypt(span_of(e1), span_of(kAad)).has_value());
+}
+
+// H2 regression: a failed try_decrypt that forced skip-key derivation must
+// roll back the skipped-key map intact (and, per the secure_wipe fix, must
+// not corrupt the session). We populate Bob's skipped map with out-of-order
+// keys, fire a wrong-session try_decrypt against a DIFFERENT ratchet (which
+// internally derives + caches keys before the MAC fails), then confirm the
+// original session still decrypts every previously-skipped message. If the
+// rollback (wipe-then-restore) mishandled the map, the skipped keys would be
+// lost or duplicated and these decrypts would fail.
+TEST(Ratchet, TryDecryptRollbackPreservesSkippedKeys) {
+    auto p  = make_pair();
+    auto pX = make_pair();   // an unrelated session to mis-try against
+
+    // Alice sends 4; Bob receives only #4 first → skipped map holds 1..3.
+    auto e1 = p.alice.encrypt(bytes("m1"), span_of(kAad));
+    auto e2 = p.alice.encrypt(bytes("m2"), span_of(kAad));
+    auto e3 = p.alice.encrypt(bytes("m3"), span_of(kAad));
+    auto e4 = p.alice.encrypt(bytes("m4"), span_of(kAad));
+    auto d4 = p.bob.decrypt(span_of(e4), span_of(kAad));   // populates skipped 1..3
+    ASSERT_TRUE(d4.has_value());
+    EXPECT_EQ(*d4, bytes("m4"));
+
+    // A wrong-session try_decrypt on Bob: an envelope from an unrelated
+    // ratchet. decrypt() will DH-ratchet + derive skip keys before failing
+    // the MAC, exercising the mutate-then-rollback path.
+    auto wrong = pX.alice.encrypt(bytes("not for this bob"), span_of(kAad));
+    EXPECT_FALSE(p.bob.try_decrypt(span_of(wrong), span_of(kAad)).has_value());
+
+    // The legitimately-skipped messages 1..3 must STILL decrypt — proving the
+    // failed try's rollback left the skipped map exactly as it was.
+    auto d1 = p.bob.decrypt(span_of(e1), span_of(kAad));
+    auto d2 = p.bob.decrypt(span_of(e2), span_of(kAad));
+    auto d3 = p.bob.decrypt(span_of(e3), span_of(kAad));
+    ASSERT_TRUE(d1.has_value()); EXPECT_EQ(*d1, bytes("m1"));
+    ASSERT_TRUE(d2.has_value()); EXPECT_EQ(*d2, bytes("m2"));
+    ASSERT_TRUE(d3.has_value()); EXPECT_EQ(*d3, bytes("m3"));
+}
+
+// H1 regression: the sealed-sender try-all DoS guard. header_matches_recv_chain
+// must (a) return true for a message that genuinely belongs to the session,
+// (b) return false for a message from an unrelated session WITHOUT deriving
+// keys, and (c) reject an attacker-crafted absurd skip distance.
+TEST(Ratchet, HeaderMatchPrefilterIdentifiesRightSession) {
+    auto p1 = make_pair();
+    auto p2 = make_pair();
+
+    // Bob must have an established receive chain to match against: he
+    // decrypts one real message from his Alice first.
+    auto warm = p1.alice.encrypt(bytes("warm"), span_of(kAad));
+    ASSERT_TRUE(p1.bob.decrypt(span_of(warm), span_of(kAad)).has_value());
+
+    auto for_p1bob = p1.alice.encrypt(bytes("hello p1.bob"), span_of(kAad));
+    auto for_p2bob = p2.alice.encrypt(bytes("hello p2.bob"), span_of(kAad));
+
+    // (a) p1.bob's recv chain matches p1.alice's message header.
+    EXPECT_TRUE(p1.bob.header_matches_recv_chain(span_of(for_p1bob)));
+    // (b) p1.bob does NOT match a message from an unrelated session.
+    EXPECT_FALSE(p1.bob.header_matches_recv_chain(span_of(for_p2bob)));
+}
+
+TEST(Ratchet, HeaderMatchPrefilterRejectsAbsurdSkipAndGarbage) {
+    auto p = make_pair();
+    auto warm = p.alice.encrypt(bytes("warm"), span_of(kAad));
+    ASSERT_TRUE(p.bob.decrypt(span_of(warm), span_of(kAad)).has_value());
+
+    // Garbage bytes → false (no parse, no key derivation).
+    auto junk = bytes("not a ratchet message");
+    EXPECT_FALSE(p.bob.header_matches_recv_chain(span_of(junk)));
+
+    // Craft a RatchetMessage with the RIGHT header DH but an absurd n
+    // (2^32-1). The skip-distance guard must reject it so try_decrypt is
+    // never invoked to derive ~4 billion keys. We rebuild the wire bytes
+    // from a real message and bump n via the proto.
+    auto real = p.alice.encrypt(bytes("real"), span_of(kAad));
+    fb::proto::RatchetMessage rm;
+    ASSERT_TRUE(rm.ParseFromArray(real.data(), static_cast<int>(real.size())));
+    rm.set_n(0xFFFFFFFFu);
+    std::vector<std::uint8_t> tampered(rm.ByteSizeLong());
+    ASSERT_TRUE(rm.SerializeToArray(tampered.data(),
+                                    static_cast<int>(tampered.size())));
+    EXPECT_FALSE(p.bob.header_matches_recv_chain(span_of(tampered)));
 }
 
 TEST(Ratchet, BobCannotSendBeforeReceiving) {

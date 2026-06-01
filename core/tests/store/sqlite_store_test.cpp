@@ -5,9 +5,11 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -184,6 +186,68 @@ TEST_F(TmpDb, ChannelInboxOrdering) {
     ASSERT_EQ(rows.size(), 2u);
     EXPECT_EQ(rows[0].timestamp_ms, 200u);
     EXPECT_EQ(rows[1].timestamp_ms, 100u);
+}
+
+// F1 regression: peer_pubkeys_for_username locks the recursive_mutex then
+// calls all_cached_peers (which re-locks it). With a non-recursive mutex
+// this self-deadlocks; this test would hang. It passing proves the lock
+// is recursive as required.
+TEST_F(TmpDb, RecursiveLockDoesNotSelfDeadlock) {
+    auto s = fb::store::SqliteStore::open(path);
+    auto pub = bytes({0xaa});
+    s->cache_peer_name(span_of(pub), "bob");
+    auto pubs = s->peer_pubkeys_for_username("bob");   // re-enters all_cached_peers
+    ASSERT_EQ(pubs.size(), 1u);
+    EXPECT_EQ(pubs[0], std::vector<std::uint8_t>{0xaa});
+}
+
+// F1 regression: concurrent writer (worker-thread role) + reader
+// (UI-thread role) hammering the SAME store. Without the Impl mutex +
+// busy_timeout this races on the table sub-keys / throws SQLITE_BUSY.
+// Run with an at-rest key so rotate_storage_keys exercises the sub-key
+// swap the audit flagged as a torn-read hazard. TSan-clean if the lock
+// covers it.
+TEST_F(TmpDb, ConcurrentWriterReaderIsSafe) {
+    std::array<std::uint8_t, 32> mk{};
+    for (auto& b : mk) b = 0x5a;
+    auto s = fb::store::SqliteStore::open(path,
+        std::span<const std::uint8_t>(mk.data(), mk.size()));
+    auto peer = bytes({0xc0, 0xff, 0xee});
+    // Seed some rows so rotate + reads have content.
+    for (int i = 0; i < 20; ++i) {
+        auto id = bytes({static_cast<std::uint8_t>(i)});
+        auto pt = bytes({static_cast<std::uint8_t>(i), 0x11, 0x22});
+        s->append_inbox(span_of(id), span_of(peer), span_of(pt),
+                        static_cast<std::uint64_t>(1000 + i));
+    }
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> reads{0};
+    // Reader thread: continuously read inbox + rotate-affected tables.
+    std::thread reader([&] {
+        while (!stop.load()) {
+            auto rows = s->recent_inbox(50);
+            // Every row's plaintext must be intact — a torn sub-key read
+            // during a concurrent rotate would corrupt the AEAD decrypt
+            // and either throw or yield wrong bytes.
+            for (const auto& r : rows) {
+                ASSERT_EQ(r.plaintext.size(), 3u);
+                ASSERT_EQ(r.plaintext[1], 0x11);
+                ASSERT_EQ(r.plaintext[2], 0x22);
+            }
+            reads.fetch_add(1);
+        }
+    });
+    // Writer thread: rotate keys repeatedly (the high-risk path).
+    for (int i = 0; i < 25; ++i) {
+        EXPECT_NO_THROW({ (void)s->rotate_storage_keys(); });
+    }
+    stop.store(true);
+    reader.join();
+    EXPECT_GT(reads.load(), 0);
+    // After all the rotations, rows still decrypt correctly.
+    auto final_rows = s->recent_inbox(50);
+    EXPECT_EQ(final_rows.size(), 20u);
 }
 
 TEST_F(TmpDb, PeerNameCache) {

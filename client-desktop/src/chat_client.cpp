@@ -26,6 +26,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cctype>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -599,6 +600,14 @@ struct ChatClient::Impl {
     // Touched by worker only.
     std::optional<fb::crypto::Identity> identity;
     X25519Pair x25519;
+    // F2 (audit): the worker constructs `identity` once, then the Qt main
+    // thread reads it via the MITM accessors (safetyNumberFor /
+    // myIdentityPubkey / myFingerprint). Without a barrier the main thread
+    // can observe a half-constructed std::optional. This atomic provides
+    // the release/acquire edge: the worker stores true (release) AFTER the
+    // assignment; the accessors load (acquire) before dereferencing. Once
+    // true, `identity` is never reassigned, so no further sync is needed.
+    std::atomic<bool> identity_ready{false};
 
     // Tier-7 PQ-hybrid: deterministic ML-KEM-768 keypair derived from the
     // long-term Ed25519 identity seed via HKDF (FinBit-PQ-seed-v1). Same
@@ -1060,6 +1069,10 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             emit log(QString("identity unlocked from vault, store=%1 pq=ML-KEM-768")
                          .arg(QString::fromStdString(impl_->store_path)));
             impl_->x25519 = derive_x25519(*impl_->identity);
+            // F2 (audit): publish the identity to the main thread with a
+            // release barrier — pairs with the acquire load in the MITM
+            // accessors so they never observe a half-constructed optional.
+            impl_->identity_ready.store(true, std::memory_order_release);
 
             emit connected(QString::fromStdString(impl_->identity->fingerprint()));
 
@@ -1496,21 +1509,67 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 //     onion address (a different onion is a different keypair
                 //     → a different relay → a different ratchet partner).
                 {
-                    const std::string h = impl_->host.toStdString();
-                    if (h.size() >= 6 &&
-                        h.compare(h.size() - 6, 6, ".onion") == 0) {
+                    // F3 (audit): lowercase the host before the suffix
+                    // compare. DNS / onion names are case-insensitive, but a
+                    // byte-exact ".onion" compare would miss "Foo.ONION" and
+                    // then attempt a DIRECT DNS resolution of the onion name
+                    // — leaking the hidden-service address to the local
+                    // resolver / ISP (deanonymization). Lowercasing closes
+                    // that leak.
+                    std::string h = impl_->host.toStdString();
+                    for (auto& c : h) {
+                        c = static_cast<char>(std::tolower(
+                            static_cast<unsigned char>(c)));
+                    }
+                    const bool ends_onion =
+                        h.size() >= 6 && h.compare(h.size() - 6, 6, ".onion") == 0;
+                    // Validate the onion label length: v3 = 56 base32 chars,
+                    // v2 (deprecated) = 16. "<label>.onion" must be 22 or 62
+                    // chars total. Reject malformed onion hosts (e.g.
+                    // "x.onion") so a bogus suffix can't trigger the
+                    // skip-verify path below.
+                    const bool valid_onion = ends_onion &&
+                        (h.size() == 62 || h.size() == 22);
+                    if (ends_onion && !valid_onion) {
+                        emit log(QString(
+                            "host ends in .onion but the label length is "
+                            "invalid (expected 56-char v3 or 16-char v2) — "
+                            "refusing to special-case it"));
+                    }
+                    if (valid_onion) {
                         if (impl_->socks5_proxy.empty()) {
                             impl_->socks5_proxy = "127.0.0.1:9050";
                             emit log(QString(
                                 ".onion host detected — forcing SOCKS5 proxy "
                                 "127.0.0.1:9050 (start Tor if not running)"));
                         }
-                        if (!impl_->tls_insecure_skip_verify) {
-                            impl_->tls_insecure_skip_verify = true;
+                        // F3 (audit): only disable cert validation when the
+                        // SOCKS proxy is genuinely loopback Tor. If the user
+                        // overrode FB_SOCKS to a NON-loopback proxy, we can't
+                        // assume it's Tor — keep cert validation on rather
+                        // than hand an attacker-chosen proxy a skip-verify
+                        // downgrade. (E2E AEAD still protects content either
+                        // way; this is about not blindly trusting an
+                        // unverified transport endpoint.)
+                        const auto& px = impl_->socks5_proxy;
+                        const bool loopback_tor =
+                            px.rfind("127.0.0.1:", 0) == 0 ||
+                            px.rfind("localhost:", 0) == 0 ||
+                            px.rfind("::1:", 0) == 0;
+                        if (loopback_tor) {
+                            if (!impl_->tls_insecure_skip_verify) {
+                                impl_->tls_insecure_skip_verify = true;
+                                emit log(QString(
+                                    ".onion host — TLS chain validation disabled "
+                                    "(onion address IS the identity; E2E still "
+                                    "binds to it)"));
+                            }
+                        } else {
                             emit log(QString(
-                                ".onion host — TLS chain validation disabled "
-                                "(onion address IS the identity; E2E still "
-                                "binds to it)"));
+                                ".onion host but SOCKS proxy '%1' is not "
+                                "loopback Tor — keeping TLS cert validation ON "
+                                "(won't trust an unverified proxy as Tor)")
+                                    .arg(QString::fromStdString(px)));
                         }
                     }
                 }
@@ -2376,24 +2435,36 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                         reinterpret_cast<const std::uint8_t*>(
                                             env.aad().data()),
                                         env.aad().size());
-                                for (auto& [_sname, s] : impl_->sessions) {
-                                    if (!s.rat) continue;
+                                // H1 (audit): cap the work an unauthenticated
+                                // sealed envelope can force. try_decrypt
+                                // derives up to kMaxSkip message keys BEFORE
+                                // the MAC check, so a naive "try every
+                                // session" is an O(N·kMaxSkip) DoS. Pass 1
+                                // attempts only sessions whose ratchet header
+                                // DH matches the envelope (cheap O(1) parse,
+                                // no key derivation) — the common case. Pass
+                                // 2 is the fallback for the rare
+                                // just-DH-ratcheted message; header_matches_
+                                // recv_chain already rejected absurd skip
+                                // distances, so even the fallback can't be
+                                // amplified beyond one bounded try per session.
+                                auto try_session = [&](Impl::Session& s) -> bool {
                                     auto attempt = s.rat->try_decrypt(
                                         env_ct_span, env_aad_span);
-                                    if (!attempt) continue;
+                                    if (!attempt) return false;
                                     fb::proto::DmPayload dmp;
                                     if (!dmp.ParseFromArray(attempt->data(),
                                             static_cast<int>(attempt->size()))) {
-                                        continue;
+                                        return false;
                                     }
                                     if (dmp.sealed_sender_pubkey().size() != 32 ||
                                         dmp.sealed_sender_sig().size() != 64) {
-                                        continue;
+                                        return false;
                                     }
                                     if (0 != std::memcmp(
                                             dmp.sealed_sender_pubkey().data(),
                                             s.peer_pub.data(), 32)) {
-                                        continue;
+                                        return false;
                                     }
                                     if (!fb::handshake::verify_sealed_sender(
                                             std::span<const std::uint8_t,
@@ -2405,13 +2476,34 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                                 reinterpret_cast<const std::uint8_t*>(
                                                     dmp.sealed_sender_sig().data()), 64),
                                             env_id_span, env.timestamp_ms())) {
-                                        continue;
+                                        return false;
                                     }
                                     sender_pub_bytes.assign(
                                         reinterpret_cast<const char*>(s.peer_pub.data()),
                                         s.peer_pub.size());
                                     sealed_pt = std::move(*attempt);
-                                    break;
+                                    return true;
+                                };
+                                // Pass 1: header-matched sessions only.
+                                for (auto& [_sname, s] : impl_->sessions) {
+                                    if (!s.rat) continue;
+                                    if (!s.rat->header_matches_recv_chain(env_ct_span)) {
+                                        continue;
+                                    }
+                                    if (try_session(s)) break;
+                                }
+                                // Pass 2: fallback for a just-DH-ratcheted
+                                // message whose header didn't match the
+                                // cached recv-DH. Only sessions NOT already
+                                // header-matched, still bounded per attempt.
+                                if (sender_pub_bytes.empty()) {
+                                    for (auto& [_sname, s] : impl_->sessions) {
+                                        if (!s.rat) continue;
+                                        if (s.rat->header_matches_recv_chain(env_ct_span)) {
+                                            continue;   // already tried in pass 1
+                                        }
+                                        if (try_session(s)) break;
+                                    }
                                 }
                                 if (sender_pub_bytes.empty()) {
                                     emit log("sealed-sender envelope: no "
@@ -2696,10 +2788,18 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 if (cached) {
                                     cached_username = QString::fromStdString(*cached);
                                 } else {
+                                    // M1 (audit): query by the RESOLVED sender
+                                    // pubkey (peer_pub_arr), not env.sender_
+                                    // pubkey() — the latter is EMPTY on a
+                                    // sealed-sender envelope, so this lookup
+                                    // would otherwise send an empty pubkey and
+                                    // never resolve the username for sealed DMs.
                                     fb::proto::Frame qf;
                                     qf.mutable_username_lookup()->set_pubkey(
-                                        std::string(env.sender_pubkey().begin(),
-                                                    env.sender_pubkey().end()));
+                                        std::string(
+                                            reinterpret_cast<const char*>(
+                                                peer_pub_arr.data()),
+                                            peer_pub_arr.size()));
                                     blocking_send(impl_->conn, serialize(qf));
                                 }
                             }
@@ -3584,12 +3684,32 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             impl_->last_cover_send = std::chrono::steady_clock::now();
             impl_->last_prune      = std::chrono::steady_clock::now();
             impl_->last_rotate     = std::chrono::steady_clock::now();
-            if (const char* p = std::getenv("FB_PRUNE_INTERVAL_S"); p && *p) {
-                impl_->prune_interval_s = std::strtoull(p, nullptr, 10);
-            }
-            if (const char* r = std::getenv("FB_ROTATE_INTERVAL_S"); r && *r) {
-                impl_->rotate_interval_s = std::strtoull(r, nullptr, 10);
-            }
+            // F4 (audit): validate the interval env vars instead of a bare
+            // strtoull, which returns 0 on garbage ("6O" with a letter O →
+            // 0 → feature silently disabled) and wraps on "-1". A typo
+            // silently turning OFF prune/rotate is a quiet forward-secrecy
+            // regression. Mirror the cover-traffic parse: require a fully-
+            // consumed, positive, sane value, else keep the default + warn.
+            auto parse_interval = [&](const char* env, const char* name,
+                                       std::uint64_t& dst) {
+                const char* v = std::getenv(env);
+                if (!v || !*v) return;
+                char* end = nullptr;
+                const auto n = std::strtoull(v, &end, 10);
+                constexpr std::uint64_t kSaneMax = 365ULL * 24 * 3600;  // 1y
+                if (end != v && *end == '\0' && n > 0 && n <= kSaneMax) {
+                    dst = n;
+                } else {
+                    emit log(QString("ignoring invalid %1=\"%2\" — keeping "
+                                      "default %3s")
+                                 .arg(name).arg(v)
+                                 .arg(static_cast<qulonglong>(dst)));
+                }
+            };
+            parse_interval("FB_PRUNE_INTERVAL_S",  "FB_PRUNE_INTERVAL_S",
+                            impl_->prune_interval_s);
+            parse_interval("FB_ROTATE_INTERVAL_S", "FB_ROTATE_INTERVAL_S",
+                            impl_->rotate_interval_s);
             while (impl_->running) {
                 // 0. Tier-11 forward-secret local storage: prune any inbox /
                 //    outbox rows whose sender-set TTL has passed. Cheap when
@@ -6232,7 +6352,12 @@ std::vector<ChatClient::HistoryEntry> ChatClient::load_recent_history(std::size_
 // ---- Tier-11 MITM verification ---------------------------------------------
 
 QString ChatClient::safetyNumberFor(const QByteArray& peerPub) const {
-    if (!impl_->identity || peerPub.size() != 32) {
+    // F2 (audit): acquire-load the readiness flag set by the worker after
+    // it constructed `identity`; until then, treat as not-ready (the UI
+    // should only call this after connected() fires, but this is the
+    // memory-safe guard regardless of ordering).
+    if (!impl_->identity_ready.load(std::memory_order_acquire) ||
+        !impl_->identity || peerPub.size() != 32) {
         return {};
     }
     fb::crypto::PubKey peer{};
@@ -6284,14 +6409,16 @@ void ChatClient::setPeerVerified(const QByteArray& peerPub, bool verified) {
 }
 
 QByteArray ChatClient::myIdentityPubkey() const {
-    if (!impl_->identity) return {};
+    if (!impl_->identity_ready.load(std::memory_order_acquire) ||
+        !impl_->identity) return {};
     const auto& pub = impl_->identity->public_key();
     return QByteArray(reinterpret_cast<const char*>(pub.data()),
                        static_cast<int>(pub.size()));
 }
 
 QString ChatClient::myFingerprint() const {
-    if (!impl_->identity) return {};
+    if (!impl_->identity_ready.load(std::memory_order_acquire) ||
+        !impl_->identity) return {};
     return QString::fromStdString(impl_->identity->fingerprint());
 }
 

@@ -107,13 +107,17 @@ struct DoubleRatchet::State {
     // ordering keeps eviction simple. Total cap kMaxSkip across all entries.
     std::map<std::pair<Bytes32, std::uint32_t>, Bytes32> skipped;
 
-    // Wipe every byte that could be live key material on destruction:
-    // dhs_priv (our DH private key), rk (root key), cks/ckr (chain keys),
-    // and every cached skipped message key. Without this, a freed State
-    // page sits in the allocator with the keys still readable until the
-    // page is reused. Caught by the security validation pass — defaulted
-    // ~State left these unwiped.
-    ~State() {
+    // Wipe every byte that could be live key material: dhs_priv (our DH
+    // private key), rk (root key), cks/ckr (chain keys), and every cached
+    // skipped message key. Without this, a freed State page sits in the
+    // allocator with the keys still readable until the page is reused.
+    // Caught by the security validation pass — defaulted ~State left
+    // these unwiped. Factored out of ~State so try_decrypt can zero a
+    // MUTATED state before rolling it back (the std::map reassignment in
+    // copy-assign destroys nodes with the trivial Bytes32 dtor, which
+    // does NOT zero — so a failed decrypt would otherwise leak the
+    // message keys decrypt() derived before the MAC check).
+    void secure_wipe() {
         sodium_memzero(dhs_priv.data(), dhs_priv.size());
         sodium_memzero(rk.data(),       rk.size());
         sodium_memzero(cks.data(),      cks.size());
@@ -124,6 +128,7 @@ struct DoubleRatchet::State {
             sodium_memzero(mk.data(), mk.size());
         }
     }
+    ~State() { secure_wipe(); }
 };
 
 DoubleRatchet::DoubleRatchet() : state_(std::make_unique<State>()) {}
@@ -361,12 +366,50 @@ std::optional<std::vector<std::uint8_t>> DoubleRatchet::try_decrypt(
     // what it was before the call. On success, state_ reflects exactly
     // what decrypt() would have produced. Either way, the caller can
     // call try_decrypt again — or fall back to decrypt — safely.
+    //
+    // KEY HYGIENE: State has a user-declared destructor, so it has no
+    // implicit move operations — the assignment below is a deep COPY,
+    // and the std::map reassignment destroys the mutated state's nodes
+    // with the trivial Bytes32 destructor (NOT sodium_memzero). On a
+    // failed decrypt, *state_ may hold up to kMaxSkip message keys that
+    // decrypt() derived before the MAC check; we must zero them BEFORE
+    // the copy-assign overwrites the map, or they leak into freed heap.
     State snapshot = *state_;
     auto pt = decrypt(ratchet_msg, outer_aad);
     if (!pt) {
-        *state_ = std::move(snapshot);
+        state_->secure_wipe();   // zero keys decrypt() may have derived
+        *state_ = snapshot;      // restore the pre-attempt state (deep copy)
     }
     return pt;
+}
+
+bool DoubleRatchet::header_matches_recv_chain(
+    std::span<const std::uint8_t> ratchet_msg) const noexcept {
+    fb::proto::RatchetMessage msg;
+    if (!msg.ParseFromArray(ratchet_msg.data(),
+                            static_cast<int>(ratchet_msg.size()))) {
+        return false;
+    }
+    if (msg.header_dh_pub().size() != k32) return false;
+
+    const auto& s = *state_;
+    // Only meaningful once we have a receive chain established.
+    if (!s.have_dhr || !s.have_ckr) return false;
+
+    // DoS guard: reject absurd skip distances WITHOUT deriving any key.
+    // A genuine in-order/small-skip message has n within kMaxSkip of our
+    // current receive counter; an attacker-crafted n = 2^32-1 is rejected
+    // here. (pn matters only on a DH-ratchet, which is the fallback path.)
+    if (msg.n() > s.nr &&
+        static_cast<std::uint64_t>(msg.n()) - s.nr > kMaxSkip) {
+        return false;
+    }
+
+    // The cheap positive signal: this message's header DH equals the peer
+    // DH key of our CURRENT receive chain. True for every in-order and
+    // small-skip message on this session; a mismatch means it belongs to
+    // a different session (or a DH-ratcheted state handled by fallback).
+    return std::memcmp(msg.header_dh_pub().data(), s.dhr_pub.data(), k32) == 0;
 }
 
 }  // namespace fb::crypto

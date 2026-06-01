@@ -179,6 +179,11 @@ void ShamirSetupWizard::onUnlockClicked() {
     }
     seed_ = *opened;
     seed_loaded_ = true;
+    // F6 (audit): wipe the seed bytes out of the `opened` optional now that
+    // they've been copied into seed_ (which the destructor zeroizes). The
+    // optional's payload is an in-line std::array, so this touches the real
+    // backing store, not a moved-from heap allocation.
+    sodium_memzero(opened->data(), opened->size());
     passphrase_input_->clear();   // don't leave the bytes on the widget
     pages_->setCurrentIndex(kPageDistribute);
     onSelectionChanged();   // refresh threshold summary
@@ -227,14 +232,26 @@ void ShamirSetupWizard::onDistributeClicked() {
     const QString label = label_input_->text();
     int sent = 0;
     for (int i = 0; i < picked.size(); ++i) {
-        const auto wire = fb::crypto::shamir::encode_share(shares[static_cast<std::size_t>(i)]);
+        auto wire = fb::crypto::shamir::encode_share(shares[static_cast<std::size_t>(i)]);
         QByteArray share_qb(reinterpret_cast<const char*>(wire.data()),
                              static_cast<int>(wire.size()));
         client_->sendShamirShareTo(picked[i]->text(), share_qb, setup_id,
                                     static_cast<quint32>(threshold),
                                     static_cast<quint32>(total),
                                     label);
+        // F6 (audit): each share is seed-derived secret material. Wipe the
+        // local copies now that sendShamirShareTo has queued its own copy
+        // (which the ratchet seals under the peer's session). QByteArray
+        // doesn't zeroize on free, so do it explicitly.
+        sodium_memzero(share_qb.data(), static_cast<std::size_t>(share_qb.size()));
+        sodium_memzero(wire.data(), wire.size());
         ++sent;
+    }
+
+    // F6 (audit): wipe the in-memory Share polynomial evaluations too —
+    // each share's y-bytes are derived from the secret.
+    for (auto& sh : shares) {
+        sodium_memzero(sh.y.data(), sh.y.size());
     }
 
     // Wipe the seed from our memory as soon as we've handed off the
