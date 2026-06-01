@@ -418,6 +418,8 @@ MainWindow::MainWindow(QWidget* parent)
     QObject::connect(client_.get(), &ChatClient::log, this, &MainWindow::appendLog);
     QObject::connect(client_.get(), &ChatClient::peerPubkeyChanged, this,
                      &MainWindow::onPeerPubkeyChanged);
+    QObject::connect(client_.get(), &ChatClient::peerPqDowngrade, this,
+                     &MainWindow::onPeerPqDowngrade);
     QObject::connect(client_.get(), &ChatClient::messageReceived, this,
                      &MainWindow::appendIncoming);
     QObject::connect(client_.get(), &ChatClient::imageReceived, this,
@@ -1318,6 +1320,24 @@ void MainWindow::onPeerPubkeyChanged(const QString& peerLabel,
            "(in person, voice call) BEFORE sending anything sensitive.\n\n"
            "Their previous verification status has been cleared.")
             .arg(peerLabel));
+}
+
+void MainWindow::onPeerPqDowngrade(const QString& peerLabel,
+                                   const QString& fingerprint) {
+    // Tier-11 PQ TOFU. chat_client refused to open a session because a peer
+    // we had previously seen advertise post-quantum support handed us a
+    // bundle with all PQ fields stripped — the signature of a relay/MITM
+    // forcing a silent fall-back to classical-only X25519 (which a future
+    // quantum computer could break against today's recorded traffic).
+    QMessageBox::warning(this, tr("Post-quantum downgrade blocked"),
+        tr("\"%1\" was previously post-quantum-capable, but the key bundle "
+           "just received for them has had all post-quantum fields removed.\n\n"
+           "FinBit REFUSED to open the session rather than silently fall back "
+           "to classical-only encryption — this is what a network attacker "
+           "stripping post-quantum protection would look like. Re-verify the "
+           "peer's identity (fingerprint %2) over a channel you trust before "
+           "retrying.")
+            .arg(peerLabel, fingerprint));
 }
 
 void MainWindow::onChannelCallRoster(const QString& channel,

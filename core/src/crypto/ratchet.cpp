@@ -309,16 +309,22 @@ std::optional<std::vector<std::uint8_t>> DoubleRatchet::decrypt(
     {
         auto it = s.skipped.find(std::make_pair(header_dh, msg.n()));
         if (it != s.skipped.end()) {
-            const auto mk = it->second;
-            s.skipped.erase(it);
             AeadKey key{};
-            std::memcpy(key.data(), mk.data(), key.size());
+            std::memcpy(key.data(), it->second.data(), key.size());
             XChaChaNonce nonce{};
             auto aad = compose_aad(header_dh, msg.pn(), msg.n(), outer_aad);
             auto ct = std::span<const std::uint8_t>(
                 reinterpret_cast<const std::uint8_t*>(msg.ciphertext().data()),
                 msg.ciphertext().size());
-            return xchacha20_decrypt(key, nonce, ct, aad);
+            auto pt = xchacha20_decrypt(key, nonce, ct, aad);
+            // L1 (audit): consume the one-time skipped key ONLY after the
+            // AEAD tag verifies. Erasing before decrypt would permanently
+            // drop the key for a direct decrypt() caller fed a corrupted or
+            // forged ciphertext, destroying the ability to ever decrypt the
+            // genuine out-of-order message this key was saved for. (`it`
+            // stays valid — the map isn't mutated across the decrypt.)
+            if (pt) s.skipped.erase(it);
+            return pt;
         }
     }
 

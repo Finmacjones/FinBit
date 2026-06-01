@@ -17,6 +17,7 @@
 #endif
 
 #include <QMetaObject>
+#include <QPointer>
 #include <QString>
 #include <algorithm>
 #include <array>
@@ -43,6 +44,7 @@
 #include "fb/config/build_config.hpp"
 #include "fb/crypto/hkdf.hpp"
 #include "fb/crypto/identity.hpp"
+#include "fb/crypto/padding.hpp"
 #include "fb/crypto/pq_kem.hpp"
 #include "fb/crypto/ratchet.hpp"
 #include "fb/crypto/sender_keys.hpp"
@@ -332,6 +334,20 @@ void detect_pubkey_change(ChatClient* self, ::fb::store::SqliteStore* store,
                           const std::string& username,
                           std::span<const std::uint8_t, 32> new_pub);
 
+// Tier-11 PQ TOFU: enforce the per-peer PQ-capability pin at each
+// bundle/record-consume site. `peer_pub` is the peer's identity Ed25519,
+// `peer_label` feeds the warning signal, `now_advertises_pq` is whether the
+// fetched bundle/record carries an ML-KEM pubkey. Returns true to admit the
+// session; returns false (and emits peerPqDowngrade) when the peer was
+// previously pinned PQ-capable but this bundle has no PQ — a strip-downgrade
+// (the full-field-strip case verify_bundle_pq_sigs structurally cannot see).
+// On admit it pins capability the first time PQ is advertised. Impl near
+// detect_pubkey_change at the bottom of this TU.
+[[nodiscard]] bool pq_tofu_admit(ChatClient* self, ::fb::store::SqliteStore* store,
+                                 std::span<const std::uint8_t, 32> peer_pub,
+                                 const std::string& peer_label,
+                                 bool now_advertises_pq);
+
 // Tier-11 Shamir helpers — pack ShamirSharePush / ShamirShareRequest into a
 // DmPayload. Both ride the same Double Ratchet path; the trustee's chat_client
 // persists incoming pushes to shamir_held_shares.
@@ -387,22 +403,27 @@ QString peer_label_for(std::span<const std::uint8_t> pub) {
 
 // Sealed-sender wrapper: parses an already-serialized DmPayload, fills in
 // sealed_sender_pubkey + sealed_sender_sig, re-serializes. The signature
-// covers (envelope_id || timestamp_ms_be) — the same outer AAD bound by
-// the AEAD — so an envelope can't be replayed under a different id or
-// time without breaking BOTH the seal and the AEAD tag at once. Used by
-// every chat_client send site once a session is "pq_acked" (the peer has
-// proven they can decrypt by replying); the corresponding Envelope must
-// SET sender_pubkey EMPTY so the relay learns nothing about who sent it.
+// covers ("FinBit-SealedSender-v1" || envelope_id || timestamp_ms_be ||
+// recipient_pubkey) — domain-separated (audit M2) so it can't be confused
+// with any other identity-key sig; the envelope_id||timestamp portion is
+// the same outer AAD the AEAD binds (no replay under a different id/time);
+// and recipient_pubkey (the destination peer's identity key) binds the seal
+// to its recipient. Used by every chat_client send site once a session's
+// `seal_outbound` is set (audit L2 — the peer has a working reverse session
+// so it can try-all to attribute us); the corresponding Envelope must SET
+// sender_pubkey EMPTY so the relay learns nothing.
 std::vector<std::uint8_t> seal_dm_payload(
     std::vector<std::uint8_t> dm_bytes,
     const fb::crypto::Identity& id,
     std::span<const std::uint8_t> envelope_id,
-    std::uint64_t timestamp_ms) {
+    std::uint64_t timestamp_ms,
+    std::span<const std::uint8_t> recipient_pubkey) {
     fb::proto::DmPayload dmp;
     if (!dmp.ParseFromArray(dm_bytes.data(), static_cast<int>(dm_bytes.size()))) {
         return dm_bytes;
     }
-    auto seal = fb::handshake::make_sealed_sender_fields(id, envelope_id, timestamp_ms);
+    auto seal = fb::handshake::make_sealed_sender_fields(
+        id, envelope_id, timestamp_ms, recipient_pubkey);
     dmp.set_sealed_sender_pubkey(std::string(
         reinterpret_cast<const char*>(seal.pubkey.data()), seal.pubkey.size()));
     dmp.set_sealed_sender_sig(std::string(
@@ -770,10 +791,26 @@ struct ChatClient::Impl {
         // For Bob-initialized sessions this stays empty (the recv path
         // reads pq_ct from the envelope directly).
         std::vector<std::uint8_t> pq_ct;
-        // Cleared after we receive the first inbound envelope from this
-        // peer — proves their ratchet bootstrapped on the hybrid root, so
-        // subsequent pq_ct shipments are redundant. Bandwidth opt (Item 2).
+        // BANDWIDTH role only (audit L2 — decoupled from sealing below).
+        // Set once we receive the first inbound envelope from this peer —
+        // proves their ratchet bootstrapped on the hybrid root, so subsequent
+        // pq_ct shipments are redundant; we drop the 1088B overhead. Bandwidth
+        // opt (Item 2). NOTHING about metadata privacy keys off this flag.
         bool pq_acked = false;
+        // SEALING role (audit L2 — split out of the overloaded pq_acked).
+        // True ⇒ safe to send sealed (omit our sender_pubkey from the
+        // Envelope). The precondition for sealing is that the peer can still
+        // ATTRIBUTE the message: they must have an established reverse session
+        // to try-all our ciphertext against. We learn that two ways:
+        //   (a) we successfully decrypted an inbound from them — round-trip
+        //       proof they have a working session keyed to us (set alongside
+        //       pq_acked, but for this distinct reason); and
+        //   (b) we observed a VERIFIED SEALED inbound from them — definitive
+        //       proof their client both produces and parses sealed sender.
+        // Keeping this separate from pq_acked means the bandwidth opt and the
+        // privacy gate can evolve independently and neither silently changes
+        // the other (the conflation the audit flagged).
+        bool seal_outbound = false;
         // Cached peer pq_pubkey (1184 B ML-KEM-768) from the bundle that
         // bootstrapped this session. Used by SFrame setup (Item 1) so
         // start_call_to_pub can encap against it without re-fetching the
@@ -2475,12 +2512,20 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                                       fb::crypto::kIdentitySigBytes>(
                                                 reinterpret_cast<const std::uint8_t*>(
                                                     dmp.sealed_sender_sig().data()), 64),
-                                            env_id_span, env.timestamp_ms())) {
+                                            env_id_span, env.timestamp_ms(),
+                                            std::span<const std::uint8_t>(
+                                                impl_->identity->public_key().data(),
+                                                impl_->identity->public_key().size()))) {
                                         return false;
                                     }
                                     sender_pub_bytes.assign(
                                         reinterpret_cast<const char*>(s.peer_pub.data()),
                                         s.peer_pub.size());
+                                    // Sealing gate (audit L2): a verified sealed
+                                    // inbound is definitive proof this peer both
+                                    // produces and parses sealed sender — latch
+                                    // the privacy gate so our replies seal too.
+                                    s.seal_outbound = true;
                                     sealed_pt = std::move(*attempt);
                                     return true;
                                 };
@@ -2760,6 +2805,13 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 sess.pq_ct.clear();
                                 sess.pq_ct.shrink_to_fit();
                             }
+                            // Sealing gate (audit L2): a decryptable inbound is
+                            // also round-trip proof the peer has a working
+                            // reverse session and can try-all to attribute a
+                            // sealed envelope from us — so it's now safe to omit
+                            // our sender_pubkey. Distinct reason from the
+                            // bandwidth flag above; tracked separately.
+                            sess.seal_outbound = true;
                             fb::crypto::PubKey peer_pub_arr{};
                             std::memcpy(peer_pub_arr.data(), sender_pub_bytes.data(), 32);
                             const QString peer_fp = QString::fromStdString(
@@ -3765,33 +3817,64 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 //     learns a surprising amount from message timing alone —
                 //     even with E2E + Tor, "Alice sent something at
                 //     12:03:17.42" is a powerful inference. A constant-rate
-                //     padded heartbeat hides REAL traffic in a stream of
-                //     identical-looking writes. We send a Frame.control with
-                //     code=OK and a 256-byte padded detail; the relay
-                //     gracefully ignores client-issued OKs. Encrypted at
-                //     WSS+TLS so the observer sees only ~280 bytes of
-                //     unintelligible bytes on a fixed schedule.
+                //     heartbeat whose framed size is drawn from the SAME
+                //     bucket ladder real messages use hides real traffic in a
+                //     stream of size-indistinguishable writes. We send a
+                //     Frame.control with code=OK and a bucket-padded detail;
+                //     the relay gracefully ignores client-issued OKs.
                 if (impl_->cover_interval_s > 0) {
                     const auto now = std::chrono::steady_clock::now();
                     if (now - impl_->last_cover_send >=
                             std::chrono::seconds(impl_->cover_interval_s)) {
-                        try {
+                        // F8 (audit): cover traffic is ONLY plausible over an
+                        // encrypted transport. On a cleartext TCP relay the
+                        // observer sees an unmistakable Frame.control(OK) with
+                        // a high-entropy detail on a fixed schedule — that is
+                        // a cover-traffic BEACON, worse than silence, and it
+                        // also leaks the padding ladder. Refuse to emit it
+                        // unless the link is TLS or WSS; warn once.
+                        if (!impl_->use_tls && !impl_->use_wss) {
+                            static bool warned_cover_cleartext = false;
+                            if (!warned_cover_cleartext) {
+                                warned_cover_cleartext = true;
+                                emit log("cover traffic disabled: transport is "
+                                         "not TLS/WSS (would beacon in cleartext)");
+                            }
+                            impl_->last_cover_send = now;
+                        } else {
+                          try {
                             fb::proto::Frame f;
                             auto* ctl = f.mutable_control();
                             ctl->set_code(fb::proto::ControlMessage::OK);
-                            // Pad detail to the smallest bucket (256B). Use
-                            // pseudorandom bytes so two heartbeats aren't
-                            // bytewise-identical (defeats trivial pattern-
-                            // match deduplication by a relay or observer).
-                            std::string padding(240, '\0');
-                            randombytes_buf(padding.data(), padding.size());
-                            ctl->set_detail(std::move(padding));
+                            // Draw the framed size from the real padding ladder
+                            // so a heartbeat is size-indistinguishable from a
+                            // genuine padded message. Pick randomly among the
+                            // smaller buckets (the bulk of real chat traffic);
+                            // pad random filler so the detail lands EXACTLY on
+                            // the chosen bucket. TLS encrypts the content, so
+                            // only the size — now ladder-aligned — is visible.
+                            auto buckets = fb::crypto::default_padding_buckets();
+                            const std::size_t nchoices =
+                                std::min<std::size_t>(buckets.size(), 2);
+                            const std::size_t target =
+                                buckets[randombytes_uniform(
+                                    static_cast<std::uint32_t>(nchoices))];
+                            std::vector<std::uint8_t> filler(target - 1);
+                            randombytes_buf(filler.data(), filler.size());
+                            auto padded = fb::crypto::pad_to_bucket(
+                                std::span<const std::uint8_t>(
+                                    filler.data(), filler.size()),
+                                buckets);
+                            ctl->set_detail(std::string(
+                                reinterpret_cast<const char*>(padded.data()),
+                                padded.size()));
                             blocking_send(impl_->conn, serialize(f));
-                        } catch (const std::exception&) {
+                          } catch (const std::exception&) {
                             // Send failures are non-fatal; the main loop
                             // will catch a dead connection on the next read.
+                          }
+                          impl_->last_cover_send = now;
                         }
-                        impl_->last_cover_send = now;
                     }
                 }
                 // 0z. Drain the first-contact parking lot (P).
@@ -3841,6 +3924,55 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             // session via init_alice using bob's
                             // SPK from the DHT, encrypt, ship.
                             try {
+                                // Tier-11 PQ TOFU: a peer pinned PQ-capable
+                                // whose DHT record now carries no ML-KEM
+                                // pubkey is a strip-downgrade. Refuse the
+                                // direct path and fall back to the server
+                                // fetch (which TOFU-checks the server bundle
+                                // too) rather than establish a classical-only
+                                // session here.
+                                if (!pq_tofu_admit(
+                                        this, impl_->store.get(),
+                                        std::span<const std::uint8_t, 32>(
+                                            p.peer_pub.data(), 32),
+                                        p.send.peer,
+                                        !pkey_rec_opt->pq_pubkey().empty())) {
+                                    emit log(QString("PQ downgrade blocked for "
+                                                     "%1 on DHT path — falling "
+                                                     "back to server "
+                                                     "(possible MITM)")
+                                                 .arg(QString::fromStdString(
+                                                     p.send.peer)));
+                                    std::lock_guard lk(impl_->mu);
+                                    impl_->queue.push_front(std::move(p.send));
+                                    continue;
+                                }
+                                // Audit L3: never re-key over a live session.
+                                // If any session for this peer already has a
+                                // ratchet (e.g. a reactive init_bob from an
+                                // inbound that raced this first-contact path),
+                                // reuse it. A second init_alice here would
+                                // clobber the working ratchet AND inherit its
+                                // stale pq_acked / seal_outbound, so the peer
+                                // would stop getting pq_ct and we'd seal before
+                                // the new chain is acked.
+                                bool dht_reused = false;
+                                for (const auto& [_n, es] : impl_->sessions) {
+                                    if (es.rat && es.peer_pub == p.peer_pub) {
+                                        dht_reused = true;
+                                        break;
+                                    }
+                                }
+                                if (dht_reused) {
+                                    emit log(QString("reusing existing session "
+                                                     "for %1 (DHT first-contact "
+                                                     "raced an inbound)")
+                                                 .arg(QString::fromStdString(
+                                                     p.send.peer)));
+                                    std::lock_guard lk(impl_->mu);
+                                    impl_->queue.push_front(std::move(p.send));
+                                    continue;
+                                }
                                 std::array<std::uint8_t, 32> peer_x{};
                                 std::memcpy(peer_x.data(),
                                     pkey_rec_opt->signed_prekey().data(),
@@ -3887,6 +4019,13 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                         std::span<const std::uint8_t, 32>(
                                             peer_x.data(), 32)));
                                 sess.initialized_as_alice = true;
+                                // Audit L3: a freshly keyed session starts with
+                                // clean derived state — the new ratchet isn't
+                                // acked, so keep sending pq_ct (just set above)
+                                // and don't seal until the peer establishes the
+                                // reverse chain.
+                                sess.pq_acked = false;
+                                sess.seal_outbound = false;
                                 emit log(QString("first-contact direct "
                                                   "init_alice for %1 "
                                                   "(server skipped)")
@@ -4633,11 +4772,14 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         const auto env_aad = envelope_aad_bytes(
                             std::span<const std::uint8_t>(envid.data(), envid.size()),
                             now_ms);
-                        const bool _sealed = peer_sess.pq_acked;
+                        const bool _sealed = peer_sess.seal_outbound;
                         if (_sealed) {
                             pt = seal_dm_payload(std::move(pt), *impl_->identity,
                                 std::span<const std::uint8_t>(envid.data(), envid.size()),
-                                now_ms);
+                                now_ms,
+                                std::span<const std::uint8_t>(
+                                    peer_sess.peer_pub.data(),
+                                    peer_sess.peer_pub.size()));
                         }
                         auto inner = peer_sess.rat->encrypt(
                             std::span<const std::uint8_t>(pt.data(), pt.size()),
@@ -4747,11 +4889,13 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                         const auto env_aad = envelope_aad_bytes(
                             std::span<const std::uint8_t>(envid.data(), envid.size()),
                             now_ms);
-                        const bool _sealed = sess->pq_acked;
+                        const bool _sealed = sess->seal_outbound;
                         if (_sealed) {
                             pt = seal_dm_payload(std::move(pt), *impl_->identity,
                                 std::span<const std::uint8_t>(envid.data(), envid.size()),
-                                now_ms);
+                                now_ms,
+                                std::span<const std::uint8_t>(
+                                    sess->peer_pub.data(), sess->peer_pub.size()));
                         }
                         auto inner = sess->rat->encrypt(
                             std::span<const std::uint8_t>(pt.data(), pt.size()),
@@ -4892,13 +5036,16 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                 auto outer_aad = envelope_aad_bytes(
                                     std::span<const std::uint8_t>(
                                         envid.data(), envid.size()), ts);
-                                const bool _sealed = sess_direct.pq_acked;
+                                const bool _sealed = sess_direct.seal_outbound;
                                 if (_sealed) {
                                     inner = seal_dm_payload(std::move(inner),
                                         *impl_->identity,
                                         std::span<const std::uint8_t>(
                                             envid.data(), envid.size()),
-                                        ts);
+                                        ts,
+                                        std::span<const std::uint8_t>(
+                                            sess_direct.peer_pub.data(),
+                                            sess_direct.peer_pub.size()));
                                 }
                                 auto ct = sess_direct.rat->encrypt(
                                     std::span<const std::uint8_t>(
@@ -5182,20 +5329,24 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     const auto env_aad = envelope_aad_bytes(
                         std::span<const std::uint8_t>(envid.data(), envid.size()),
                         now_ms);
-                    // Sealed sender: once the peer has acked our session
-                    // (sess.pq_acked, set when their first reply decrypted
-                    // under our ratchet), wrap the DmPayload with our
-                    // sealed_sender_pubkey + sig and OMIT
-                    // Envelope.sender_pubkey on the wire. Pre-ack sends
-                    // fall back to the legacy plaintext sender_pubkey so
-                    // first-contact bootstrapping still works (the peer
-                    // has nothing to try-all against).
-                    const bool _sealed = sess.pq_acked;
+                    // Sealed sender: once the peer has an established reverse
+                    // session against us (sess.seal_outbound — audit L2; set
+                    // when their first reply decrypted under our ratchet, or
+                    // when we observed a verified sealed inbound from them),
+                    // wrap the DmPayload with our sealed_sender_pubkey + sig
+                    // and OMIT Envelope.sender_pubkey on the wire. Pre-ack
+                    // sends fall back to the legacy plaintext sender_pubkey so
+                    // first-contact bootstrapping still works (the peer has
+                    // nothing to try-all against yet).
+                    const bool _sealed = sess.seal_outbound;
                     if (_sealed) {
                         pt = seal_dm_payload(std::move(pt), *impl_->identity,
                                               std::span<const std::uint8_t>(
                                                   envid.data(), envid.size()),
-                                              now_ms);
+                                              now_ms,
+                                              std::span<const std::uint8_t>(
+                                                  sess.peer_pub.data(),
+                                                  sess.peer_pub.size()));
                     }
                     auto inner = sess.rat->encrypt(
                         std::span<const std::uint8_t>(pt.data(), pt.size()),
@@ -5515,6 +5666,22 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             std::array<std::uint8_t, 32> fetched_pub{};
                             std::memcpy(fetched_pub.data(),
                                         r.bundle().identity_pubkey().data(), 32);
+                            // Tier-11 PQ TOFU: refuse a full-strip downgrade
+                            // before we touch the ratchet. A peer pinned
+                            // PQ-capable that now hands us a PQ-less bundle is
+                            // a strip attempt — drop the fetch rather than
+                            // silently establish a classical-only session.
+                            if (!pq_tofu_admit(
+                                    this, impl_->store.get(),
+                                    std::span<const std::uint8_t, 32>(
+                                        fetched_pub.data(), 32),
+                                    fetched_for,
+                                    !r.bundle().pq_pubkey().empty())) {
+                                emit log(QString("PQ downgrade blocked for %1 "
+                                                 "— refusing session (possible MITM)")
+                                             .arg(QString::fromStdString(fetched_for)));
+                                continue;
+                            }
                             bool reused = false;
                             for (const auto& [_, s] : impl_->sessions) {
                                 if (s.rat && s.peer_pub == fetched_pub) {
@@ -5561,6 +5728,11 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                                         hybrid.shared.data(), hybrid.shared.size()),
                                     std::span<const std::uint8_t, 32>(sess.peer_x.data(), 32)));
                                 sess.initialized_as_alice = true;
+                                // Audit L3: clean derived state for a freshly
+                                // keyed session — the new ratchet isn't acked,
+                                // so keep shipping pq_ct and don't seal yet.
+                                sess.pq_acked = false;
+                                sess.seal_outbound = false;
                                 emit log(QString("ratchet ready for %1")
                                              .arg(QString::fromStdString(fetched_for)));
                             } else {
@@ -6438,11 +6610,60 @@ void detect_pubkey_change(ChatClient* self, ::fb::store::SqliteStore* store,
         // verification doesn't apply.
         store->set_peer_verified(
             std::span<const std::uint8_t>(old_pub.data(), 32), false, 0);
-        QMetaObject::invokeMethod(self, [self, label, old_qb, new_qb] {
-            emit self->peerPubkeyChanged(label, old_qb, new_qb);
+        // F7 (audit): the queued lambda outlives this call; if the ChatClient
+        // is torn down before the event is delivered, deref'ing a raw `self`
+        // is a use-after-free. The QObject-receiver form of invokeMethod
+        // already drops the event on `self`'s destruction, but capture a
+        // QPointer and null-check too — belt-and-suspenders and self-
+        // documenting against future refactors that change the post target.
+        QPointer<ChatClient> guard(self);
+        QMetaObject::invokeMethod(self, [guard, label, old_qb, new_qb] {
+            if (!guard) return;
+            emit guard->peerPubkeyChanged(label, old_qb, new_qb);
         }, Qt::QueuedConnection);
         return;   // one signal per fetch is enough
     }
+}
+
+bool pq_tofu_admit(ChatClient* self, ::fb::store::SqliteStore* store,
+                   std::span<const std::uint8_t, 32> peer_pub,
+                   const std::string& peer_label,
+                   bool now_advertises_pq) {
+    // No persistent store (e.g. an ephemeral/amnesia run) → no pin to
+    // consult; admit and let verify_bundle_pq_sigs handle the partial-strip
+    // case. TOFU needs cross-session memory it doesn't have here.
+    if (!store) return true;
+    const bool prev = store->peer_pq_capable(
+        std::span<const std::uint8_t>(peer_pub.data(), peer_pub.size()));
+    if (fb::handshake::is_pq_capability_downgrade(prev, now_advertises_pq)) {
+        // A peer we have seen do PQ is now offering a PQ-less bundle: a
+        // full-strip downgrade. Refuse the session and warn the UI rather
+        // than silently fall back to classical X25519.
+        fb::crypto::PubKey p{};
+        std::memcpy(p.data(), peer_pub.data(), 32);
+        const QString fp = QString::fromStdString(
+            fb::crypto::Identity::fingerprint(p));
+        const QString label =
+            peer_label.empty() ? fp : QString::fromStdString(peer_label);
+        if (self) {
+            QPointer<ChatClient> guard(self);
+            QMetaObject::invokeMethod(self, [guard, label, fp] {
+                if (!guard) return;
+                emit guard->peerPqDowngrade(label, fp);
+            }, Qt::QueuedConnection);
+        }
+        return false;
+    }
+    // First sight of PQ for this peer → pin it (sticky in the store).
+    if (now_advertises_pq && !prev) {
+        const auto now_ms = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        store->set_peer_pq_capable(
+            std::span<const std::uint8_t>(peer_pub.data(), peer_pub.size()),
+            true, now_ms);
+    }
+    return true;
 }
 
 QByteArray ChatClient::peerPubkeyForUsername(const QString& username) const {

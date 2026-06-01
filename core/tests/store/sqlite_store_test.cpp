@@ -755,3 +755,27 @@ TEST_F(TmpDb, AtRestRefusesUnkeyedReopen) {
         auto s = fb::store::SqliteStore::open(path);
     }, std::runtime_error);
 }
+
+// TOFU PQ-capability pin (audit residual). Default is "not capable"; once
+// pinned it is sticky (a later capable=false can't downgrade it), and the pin
+// survives a reopen so an attacker can't beat it by waiting for a restart.
+TEST_F(TmpDb, PeerPqCapablePinIsStickyAndPersists) {
+    auto peer = bytes({0xab, 0xcd, 0xef, 0x01});
+    {
+        auto s = fb::store::SqliteStore::open(path);
+        EXPECT_FALSE(s->peer_pq_capable(span_of(peer)));   // unknown peer
+        s->set_peer_pq_capable(span_of(peer), true, 1000);
+        EXPECT_TRUE(s->peer_pq_capable(span_of(peer)));
+        // A clearing attempt must NOT downgrade the sticky pin.
+        s->set_peer_pq_capable(span_of(peer), false, 2000);
+        EXPECT_TRUE(s->peer_pq_capable(span_of(peer)));
+    }
+    // Reopen: the pin persists across restart.
+    {
+        auto s = fb::store::SqliteStore::open(path);
+        EXPECT_TRUE(s->peer_pq_capable(span_of(peer)));
+        // A different, never-seen peer is still not capable.
+        auto other = bytes({0x99, 0x88});
+        EXPECT_FALSE(s->peer_pq_capable(span_of(other)));
+    }
+}

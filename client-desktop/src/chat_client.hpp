@@ -305,6 +305,14 @@ signals:
                             QByteArray oldPubkey,
                             QByteArray newPubkey);
 
+    // Tier-11 PQ TOFU — fired when a peer we previously pinned as
+    // post-quantum-capable presents a bundle / DHT record that has had all
+    // its PQ fields stripped (a silent PQ→classical downgrade attempt that
+    // verify_bundle_pq_sigs cannot catch). The session is REFUSED, not
+    // downgraded; the UI shows a "post-quantum downgrade blocked — possible
+    // MITM" banner. `peerLabel` is the username if cached, else fingerprint.
+    void peerPqDowngrade(QString peerLabel, QString fingerprint);
+
     // Tier-11 Shamir social recovery — receive-side notifications.
     // shamirShareReceived: a peer DM'd us their share for safekeeping.
     //   The trustee's chat_client has already persisted to the sqlite

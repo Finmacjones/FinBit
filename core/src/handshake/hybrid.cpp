@@ -67,6 +67,11 @@ PqIdentity derive_pq_identity(
     p.sec = kp.sec;
     p.pubkey_sig = id.sign(
         std::span<const std::uint8_t>(p.pub.data(), p.pub.size()));
+    // Wipe the transient secret copies (audit PQ HIGH-1): the 64-byte PQ
+    // seed and the keypair's own `sec` are duplicates of identity material
+    // and must not linger in freed stack/heap once copied into `p`.
+    sodium_memzero(pq_seed.data(), pq_seed.size());
+    sodium_memzero(kp.sec.data(), kp.sec.size());
     return p;
 }
 
@@ -167,24 +172,41 @@ std::array<std::uint8_t, 32> derive_hybrid_recv_from_env(
 
 // ---- Sealed sender --------------------------------------------------------
 
+// Domain-separation tag (audit M2). Prepended to every sealed-sender signed
+// message so an Ed25519 signature produced for sealed-sender can never be
+// confused with — or replayed as — any other identity-key signature in the
+// protocol (prekey-bundle bindings, identity claims, etc.), and vice-versa.
+namespace {
+constexpr std::string_view kSealedSenderDomain = "FinBit-SealedSender-v1";
+}  // namespace
+
 std::vector<std::uint8_t> sealed_sender_sig_input(
-    std::span<const std::uint8_t> envelope_id, std::uint64_t timestamp_ms) {
+    std::span<const std::uint8_t> envelope_id, std::uint64_t timestamp_ms,
+    std::span<const std::uint8_t> recipient_pubkey) {
     std::vector<std::uint8_t> out;
-    out.reserve(envelope_id.size() + 8);
+    out.reserve(kSealedSenderDomain.size() + envelope_id.size() + 8 +
+                recipient_pubkey.size());
+    out.insert(out.end(), kSealedSenderDomain.begin(), kSealedSenderDomain.end());
     out.insert(out.end(), envelope_id.begin(), envelope_id.end());
     for (int i = 7; i >= 0; --i) {
         out.push_back(static_cast<std::uint8_t>((timestamp_ms >> (8 * i)) & 0xff));
     }
+    // Recipient binding (audit M2): tie the seal to the intended recipient's
+    // identity so a relay can't lift a sealed sender claim onto an envelope
+    // routed to a different recipient. (The AEAD/ratchet session already
+    // binds the recipient pair; this is defense-in-depth at the sig layer.)
+    out.insert(out.end(), recipient_pubkey.begin(), recipient_pubkey.end());
     return out;
 }
 
 SealedSenderFields make_sealed_sender_fields(
     const fb::crypto::Identity& id,
     std::span<const std::uint8_t> envelope_id,
-    std::uint64_t timestamp_ms) {
+    std::uint64_t timestamp_ms,
+    std::span<const std::uint8_t> recipient_pubkey) {
     SealedSenderFields out;
     out.pubkey = id.public_key();
-    auto msg = sealed_sender_sig_input(envelope_id, timestamp_ms);
+    auto msg = sealed_sender_sig_input(envelope_id, timestamp_ms, recipient_pubkey);
     out.sig = id.sign(std::span<const std::uint8_t>(msg.data(), msg.size()));
     return out;
 }
@@ -193,12 +215,13 @@ bool verify_sealed_sender(
     std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes> claimed_pubkey,
     std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>    claimed_sig,
     std::span<const std::uint8_t> envelope_id,
-    std::uint64_t timestamp_ms) noexcept {
+    std::uint64_t timestamp_ms,
+    std::span<const std::uint8_t> recipient_pubkey) noexcept {
     fb::crypto::PubKey pk{};
     std::memcpy(pk.data(), claimed_pubkey.data(), pk.size());
     fb::crypto::Sig sg{};
     std::memcpy(sg.data(), claimed_sig.data(), sg.size());
-    auto msg = sealed_sender_sig_input(envelope_id, timestamp_ms);
+    auto msg = sealed_sender_sig_input(envelope_id, timestamp_ms, recipient_pubkey);
     return fb::crypto::Identity::verify(
         pk, std::span<const std::uint8_t>(msg.data(), msg.size()), sg);
 }
@@ -216,6 +239,9 @@ PqSigIdentity derive_pq_sig_identity(
     p.sec = kp.sec;
     p.pubkey_sig = id.sign(
         std::span<const std::uint8_t>(p.pub.data(), p.pub.size()));
+    // Wipe transient secret copies (audit PQ HIGH-1).
+    sodium_memzero(pq_seed.data(), pq_seed.size());
+    sodium_memzero(kp.sec.data(), kp.sec.size());
     return p;
 }
 
@@ -245,8 +271,14 @@ bool hybrid_verify(
         message,
         std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65SigBytes>(
             sig.pq.data(), sig.pq.size()));
-    // Force both checks to evaluate even when the first fails — defeats a
-    // timing observer learning whether the classical or PQ half is wrong.
+    // Evaluate BOTH halves unconditionally and combine with non-short-
+    // circuit `&`: a passing half can never mask a failing one, so the
+    // result genuinely requires both. NB: this is NOT constant-time — each
+    // verify returns at its own speed and they run sequentially, so total
+    // wall-clock still leaks which half failed. That is acceptable here:
+    // these are signature checks over PUBLIC bundle data, where "which half
+    // is invalid" has no value to an attacker who already chose what to
+    // tamper with.
     return ok_ed & ok_pq;
 }
 
@@ -305,6 +337,24 @@ bool verify_bundle_pq_sigs(const fb::proto::PreKeyBundle& bundle) noexcept {
     if (bundle.identity_pubkey().size() != fb::crypto::kIdentityPubKeyBytes) return false;
     if (bundle.signed_prekey().size() != 32)                                 return false;
 
+    // CRITICAL — KEM-strip downgrade defense (audit PQ CRITICAL-1). Nothing
+    // else in the bundle commits to the *presence* of the ML-KEM-768
+    // pq_pubkey: a MITM could strip pq_pubkey + pq_pubkey_sig +
+    // pq_pubkey_sig_pq while leaving the (still-valid) PQ-sig identity
+    // fields intact, and the old `else if (pq_pubkey absent)` path below
+    // fell through to `return true` → derive_hybrid_send_from_bundle then
+    // saw an empty pq_pub and silently fell back to pure X25519. That
+    // defeats harvest-now-decrypt-later against an ordinary (non-quantum)
+    // relay today. Every FinBit publisher that advertises a PQ-sig identity
+    // ALSO publishes its KEM pubkey — both are re-derived from the single
+    // identity seed, and both add_pq_sig_fields_to_bundle call sites set
+    // pq_pubkey immediately before. So a PQ-sig bundle WITHOUT a well-formed
+    // KEM pubkey and its ML-DSA binding sig is a strip attempt: refuse it
+    // rather than downgrade. (The KEM is transitively identity-bound below
+    // via pq_pubkey_sig_pq → pq_sig_pubkey → pq_sig_pubkey_sig.)
+    if (bundle.pq_pubkey().size() != fb::crypto::pq::kMlKem768PubBytes)       return false;
+    if (bundle.pq_pubkey_sig_pq().size() != fb::crypto::pq::kMlDsa65SigBytes) return false;
+
     // 1. Ed25519: identity_pubkey signed pq_sig_pubkey.
     fb::crypto::PubKey id_pub{};
     std::memcpy(id_pub.data(), bundle.identity_pubkey().data(), id_pub.size());
@@ -335,11 +385,11 @@ bool verify_bundle_pq_sigs(const fb::proto::PreKeyBundle& bundle) noexcept {
         }
     }
 
-    // 3. ML-DSA-65: pq_sig_pubkey signed pq_pubkey (if KEM pubkey is set).
-    if (!bundle.pq_pubkey().empty()) {
-        if (bundle.pq_pubkey_sig_pq().size() != fb::crypto::pq::kMlDsa65SigBytes) {
-            return false;
-        }
+    // 3. ML-DSA-65: pq_sig_pubkey signed pq_pubkey. The KEM pubkey and its
+    //    ML-DSA binding sig are now MANDATORY for a PQ-sig bundle (validated
+    //    above), so there is no empty-KEM branch — a stripped KEM can never
+    //    reach the `return true` below.
+    {
         fb::crypto::pq::MlDsa65Sig sig{};
         std::memcpy(sig.data(), bundle.pq_pubkey_sig_pq().data(), sig.size());
         fb::crypto::pq::MlDsa65Pub pq_pub{};
@@ -352,9 +402,6 @@ bool verify_bundle_pq_sigs(const fb::proto::PreKeyBundle& bundle) noexcept {
                 std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65SigBytes>(sig))) {
             return false;
         }
-    } else if (!bundle.pq_pubkey_sig_pq().empty()) {
-        // pq_pubkey_sig_pq present but pq_pubkey absent — malformed.
-        return false;
     }
 
     return true;

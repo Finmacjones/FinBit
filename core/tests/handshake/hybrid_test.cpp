@@ -179,25 +179,42 @@ TEST(Handshake, BundleHelperVerifiesBindingSig) {
 // Sealed sender — sender_pubkey hidden from the relay (Signal-style)
 // ---------------------------------------------------------------------------
 
-TEST(Handshake, SealedSenderSigInputIsEnvelopeIdConcatBeTs) {
+// Bob's identity pubkey, used as the sealed-sender recipient binding.
+static std::array<std::uint8_t, 32> recipient_of(std::uint8_t fill) {
+    return ident_from_byte(fill).public_key();
+}
+
+TEST(Handshake, SealedSenderSigInputIsDomainEnvIdBeTsRecipient) {
     std::array<std::uint8_t, 16> env_id{};
     for (std::size_t i = 0; i < env_id.size(); ++i) {
         env_id[i] = static_cast<std::uint8_t>(0xA0 + i);
     }
+    auto recipient = recipient_of(0x5A);
     constexpr std::uint64_t ts = 0x0102030405060708ULL;
     auto bytes = sealed_sender_sig_input(
-        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts);
-    ASSERT_EQ(bytes.size(), 16u + 8u);
-    for (std::size_t i = 0; i < 16; ++i) EXPECT_EQ(bytes[i], env_id[i]);
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts,
+        std::span<const std::uint8_t>(recipient.data(), recipient.size()));
+
+    // Layout: "FinBit-SealedSender-v1" || env_id(16) || u64_be(8) || recip(32)
+    static constexpr char kDomain[] = "FinBit-SealedSender-v1";
+    const std::size_t dlen = sizeof(kDomain) - 1;  // exclude NUL
+    ASSERT_EQ(bytes.size(), dlen + 16u + 8u + recipient.size());
+    for (std::size_t i = 0; i < dlen; ++i) {
+        EXPECT_EQ(bytes[i], static_cast<std::uint8_t>(kDomain[i]));
+    }
+    for (std::size_t i = 0; i < 16; ++i) EXPECT_EQ(bytes[dlen + i], env_id[i]);
     // Big-endian u64 of 0x0102030405060708.
-    EXPECT_EQ(bytes[16], 0x01); EXPECT_EQ(bytes[17], 0x02);
-    EXPECT_EQ(bytes[18], 0x03); EXPECT_EQ(bytes[19], 0x04);
-    EXPECT_EQ(bytes[20], 0x05); EXPECT_EQ(bytes[21], 0x06);
-    EXPECT_EQ(bytes[22], 0x07); EXPECT_EQ(bytes[23], 0x08);
+    for (std::size_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(bytes[dlen + 16 + i], static_cast<std::uint8_t>(i + 1));
+    }
+    for (std::size_t i = 0; i < recipient.size(); ++i) {
+        EXPECT_EQ(bytes[dlen + 24 + i], recipient[i]);
+    }
 }
 
 TEST(Handshake, SealedSenderRoundTrip) {
     auto alice = ident_from_byte(0xEE);
+    auto recipient = recipient_of(0x10);
     std::array<std::uint8_t, 16> env_id{};
     for (std::size_t i = 0; i < env_id.size(); ++i) {
         env_id[i] = static_cast<std::uint8_t>(i + 1);
@@ -205,7 +222,8 @@ TEST(Handshake, SealedSenderRoundTrip) {
     const std::uint64_t ts = 1700000000123ULL;
 
     auto fields = make_sealed_sender_fields(alice,
-        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts);
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts,
+        std::span<const std::uint8_t>(recipient.data(), recipient.size()));
     EXPECT_EQ(fields.pubkey, alice.public_key());
 
     EXPECT_TRUE(verify_sealed_sender(
@@ -213,16 +231,19 @@ TEST(Handshake, SealedSenderRoundTrip) {
             fields.pubkey.data(), fields.pubkey.size()),
         std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>(
             fields.sig.data(), fields.sig.size()),
-        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts));
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts,
+        std::span<const std::uint8_t>(recipient.data(), recipient.size())));
 }
 
 TEST(Handshake, SealedSenderRejectsTimestampShift) {
     auto alice = ident_from_byte(0xCC);
+    auto recipient = recipient_of(0x11);
     std::array<std::uint8_t, 16> env_id{};
     randombytes_buf(env_id.data(), env_id.size());
     const std::uint64_t ts = 1700000000000ULL;
     auto f = make_sealed_sender_fields(alice,
-        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts);
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts,
+        std::span<const std::uint8_t>(recipient.data(), recipient.size()));
 
     // Same sig, different timestamp → MUST fail (relay can't replay
     // an envelope at a different time).
@@ -232,17 +253,20 @@ TEST(Handshake, SealedSenderRejectsTimestampShift) {
         std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>(
             f.sig.data(), f.sig.size()),
         std::span<const std::uint8_t>(env_id.data(), env_id.size()),
-        ts + 1));
+        ts + 1,
+        std::span<const std::uint8_t>(recipient.data(), recipient.size())));
 }
 
 TEST(Handshake, SealedSenderRejectsEnvelopeIdReplay) {
     auto alice = ident_from_byte(0xDD);
+    auto recipient = recipient_of(0x12);
     std::array<std::uint8_t, 16> env_id_a{}, env_id_b{};
     randombytes_buf(env_id_a.data(), env_id_a.size());
     randombytes_buf(env_id_b.data(), env_id_b.size());
     const std::uint64_t ts = 1700000000000ULL;
     auto f = make_sealed_sender_fields(alice,
-        std::span<const std::uint8_t>(env_id_a.data(), env_id_a.size()), ts);
+        std::span<const std::uint8_t>(env_id_a.data(), env_id_a.size()), ts,
+        std::span<const std::uint8_t>(recipient.data(), recipient.size()));
 
     // Reusing the sig against a different envelope id → MUST fail.
     EXPECT_FALSE(verify_sealed_sender(
@@ -250,7 +274,40 @@ TEST(Handshake, SealedSenderRejectsEnvelopeIdReplay) {
             f.pubkey.data(), f.pubkey.size()),
         std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>(
             f.sig.data(), f.sig.size()),
-        std::span<const std::uint8_t>(env_id_b.data(), env_id_b.size()), ts));
+        std::span<const std::uint8_t>(env_id_b.data(), env_id_b.size()), ts,
+        std::span<const std::uint8_t>(recipient.data(), recipient.size())));
+}
+
+// M2 (audit): the seal is bound to its intended recipient. A relay that
+// lifts a valid sealed claim onto an envelope routed to a DIFFERENT
+// recipient must fail verification under that recipient's own pubkey.
+TEST(Handshake, SealedSenderRejectsWrongRecipient) {
+    auto alice = ident_from_byte(0xAE);
+    auto recip_bob   = recipient_of(0x20);
+    auto recip_carol = recipient_of(0x21);
+    std::array<std::uint8_t, 16> env_id{};
+    randombytes_buf(env_id.data(), env_id.size());
+    const std::uint64_t ts = 1700000000777ULL;
+    auto f = make_sealed_sender_fields(alice,
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts,
+        std::span<const std::uint8_t>(recip_bob.data(), recip_bob.size()));
+
+    // Verifying with Carol's pubkey (the wrong recipient) → MUST fail.
+    EXPECT_FALSE(verify_sealed_sender(
+        std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>(
+            f.pubkey.data(), f.pubkey.size()),
+        std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>(
+            f.sig.data(), f.sig.size()),
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts,
+        std::span<const std::uint8_t>(recip_carol.data(), recip_carol.size())));
+    // ...but the intended recipient still verifies.
+    EXPECT_TRUE(verify_sealed_sender(
+        std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>(
+            f.pubkey.data(), f.pubkey.size()),
+        std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>(
+            f.sig.data(), f.sig.size()),
+        std::span<const std::uint8_t>(env_id.data(), env_id.size()), ts,
+        std::span<const std::uint8_t>(recip_bob.data(), recip_bob.size())));
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +496,36 @@ TEST(Handshake, BundlePqSigsRejectSwappedPqSigPubkey) {
     EXPECT_FALSE(verify_bundle_pq_sigs(bundle));
 }
 
+// PQ CRITICAL-1 (audit): a MITM that strips the ML-KEM pq_pubkey (and its
+// two binding sigs) while leaving the still-valid PQ-sig identity fields
+// intact must be REFUSED. Otherwise the session silently downgrades to
+// classical-only X25519, defeating harvest-now-decrypt-later against an
+// ordinary relay. Nothing else in the bundle commits to the KEM key's
+// presence, so verify_bundle_pq_sigs must mandate it.
+TEST(Handshake, BundlePqSigsRejectStrippedKem) {
+    auto id = ident_from_byte(0x5C);
+    auto seed = seed_of_byte(0x5C);
+    auto b = make_full_bundle(id, seed);
+    ASSERT_TRUE(verify_bundle_pq_sigs(b));   // intact bundle verifies
+
+    // Strip the KEM half: pq_pubkey + its Ed25519 binding + its ML-DSA
+    // binding, leaving the (genuine) PQ-sig identity fields untouched.
+    b.clear_pq_pubkey();
+    b.clear_pq_pubkey_sig();
+    b.clear_pq_pubkey_sig_pq();
+    EXPECT_FALSE(verify_bundle_pq_sigs(b));
+
+    // The bundle-driven send path must THROW rather than silently fall back
+    // to pure X25519.
+    auto alice   = ident_from_byte(0x5D);
+    auto x_alice = derive_x25519(alice);
+    auto x_bob   = derive_x25519(id);
+    EXPECT_THROW({
+        (void)derive_hybrid_send_from_bundle(x_alice,
+            std::span<const std::uint8_t, 32>(x_bob.pub.data(), 32), b);
+    }, std::runtime_error);
+}
+
 TEST(Handshake, HybridVerifyRejectsWrongMessage) {
     auto id = ident_from_byte(0x99);
     auto seed = seed_of_byte(0x99);
@@ -484,4 +571,20 @@ TEST(Handshake, BundleWithoutPqGracefullyFallsBack) {
     auto pure = derive_shared_secret(x_alice,
         std::span<const std::uint8_t, 32>(x_bob.pub.data(), 32));
     EXPECT_EQ(hyb.shared, pure);
+}
+
+// TOFU PQ-capability downgrade policy (audit residual). verify_bundle_pq_sigs
+// catches a PARTIAL strip but is blind to a FULL strip (all PQ fields gone →
+// legacy-looking bundle). The cross-session pin closes it: once a peer is
+// pinned PQ-capable, a later PQ-less bundle from the same identity is a
+// downgrade and must be refused.
+TEST(Handshake, PqCapabilityDowngradeTruthTable) {
+    using fb::handshake::is_pq_capability_downgrade;
+    // Never pinned PQ for this peer → nothing to violate, any bundle is fine.
+    EXPECT_FALSE(is_pq_capability_downgrade(/*prev=*/false, /*now=*/false));
+    EXPECT_FALSE(is_pq_capability_downgrade(/*prev=*/false, /*now=*/true));
+    // Pinned PQ-capable and still advertising PQ → fine.
+    EXPECT_FALSE(is_pq_capability_downgrade(/*prev=*/true,  /*now=*/true));
+    // Pinned PQ-capable but PQ now stripped → DOWNGRADE, refuse.
+    EXPECT_TRUE (is_pq_capability_downgrade(/*prev=*/true,  /*now=*/false));
 }

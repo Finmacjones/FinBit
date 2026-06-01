@@ -32,9 +32,12 @@
 #include "fb/crypto/identity.hpp"
 #include "fb/crypto/pq_kem.hpp"
 
+#include <sodium.h>
+
 #include <array>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 // Forward-declare the proto types so the header doesn't require every
@@ -83,10 +86,30 @@ struct X25519Pair {
 // gets shipped alongside the pubkey in PreKeyBundle / PrekeyRecord so
 // peers can verify the PQ key is bound to the same long-term identity
 // (defeats a MITM that strips PQ and substitutes a key it controls).
+// The 2400-byte ML-KEM secret is long-term identity material (re-derivable
+// from the Ed25519 seed). Mirror fb::crypto::Identity's hygiene: wipe `sec`
+// on destruction and on move-from so it never lingers in freed heap (audit
+// PQ HIGH-1). Copies are kept (defaulted) for the rare value-copy; the live
+// copy is wiped by its own destructor.
 struct PqIdentity {
     fb::crypto::pq::MlKem768Pub  pub{};
     fb::crypto::pq::MlKem768Sec  sec{};
     fb::crypto::Sig              pubkey_sig{};
+
+    PqIdentity() = default;
+    ~PqIdentity() { sodium_memzero(sec.data(), sec.size()); }
+    PqIdentity(const PqIdentity&) = default;
+    PqIdentity& operator=(const PqIdentity&) = default;
+    PqIdentity(PqIdentity&& o) noexcept { *this = std::move(o); }
+    PqIdentity& operator=(PqIdentity&& o) noexcept {
+        if (this != &o) {
+            pub = o.pub;
+            sec = o.sec;
+            pubkey_sig = o.pubkey_sig;
+            sodium_memzero(o.sec.data(), o.sec.size());
+        }
+        return *this;
+    }
 };
 
 [[nodiscard]] PqIdentity derive_pq_identity(
@@ -155,13 +178,21 @@ struct HybridSendResult {
 // ---------------------------------------------------------------------------
 
 // Build the bytes that the sealed-sender sig covers. Equal to
-// envelope_id || u64_be(timestamp_ms) — the same outer AAD the AEAD
-// authenticates. Producing both signatures over the same bytes means an
-// envelope can't be replayed under a different id or with a shifted
-// timestamp without invalidating both checks at once.
+//   "FinBit-SealedSender-v1" || envelope_id || u64_be(timestamp_ms)
+//        || recipient_pubkey
+// The leading domain tag (audit M2) keeps a sealed-sender Ed25519 sig from
+// being confused with any other identity-key signature in the protocol. The
+// envelope_id || timestamp portion is the same outer AAD the AEAD
+// authenticates (so an envelope can't be replayed under a different id or a
+// shifted timestamp), and the trailing recipient_pubkey binds the seal to
+// its intended recipient (so a relay can't lift the claim onto an envelope
+// routed elsewhere). `recipient_pubkey` is the recipient's Ed25519 identity
+// pubkey: the destination peer's on the sender side, one's own on the
+// verify side.
 [[nodiscard]] std::vector<std::uint8_t> sealed_sender_sig_input(
     std::span<const std::uint8_t> envelope_id,
-    std::uint64_t timestamp_ms);
+    std::uint64_t timestamp_ms,
+    std::span<const std::uint8_t> recipient_pubkey);
 
 struct SealedSenderFields {
     fb::crypto::PubKey pubkey{};
@@ -169,20 +200,25 @@ struct SealedSenderFields {
 };
 
 // Sender side: produce { pubkey, sig } to attach as
-// DmPayload.sealed_sender_pubkey + sealed_sender_sig.
+// DmPayload.sealed_sender_pubkey + sealed_sender_sig. `recipient_pubkey` is
+// the destination peer's Ed25519 identity pubkey (bound into the sig).
 [[nodiscard]] SealedSenderFields make_sealed_sender_fields(
     const fb::crypto::Identity& id,
     std::span<const std::uint8_t> envelope_id,
-    std::uint64_t timestamp_ms);
+    std::uint64_t timestamp_ms,
+    std::span<const std::uint8_t> recipient_pubkey);
 
-// Recipient side: verify that the embedded sender claim is genuine. The
-// caller is expected to ALSO check claimed_pubkey == session.peer_pub
-// (this function doesn't have access to session state — keep it pure).
+// Recipient side: verify that the embedded sender claim is genuine. Pass
+// one's OWN identity pubkey as `recipient_pubkey` (it must match what the
+// sender bound). The caller is expected to ALSO check claimed_pubkey ==
+// session.peer_pub (this function doesn't have access to session state —
+// keep it pure).
 [[nodiscard]] bool verify_sealed_sender(
     std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes> claimed_pubkey,
     std::span<const std::uint8_t, fb::crypto::kIdentitySigBytes>    claimed_sig,
     std::span<const std::uint8_t> envelope_id,
-    std::uint64_t timestamp_ms) noexcept;
+    std::uint64_t timestamp_ms,
+    std::span<const std::uint8_t> recipient_pubkey) noexcept;
 
 // ---------------------------------------------------------------------------
 // Hybrid signatures — Ed25519 + ML-DSA-65.
@@ -211,10 +247,27 @@ struct SealedSenderFields {
 // future weaknesses in Ed25519.
 // ---------------------------------------------------------------------------
 
+// As PqIdentity: the 4032-byte ML-DSA secret is long-term identity material;
+// wipe it on destruction and on move-from (audit PQ HIGH-1).
 struct PqSigIdentity {
     fb::crypto::pq::MlDsa65Pub  pub{};
     fb::crypto::pq::MlDsa65Sec  sec{};
     fb::crypto::Sig             pubkey_sig{};   // Ed25519 binding to identity
+
+    PqSigIdentity() = default;
+    ~PqSigIdentity() { sodium_memzero(sec.data(), sec.size()); }
+    PqSigIdentity(const PqSigIdentity&) = default;
+    PqSigIdentity& operator=(const PqSigIdentity&) = default;
+    PqSigIdentity(PqSigIdentity&& o) noexcept { *this = std::move(o); }
+    PqSigIdentity& operator=(PqSigIdentity&& o) noexcept {
+        if (this != &o) {
+            pub = o.pub;
+            sec = o.sec;
+            pubkey_sig = o.pubkey_sig;
+            sodium_memzero(o.sec.data(), o.sec.size());
+        }
+        return *this;
+    }
 };
 
 // Derive the deterministic ML-DSA-65 keypair from the Ed25519 identity seed
@@ -239,9 +292,10 @@ struct HybridSignature {
     std::span<const std::uint8_t> message);
 
 // Verify a hybrid signature. Returns true iff BOTH sigs verify under their
-// respective pubkeys. Constant-time-ish: always evaluates both checks even
-// when the first fails (defeats timing-side-channel inference about which
-// half is wrong).
+// respective pubkeys. Always evaluates both checks (non-short-circuit `&`)
+// so a passing half can't mask a failing one — but this is NOT constant-
+// time and intentionally so: the inputs are PUBLIC signature material, so a
+// timing leak of which half is invalid has no value to an attacker.
 [[nodiscard]] bool hybrid_verify(
     std::span<const std::uint8_t, fb::crypto::kIdentityPubKeyBytes>     ed25519_pub,
     std::span<const std::uint8_t, fb::crypto::pq::kMlDsa65PubBytes>     pq_pub,
@@ -264,15 +318,45 @@ void add_pq_sig_fields_to_bundle(
 //
 // Returns true iff EITHER (a) the bundle is pre-PQ-sig (all four PQ-sig
 // fields empty) — Ed25519-only fallback path — OR (b) all four fields are
-// present and every hybrid signature verifies. Returns false on any
-// partial/mismatched state (which would only happen with a MITM that
-// stripped some fields but not others — refuse rather than silently
-// downgrade).
+// present, the ML-KEM-768 pq_pubkey is ALSO present and its ML-DSA binding
+// sig (pq_pubkey_sig_pq) verifies, and every hybrid signature verifies.
+// Returns false on any partial/mismatched state (which would only happen
+// with a MITM that stripped some fields but not others — refuse rather than
+// silently downgrade).
+//
+// KEM-strip defense (audit PQ CRITICAL-1): a bundle that advertises a PQ-sig
+// identity MUST carry its KEM pubkey. Nothing else commits to the KEM key's
+// presence, so without this a relay could strip pq_pubkey + its sigs and
+// force a silent downgrade to classical-only X25519 (defeating harvest-now-
+// decrypt-later). A genuine PQ publisher always co-publishes both, so the
+// presence requirement costs nothing and closes the strip.
 //
 // The verifier does NOT also check the existing Ed25519 signed_prekey_sig
 // or pq_pubkey_sig — those are checked elsewhere (the call sites that
 // already exist in derive_hybrid_send_from_bundle). This helper only
 // adds the PQ half.
 [[nodiscard]] bool verify_bundle_pq_sigs(const fb::proto::PreKeyBundle& bundle) noexcept;
+
+// TOFU PQ-capability downgrade policy — closes the full-field-strip residual
+// that verify_bundle_pq_sigs structurally cannot catch.
+//
+// verify_bundle_pq_sigs rejects a *partial* strip (some PQ fields gone, some
+// kept — provably a MITM). But a MITM that strips EVERY PQ field hands the
+// victim a bundle byte-indistinguishable from a genuine pre-PQ (legacy) peer:
+// nothing inside a single bundle commits to "this identity is PQ-capable", so
+// at the bundle layer the strip is invisible. Only cross-session memory closes
+// it. Once we have seen a peer advertise an ML-KEM pubkey we pin that fact; a
+// later bundle/record from the same identity that drops PQ is a downgrade
+// attempt and must be refused — trust-on-first-use, the same model SSH uses
+// for host keys.
+//
+// `previously_pq_capable` is the persisted per-peer pin; `now_advertises_pq`
+// is whether the freshly fetched bundle/record carries an ML-KEM pubkey
+// (i.e. `!pq_pubkey().empty()`). Pure function: the single source of the rule,
+// unit-tested in isolation. Returns true ⇒ caller MUST refuse the bundle.
+[[nodiscard]] constexpr bool is_pq_capability_downgrade(
+        bool previously_pq_capable, bool now_advertises_pq) noexcept {
+    return previously_pq_capable && !now_advertises_pq;
+}
 
 }  // namespace fb::handshake

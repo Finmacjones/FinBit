@@ -90,6 +90,9 @@ private slots:
     void onPeerPubkeyChanged(const QString& peerLabel,
                               const QByteArray& oldPubkey,
                               const QByteArray& newPubkey);
+    // Tier-11 PQ TOFU warning: pops a QMessageBox when chat_client refuses a
+    // session because a pinned-PQ peer's bundle was stripped of all PQ fields.
+    void onPeerPqDowngrade(const QString& peerLabel, const QString& fingerprint);
     // Tier-11 Shamir social-recovery setup wizard. Reads my_username_ +
     // current contacts from dm_list_, hands off to ShamirSetupWizard.
     void onSocialRecoverySetupClicked();

@@ -50,11 +50,11 @@ public:
     //
     // The DB tracks its mode via PRAGMA user_version:
     //   0 = legacy plaintext (no migration triggered)
-    //   2 = encrypted (master_key REQUIRED on every open)
+    //   3 = encrypted (master_key REQUIRED on every open)
     //
     // Opening an encrypted DB without a master_key throws. Opening a
     // legacy-plaintext DB WITH a master_key migrates rows in place
-    // inside a single SQLite transaction, then bumps user_version to 2.
+    // inside a single SQLite transaction, then bumps user_version to 3.
     [[nodiscard]] static std::unique_ptr<SqliteStore> open(
         const std::string& path,
         std::span<const std::uint8_t> master_key = {});
@@ -118,14 +118,30 @@ public:
     // Returns the total row count re-wrapped. No-op (returns 0) when
     // at-rest encryption isn't active.
     //
-    // THREAT MODEL — this defends against MEMORY EXFILTRATION (cold-boot
-    // attack, kernel-mode debugger reading process RAM): a dump captured
-    // BEFORE the rotation has only the OLD sub-keys, which cannot decrypt
-    // the post-rotation on-disk state. It does NOT defend against
-    // PASSPHRASE COMPROMISE — an attacker with the vault passphrase
-    // unwraps the current sub-keys from `storage_keys` and decrypts
-    // current data. The right defense for that is sender-set TTL
-    // (Phase 1, append_inbox_with_expiry + prune_expired).
+    // THREAT MODEL — read this honestly (audit F-4). Rotation generates
+    // fresh RANDOM sub-keys (not master-derived) and re-wraps every row, so
+    // exposure of an OLD sub-key VALUE alone (e.g. a stale value scraped
+    // from a log or a freed buffer) does not decrypt post-rotation data.
+    //
+    // It does NOT, however, provide forward secrecy against an attacker who
+    // captured the VAULT MASTER KEY. The master key is resident in process
+    // memory for the whole session (rotation needs it to wrap the new
+    // sub-keys), and the current sub-keys are persisted on disk wrapped
+    // UNDER that master key in `storage_keys`. So any adversary who dumps
+    // process RAM — cold-boot, kernel debugger, core dump, swap — obtains
+    // the master key and simply unwraps the current sub-keys straight off
+    // disk, exactly as open() does. Rotation does not stop them, and a
+    // pre-rotation dump that captured the master key decrypts the
+    // post-rotation disk state. (True forward secrecy here would require
+    // ratcheting the master key itself and irrecoverably destroying the old
+    // one each rotation — a larger redesign, not done here.)
+    //
+    // Likewise it does NOT defend against PASSPHRASE COMPROMISE — an
+    // attacker with the vault passphrase re-derives the master key and
+    // unwraps current data. The right defense for both is sender-set TTL
+    // (Phase 1, append_inbox_with_expiry + prune_expired), which now also
+    // secure_delete's + WAL-checkpoints so destroyed rows leave no
+    // decryptable residue on disk.
     [[nodiscard]] std::size_t rotate_storage_keys();
 
     // Tier-11 MITM verification (task #384) — persisted "this peer's
@@ -140,6 +156,19 @@ public:
                                                 bool verified,
                                                 std::uint64_t verified_at_ms);
     [[nodiscard]] bool       peer_verified(std::span<const std::uint8_t> peer_pub) const;
+
+    // TOFU PQ-capability pin (audit residual — closes the full-strip PQ
+    // downgrade). Set true the first time we accept a bundle / DHT record
+    // from `peer_pub` that advertises an ML-KEM pubkey; the pin is sticky
+    // (once capable, always capable) so a later PQ-less bundle from the same
+    // identity is detectable as a downgrade (fb::handshake::
+    // is_pq_capability_downgrade) and the consumer refuses it. Per-peer,
+    // persisted across restarts so an attacker can't beat the pin by waiting
+    // for a relaunch.
+    void                     set_peer_pq_capable(std::span<const std::uint8_t> peer_pub,
+                                                 bool capable,
+                                                 std::uint64_t first_seen_ms);
+    [[nodiscard]] bool       peer_pq_capable(std::span<const std::uint8_t> peer_pub) const;
 
     // Reverse lookup of peer_name_cache: returns every peer_pub we've seen
     // associated with `username` (typically 1; if >1, that's exactly the

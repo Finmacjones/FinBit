@@ -153,6 +153,17 @@ CREATE TABLE IF NOT EXISTS peer_verified (
     verified       INTEGER NOT NULL DEFAULT 0,
     verified_at_ms INTEGER NOT NULL DEFAULT 0
 );
+-- TOFU PQ-capability pin (audit residual — closes the full-strip PQ
+-- downgrade that verify_bundle_pq_sigs can't see). Once a peer's bundle or
+-- DHT record has carried an ML-KEM pubkey, pin "capable" here; a later
+-- PQ-less bundle from the same identity is a strip-downgrade and the
+-- consumer refuses it (fb::handshake::is_pq_capability_downgrade). Persists
+-- across restarts so an attacker can't win the pin by waiting for a relaunch.
+CREATE TABLE IF NOT EXISTS peer_pq_capable (
+    peer_pub      BLOB    PRIMARY KEY,
+    capable       INTEGER NOT NULL DEFAULT 0,
+    first_seen_ms INTEGER NOT NULL DEFAULT 0
+);
 -- Tier-11 Shamir social recovery: trustee-side share custody. Each row
 -- is a Shamir share that some peer entrusted to this user. Identified
 -- by (peer_pub, setup_id) so a single peer can have multiple parallel
@@ -278,19 +289,32 @@ struct SqliteStore::Impl {
     // sub-keys so a row swap across generations fails AEAD verify).
     std::uint64_t                     storage_keys_generation = 0;
 
+    Impl() {
+        // Audit residual: lock the key-holding pages into RAM so the master
+        // key + per-table sub-keys never page out to swap (where they'd
+        // outlive the process and survive a reboot on disk). sodium_mlock
+        // also marks the pages MADV_DONTDUMP, keeping them out of core dumps.
+        // The 11 32-byte keys are zero-initialised members here; open() fills
+        // them via HKDF. Best-effort: a tight RLIMIT_MEMLOCK can make mlock
+        // fail, in which case we run unlocked — correctness is unaffected,
+        // only the swap-exposure hardening is lost.
+        for (auto* k : {&master_key, &inbox_key, &outbox_key, &sessions_key,
+                        &chan_state_key, &chan_peers_key, &chan_inbox_key,
+                        &peer_name_key, &mls_state_key, &mls_log_key}) {
+            sodium_mlock(k->data(), k->size());
+        }
+    }
+
     ~Impl() {
-        // Best-effort: zero the table keys before the process exits so
-        // a core-dump after Close-without-Quit doesn't carry them.
-        sodium_memzero(master_key.data(),      master_key.size());
-        sodium_memzero(inbox_key.data(),       inbox_key.size());
-        sodium_memzero(outbox_key.data(),      outbox_key.size());
-        sodium_memzero(sessions_key.data(),    sessions_key.size());
-        sodium_memzero(chan_state_key.data(),  chan_state_key.size());
-        sodium_memzero(chan_peers_key.data(),  chan_peers_key.size());
-        sodium_memzero(chan_inbox_key.data(),  chan_inbox_key.size());
-        sodium_memzero(peer_name_key.data(),   peer_name_key.size());
-        sodium_memzero(mls_state_key.data(),   mls_state_key.size());
-        sodium_memzero(mls_log_key.data(),     mls_log_key.size());
+        // sodium_munlock zeroes the buffer AND unlocks the page, so a
+        // core-dump after Close-without-Quit can't carry the keys and the
+        // locked pages are returned to the OS. (Replaces the bare
+        // sodium_memzero now that the ctor mlocks.)
+        for (auto* k : {&master_key, &inbox_key, &outbox_key, &sessions_key,
+                        &chan_state_key, &chan_peers_key, &chan_inbox_key,
+                        &peer_name_key, &mls_state_key, &mls_log_key}) {
+            sodium_munlock(k->data(), k->size());
+        }
         if (db) sqlite3_close(db);
     }
 
@@ -373,6 +397,13 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
         "ALTER TABLE outbox ADD COLUMN expires_at_ms INTEGER NOT NULL DEFAULT 0;");
     s->impl_->exec("PRAGMA journal_mode = WAL;");
     s->impl_->exec("PRAGMA synchronous = NORMAL;");
+    // F-5 (audit): zero the content of freed pages in place on DELETE/UPDATE
+    // so TTL-pruned and rotation-superseded ciphertext doesn't linger in the
+    // db file's freelist where the master-key holder could still decrypt it.
+    // Pages freed by prune_expired / rotate_storage_keys still leave their
+    // pre-image in the WAL until a checkpoint — those two paths additionally
+    // wal_checkpoint(TRUNCATE) to flush and truncate the WAL.
+    s->impl_->exec("PRAGMA secure_delete = ON;");
 
     const int version = read_user_version(s->impl_->db);
     const bool have_key = !master_key.empty();
@@ -384,7 +415,7 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
     if (version == kSchemaVersionEncrypted && !have_key) {
         throw std::runtime_error(
             "SqliteStore::open: database is encrypted at rest "
-            "(user_version=2) but no master_key was provided");
+            "(user_version=3) but no master_key was provided");
     }
     if (have_key) {
         s->impl_->encrypt_at_rest = true;
@@ -822,6 +853,13 @@ std::size_t SqliteStore::prune_expired(std::uint64_t now_ms) {
         sqlite3_finalize(stmt);
     }
     impl_->exec("COMMIT;");
+    // F-5 (audit): secure_delete zeroed the freed pages in the main db, but
+    // in WAL mode their pre-image lives in WAL frames until a checkpoint.
+    // Flush + truncate so a destroyed (TTL-expired) message can't be carved
+    // back out of the WAL by the master-key holder.
+    if (deleted > 0) {
+        impl_->exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
     return deleted;
 }
 
@@ -843,6 +881,39 @@ bool SqliteStore::peer_verified(std::span<const std::uint8_t> peer_pub) const {
     std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
     auto* stmt = impl_->prep(
         "SELECT verified FROM peer_verified WHERE peer_pub = ?;");
+    bind_blob(stmt, 1, peer_pub);
+    bool out = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        out = sqlite3_column_int(stmt, 0) != 0;
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+// ---- TOFU PQ-capability pin -----------------------------------------------
+
+void SqliteStore::set_peer_pq_capable(std::span<const std::uint8_t> peer_pub,
+                                       bool capable, std::uint64_t first_seen_ms) {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
+    // Only ever record on first sight (INSERT) — once pinned capable, the pin
+    // is sticky and a later call can't downgrade it, so the COALESCE keeps the
+    // original first_seen_ms and an OR keeps capable latched true.
+    auto* stmt = impl_->prep(
+        "INSERT INTO peer_pq_capable(peer_pub, capable, first_seen_ms) "
+        "VALUES(?, ?, ?) ON CONFLICT(peer_pub) DO UPDATE SET "
+        "capable = (capable OR excluded.capable), "
+        "first_seen_ms = MIN(first_seen_ms, excluded.first_seen_ms);");
+    bind_blob(stmt, 1, peer_pub);
+    sqlite3_bind_int(stmt, 2, capable ? 1 : 0);
+    sqlite3_bind_int64(stmt, 3, static_cast<sqlite3_int64>(first_seen_ms));
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+bool SqliteStore::peer_pq_capable(std::span<const std::uint8_t> peer_pub) const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
+    auto* stmt = impl_->prep(
+        "SELECT capable FROM peer_pq_capable WHERE peer_pub = ?;");
     bind_blob(stmt, 1, peer_pub);
     bool out = false;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -1069,6 +1140,12 @@ std::size_t SqliteStore::rotate_storage_keys() {
     sodium_memzero(new_inbox.data(),    new_inbox.size());
     sodium_memzero(new_outbox.data(),   new_outbox.size());
     sodium_memzero(new_sessions.data(), new_sessions.size());
+    // F-5 (audit): the rewrap UPDATE'd every row in place; secure_delete
+    // zeroed the old-key ciphertext in the main db, but the WAL still holds
+    // those superseded frames (and the old gen's wrapped sub-keys) until a
+    // checkpoint. Flush + truncate so a disk image taken right after the
+    // rotation no longer carries the pre-rotation ciphertext or sub-keys.
+    impl_->exec("PRAGMA wal_checkpoint(TRUNCATE);");
     return total;
 }
 

@@ -282,9 +282,23 @@ bool parse(int argc, char** argv, Args& a) {
             // stdin into N shares (any M reconstruct).
             std::string m, n;
             if (!next(m) || !next(n)) return false;
+            // Strict 1..255 parse (audit Shamir LOW-2): std::atoi silently
+            // returned 0 on non-numeric input and the later uint8_t cast
+            // truncated out-of-range values (256 -> 0), surfacing as a
+            // misleading "bad threshold" deep in split(). Reject up front.
+            auto parse_u8 = [](const std::string& v, int& out) -> bool {
+                if (v.empty() || v.size() > 3) return false;
+                int val = 0;
+                for (char c : v) {
+                    if (c < '0' || c > '9') return false;
+                    val = val * 10 + (c - '0');
+                }
+                if (val < 1 || val > 255) return false;
+                out = val;
+                return true;
+            };
             a.shamir_split = true;
-            a.shamir_m = std::atoi(m.c_str());
-            a.shamir_n = std::atoi(n.c_str());
+            if (!parse_u8(m, a.shamir_m) || !parse_u8(n, a.shamir_n)) return false;
         }
         else if (s == "--shamir-combine") { a.shamir_combine = true; }
         else if (s == "--ttl-ms") {
@@ -684,6 +698,18 @@ int main(int argc, char** argv) {
     // don't need a relay, a username, or any identity state. The secret
     // is hex on stdin / shares are hex on stdout (one per line).
     auto unhex = [](const std::string& s) -> std::vector<std::uint8_t> {
+        // Strict per-nibble decode (audit Shamir LOW-1). std::sscanf("%02x")
+        // silently accepted non-hex input — "ag" -> 0x0a, "+5" -> 0x05 — so a
+        // share corrupted in transit (typo, stray sign) decoded to a
+        // structurally-valid-but-WRONG share and, combined with M-1 good
+        // shares, recovered the wrong seed with no parse error. Reject any
+        // character that isn't a hex digit.
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
         std::string clean;
         clean.reserve(s.size());
         for (char c : s) {
@@ -692,9 +718,10 @@ int main(int argc, char** argv) {
         if (clean.size() % 2 != 0) return {};
         std::vector<std::uint8_t> out(clean.size() / 2);
         for (std::size_t i = 0; i < out.size(); ++i) {
-            unsigned int v = 0;
-            if (std::sscanf(clean.c_str() + i * 2, "%02x", &v) != 1) return {};
-            out[i] = static_cast<std::uint8_t>(v);
+            const int hi = nibble(clean[i * 2]);
+            const int lo = nibble(clean[i * 2 + 1]);
+            if (hi < 0 || lo < 0) return {};
+            out[i] = static_cast<std::uint8_t>((hi << 4) | lo);
         }
         return out;
     };

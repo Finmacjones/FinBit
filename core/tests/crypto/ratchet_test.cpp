@@ -230,6 +230,35 @@ TEST(Ratchet, TryDecryptRollbackPreservesSkippedKeys) {
     ASSERT_TRUE(d3.has_value()); EXPECT_EQ(*d3, bytes("m3"));
 }
 
+// L1 regression: a DIRECT decrypt() call fed a CORRUPTED ciphertext that
+// targets an already-skipped message key must NOT consume that one-time key.
+// Before the fix, decrypt() erased the skipped key BEFORE the AEAD check, so
+// a forged/corrupted packet permanently destroyed the recipient's ability to
+// later decrypt the genuine out-of-order message that key was saved for.
+TEST(Ratchet, DirectDecryptKeepsSkippedKeyOnAeadFailure) {
+    auto p = make_pair();
+
+    // Alice sends 2; Bob receives #2 first → skipped map holds the key for #1.
+    auto e1 = p.alice.encrypt(bytes("m1"), span_of(kAad));
+    auto e2 = p.alice.encrypt(bytes("m2"), span_of(kAad));
+    ASSERT_TRUE(p.bob.decrypt(span_of(e2), span_of(kAad)).has_value());
+
+    // Corrupt #1's ciphertext but keep its header (same DH + n) so it still
+    // routes to the skipped key — only the AEAD tag fails.
+    auto forged = e1;
+    forged.back() ^= 0x01;
+    EXPECT_FALSE(p.bob.decrypt(span_of(forged), span_of(kAad)).has_value());
+
+    // The genuine #1 MUST still decrypt — the skipped key survived the failed
+    // attempt (pre-fix this returned nullopt: the key was already erased).
+    auto d1 = p.bob.decrypt(span_of(e1), span_of(kAad));
+    ASSERT_TRUE(d1.has_value());
+    EXPECT_EQ(*d1, bytes("m1"));
+
+    // And it's genuinely one-time: a replay of the now-consumed key fails.
+    EXPECT_FALSE(p.bob.decrypt(span_of(e1), span_of(kAad)).has_value());
+}
+
 // H1 regression: the sealed-sender try-all DoS guard. header_matches_recv_chain
 // must (a) return true for a message that genuinely belongs to the session,
 // (b) return false for a message from an unrelated session WITHOUT deriving
