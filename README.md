@@ -33,7 +33,7 @@ captures anytime.)*
   XChaCha20-Poly1305 (WASM, no AES-NI), now with a **post-quantum hybrid**
   root key (ML-KEM-768 ‖ X25519, see below). Server only ever sees
   ciphertext — and in serverless mode it sees nothing at all (see
-  "Serverless overlay" below). 390 native tests + 12 web smokes + 15
+  "Serverless overlay" below). 395 native tests + 12 web smokes + 15
   end-to-end shell demos pass.
 - **Inline images & GIFs (DMs + channels)** — the 📎 attach button sends
   an image or GIF, rendered inline in the chat (animated for GIFs). In a
@@ -58,7 +58,7 @@ captures anytime.)*
     UI checkbox in the channel-create dialog. Surviving restart via
     an operation-replay persistence layer above `mls::State` (the
     only acknowledged limitation in the v0 MLS path is now closed —
-    401 MLS-build tests pass including end-to-end alice/bob
+    406 MLS-build tests pass including end-to-end alice/bob
     restoration after process restart). See
     `docs/security-audit.md §10` for the design.
 - **Login** — Argon2id-protected identity vault on disk. v2 format binds
@@ -335,7 +335,7 @@ sudo apt install cmake build-essential libsodium-dev libsqlite3-dev \
 ```bash
 cmake -S . -B build
 cmake --build build -j
-ctest --test-dir build --output-on-failure   # 390 native tests
+ctest --test-dir build --output-on-failure   # 395 native tests
 ```
 
 For the MLS opt-in path:
@@ -344,7 +344,7 @@ For the MLS opt-in path:
 scripts/fetch-mlspp.sh                       # vendor + apply patches
 cmake -S . -B build-mls -DFB_FEATURE_MLS=ON
 cmake --build build-mls -j
-ctest --test-dir build-mls --output-on-failure   # 401 native tests
+ctest --test-dir build-mls --output-on-failure   # 406 native tests
 ```
 
 ### 3. Run a local relay
@@ -441,8 +441,8 @@ fb.example.com {
 ### Native tests
 
 ```bash
-ctest --test-dir build --output-on-failure       # 390 tests, default
-ctest --test-dir build-mls --output-on-failure   # 401 tests, FB_FEATURE_MLS=ON
+ctest --test-dir build --output-on-failure       # 395 tests, default
+ctest --test-dir build-mls --output-on-failure   # 406 tests, FB_FEATURE_MLS=ON
 ```
 
 The default build covers crypto KAT, ratchet behaviour (including
