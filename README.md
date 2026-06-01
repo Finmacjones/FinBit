@@ -110,9 +110,10 @@ captures anytime.)*
   present (FIPS-203 ML-KEM in the default provider — detected at CMake
   configure → `FB_HAVE_ML_KEM`); peers without it fall back to classical
   X25519, and that fallback is downgrade-protected — a stripped KEM key
-  inside a PQ-signed bundle is rejected. The web client is structurally
-  wired but dormant until a reviewer vendors the noble ML-KEM bundle
-  (see `client-web/ui/vendor/README.md`).
+  inside a PQ-signed bundle is rejected. The web client is **also PQ-hybrid**:
+  it vendors `@noble/post-quantum`'s ML-KEM-768 (`client-web/ui/vendor/`) and
+  derives the same FIPS-203 keypair from the identity seed, so web↔desktop
+  sessions are bit-compatible.
 - **Post-quantum signatures (ML-DSA-65)** — `PreKeyBundle`s carry ML-DSA-65
   (FIPS-204) public keys + signatures alongside Ed25519, so the bundle
   authentication that bootstraps a session is itself PQ-safe. Long-term
@@ -293,7 +294,6 @@ captures anytime.)*
 | Subsystem | Blocker |
 |---|---|
 | SFU mode for >6-participant calls | mediasoup or Janus integration; full-mesh works for small rooms today |
-| Post-quantum on the web client | structurally wired but dormant — needs a human reviewer to vendor the noble ML-KEM-768 bundle into `client-web/ui/vendor/`; native (desktop + fb-cli) is already PQ-hybrid on OpenSSL 3.5+ |
 | Android client | NDK not installed in this dev env (Kotlin/Compose scaffold ready) |
 | iOS client | not started |
 | Desktop UI for `PeerNet` config | currently env-var driven (`FB_PEER_LISTEN_PORT/CERT/KEY`, `FB_PEER_DIALER_*`, `FB_PEER_PUBLIC_ADDR`, `FB_GOSSIP_PORT`, `FB_OFFLINE_RELAYS`). A "Network…" preferences panel is a small follow-up — the underlying P2P + DHT + offline-relay stack is fully wired and tested. |

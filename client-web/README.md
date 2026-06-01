@@ -15,13 +15,14 @@ Emscripten, drives a Discord-style HTML/CSS/JS UI on top.
   with a console warning).
 - **Recovery code** — 64-char hex of the seed (or a BIP39 phrase);
   portable to/from the desktop client.
-- **Post-quantum hybrid — wired but dormant.** The ML-KEM-768 send/receive
-  path (`finbit_pq.js`) is fully wired and the wire format already reserves
-  the `pq_pubkey` / `pq_ct` fields, but it stays inactive — falling back to
-  X25519-only handshakes — until a reviewer vendors the noble ML-KEM-768
-  bundle into `ui/vendor/` (a deliberate supply-chain decision; see
-  `ui/vendor/README.md`). Native peers see no difference: empty PQ fields
-  cleanly trigger their X25519 fallback.
+- **Post-quantum hybrid — active.** `finbit_pq.js` vendors
+  `@noble/post-quantum`'s ML-KEM-768 (`ui/vendor/noble-mlkem.mjs`), so the
+  web client publishes a real `pq_pubkey`, ships `pq_ct` on hybrid sends, and
+  derives the same FIPS-203 keypair from the identity seed as desktop/fb-cli
+  — making web↔native sessions bit-compatible. Re-verify the vendored bytes
+  with `node test/pq_vendor_verify.mjs`; provenance is in `ui/vendor/README.md`.
+  (If the vendor file is ever removed, the adapter degrades cleanly to
+  X25519-only and pre-PQ peers see no difference.)
 
 ## Layout
 
