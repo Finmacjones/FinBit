@@ -3,8 +3,10 @@
 #include "fb/store/attachment_frame.hpp"
 
 #include <gtest/gtest.h>
+#include <sqlite3.h>
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <span>
@@ -34,6 +36,32 @@ std::vector<std::uint8_t> bytes(std::initializer_list<std::uint8_t> il) {
 }
 std::span<const std::uint8_t> span_of(const std::vector<std::uint8_t>& v) {
     return std::span<const std::uint8_t>(v.data(), v.size());
+}
+
+// Read the raw (still-AEAD-wrapped) inbox.plaintext blob for one envelope_id
+// directly off disk via a fresh sqlite3 connection — used to prove the master
+// ratchet actually re-encrypted the row on disk (the stored bytes change).
+std::vector<std::uint8_t> raw_inbox_blob(const std::string& path,
+                                         const std::vector<std::uint8_t>& envid) {
+    sqlite3* db = nullptr;
+    std::vector<std::uint8_t> out;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) { sqlite3_close(db); return out; }
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db,
+            "SELECT plaintext FROM inbox WHERE envelope_id = ?;", -1, &st,
+            nullptr) == SQLITE_OK) {
+        sqlite3_bind_blob(st, 1, envid.data(), static_cast<int>(envid.size()),
+                          SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const auto* p = static_cast<const std::uint8_t*>(
+                sqlite3_column_blob(st, 0));
+            const int n = sqlite3_column_bytes(st, 0);
+            out.assign(p, p + n);
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    return out;
 }
 
 }  // namespace
@@ -777,5 +805,173 @@ TEST_F(TmpDb, PeerPqCapablePinIsStickyAndPersists) {
         // A different, never-seen peer is still not capable.
         auto other = bytes({0x99, 0x88});
         EXPECT_FALSE(s->peer_pq_capable(span_of(other)));
+    }
+}
+
+// Forward-secret storage MASTER ratchet (audit residual). Re-keys every
+// encrypted table under a fresh random master, persists it wrapped under the
+// KEK, and the new master is recovered from disk on reopen.
+TEST_F(TmpDb, MasterRatchetReKeysAndSurvivesReopen) {
+    std::array<std::uint8_t, 32> key{};
+    for (std::size_t i = 0; i < key.size(); ++i) key[i] = static_cast<std::uint8_t>(i + 1);
+    auto K = std::span<const std::uint8_t>(key.data(), key.size());
+    auto envid = bytes({0x01, 0x02}); auto peer = bytes({0x0a, 0x0b});
+    const std::string c_inbox = "RATCHET_INBOX_CANARY";
+    const std::string c_sess  = "RATCHET_SESSION_CANARY";
+    const std::string c_name  = "RATCHET_NAME_CANARY";
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        std::vector<std::uint8_t> pt(c_inbox.begin(), c_inbox.end());
+        s->append_inbox(span_of(envid), span_of(peer), span_of(pt), 111);
+        std::vector<std::uint8_t> sb(c_sess.begin(), c_sess.end());
+        s->save_session(span_of(peer), span_of(sb));
+        s->cache_peer_name(span_of(peer), c_name);
+        EXPECT_EQ(s->storage_master_generation(), 0u);
+        const auto n = s->ratchet_storage_master();
+        EXPECT_GT(n, 0u);
+        EXPECT_EQ(s->storage_master_generation(), 1u);
+        // Readable in-memory immediately after the ratchet (new keys live).
+        auto rows = s->recent_inbox(10);
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::string(rows[0].plaintext.begin(), rows[0].plaintext.end()), c_inbox);
+        auto sess = s->load_session(span_of(peer));
+        ASSERT_TRUE(sess.has_value());
+        EXPECT_EQ(std::string(sess->begin(), sess->end()), c_sess);
+        EXPECT_EQ(*s->peer_name(span_of(peer)), c_name);
+    }
+    // Reopen with the SAME key: the fresh random master is recovered off disk.
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        EXPECT_EQ(s->storage_master_generation(), 1u);
+        auto rows = s->recent_inbox(10);
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::string(rows[0].plaintext.begin(), rows[0].plaintext.end()), c_inbox);
+        EXPECT_EQ(*s->peer_name(span_of(peer)), c_name);
+        // Ratchet a second epoch (master is now random→random, not KEK→random).
+        EXPECT_GT(s->ratchet_storage_master(), 0u);
+        EXPECT_EQ(s->storage_master_generation(), 2u);
+    }
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        EXPECT_EQ(s->storage_master_generation(), 2u);
+        auto sess = s->load_session(span_of(peer));
+        ASSERT_TRUE(sess.has_value());
+        EXPECT_EQ(std::string(sess->begin(), sess->end()), c_sess);
+    }
+}
+
+// The ratchet must actually RE-ENCRYPT rows on disk (the stored ciphertext
+// changes), and the plaintext stays absent from the raw file the whole time.
+TEST_F(TmpDb, MasterRatchetReEncryptsOnDiskAndStaysEncrypted) {
+    std::array<std::uint8_t, 32> key{};
+    for (auto& b : key) b = 0x33;
+    auto K = std::span<const std::uint8_t>(key.data(), key.size());
+    auto envid = bytes({0x77, 0x88}); auto peer = bytes({0x99});
+    const std::string canary = "REKEY_DISK_CANARY_ZZZZ";
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        std::vector<std::uint8_t> pt(canary.begin(), canary.end());
+        s->append_inbox(span_of(envid), span_of(peer), span_of(pt), 5);
+    }
+    const auto b0 = raw_inbox_blob(path, envid);
+    ASSERT_FALSE(b0.empty());
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        EXPECT_GT(s->ratchet_storage_master(), 0u);
+    }
+    const auto b1 = raw_inbox_blob(path, envid);
+    ASSERT_FALSE(b1.empty());
+    EXPECT_NE(b0, b1) << "ratchet must re-encrypt the row under the new master";
+    // Still decryptable via the API.
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        auto rows = s->recent_inbox(10);
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(std::string(rows[0].plaintext.begin(), rows[0].plaintext.end()), canary);
+    }
+    // The plaintext canary must NOT be present anywhere in the raw file.
+    FILE* f = std::fopen(path.c_str(), "rb");
+    ASSERT_NE(f, nullptr);
+    std::fseek(f, 0, SEEK_END);
+    const long sz = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    std::vector<char> file(static_cast<std::size_t>(sz));
+    ASSERT_EQ(std::fread(file.data(), 1, file.size(), f), file.size());
+    std::fclose(f);
+    EXPECT_EQ(std::string_view(file.data(), file.size()).find(canary),
+              std::string_view::npos)
+        << "plaintext leaked into the .db after the ratchet";
+}
+
+// After a ratchet, the storage master is a random value wrapped under the KEK,
+// so reopening with the WRONG key must fail loudly (not derive garbage keys).
+TEST_F(TmpDb, MasterRatchetBindsToKekWrongKeyThrows) {
+    std::array<std::uint8_t, 32> key{};
+    for (auto& b : key) b = 0x42;
+    auto K = std::span<const std::uint8_t>(key.data(), key.size());
+    auto envid = bytes({0x01}); auto peer = bytes({0x02});
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        auto pt = bytes({0xcc, 0xdd});
+        s->append_inbox(span_of(envid), span_of(peer), span_of(pt), 1);
+        EXPECT_GT(s->ratchet_storage_master(), 0u);
+    }
+    // Right key still opens.
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        EXPECT_EQ(s->storage_master_generation(), 1u);
+    }
+    // Wrong key: storage_master won't unwrap → throw.
+    std::array<std::uint8_t, 32> wrong{};
+    for (auto& b : wrong) b = 0xff;
+    EXPECT_THROW({
+        auto s = fb::store::SqliteStore::open(
+            path, std::span<const std::uint8_t>(wrong.data(), wrong.size()));
+    }, std::runtime_error);
+}
+
+// Ratcheting a plaintext (unencrypted) store is a no-op.
+TEST_F(TmpDb, MasterRatchetNoopWhenUnencrypted) {
+    auto s = fb::store::SqliteStore::open(path);   // no key
+    EXPECT_EQ(s->ratchet_storage_master(), 0u);
+    EXPECT_EQ(s->storage_master_generation(), 0u);
+}
+
+// The ratchet must also re-key the MLS tables (state + log) — the log uses a
+// channel_id||seq_be AAD, so this exercises the inline re-encryption path and
+// guards against silently bricking MLS group history on a master ratchet.
+TEST_F(TmpDb, MasterRatchetReKeysMlsTables) {
+    std::array<std::uint8_t, 32> key{};
+    for (auto& b : key) b = 0x5a;
+    auto K = std::span<const std::uint8_t>(key.data(), key.size());
+    std::vector<std::uint8_t> channel_id(32, 0x71);
+    auto seed = bytes({0x10, 0x11, 0x12});
+    auto op0  = bytes({0xa0});
+    auto op1  = bytes({0xb1, 0xb1});
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        s->mls_group_save(span_of(channel_id), span_of(seed));
+        s->mls_group_op_append(span_of(channel_id), 0, span_of(op0));
+        s->mls_group_op_append(span_of(channel_id), 1, span_of(op1));
+        EXPECT_GT(s->ratchet_storage_master(), 0u);
+        // Readable immediately after the ratchet.
+        auto snap = s->mls_group_load(span_of(channel_id));
+        ASSERT_TRUE(snap.has_value());
+        EXPECT_EQ(snap->seed, seed);
+        ASSERT_EQ(snap->ops.size(), 2u);
+        EXPECT_EQ(snap->ops[0], op0);
+        EXPECT_EQ(snap->ops[1], op1);
+    }
+    // Recovered intact after reopen under the ratcheted master.
+    {
+        auto s = fb::store::SqliteStore::open(path, K);
+        EXPECT_EQ(s->storage_master_generation(), 1u);
+        auto snap = s->mls_group_load(span_of(channel_id));
+        ASSERT_TRUE(snap.has_value());
+        EXPECT_EQ(snap->seed, seed);
+        ASSERT_EQ(snap->ops.size(), 2u);
+        EXPECT_EQ(snap->ops[0], op0);
+        EXPECT_EQ(snap->ops[1], op1);
+        EXPECT_EQ(snap->next_seq, 2);
     }
 }

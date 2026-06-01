@@ -142,6 +142,21 @@ CREATE TABLE IF NOT EXISTS storage_keys (
     wrapped    BLOB    NOT NULL,
     generation INTEGER NOT NULL
 );
+-- Tier-11 forward-secret storage, master ratchet (audit residual — the
+-- deeper answer to F-4). Single row (id=0) holding the current STORAGE
+-- MASTER, wrapped under the vault-derived KEK (the key passed to open()).
+-- All per-table sub-keys derive from this storage master, NOT from the KEK
+-- directly. ratchet_storage_master() replaces it with a fresh RANDOM master
+-- (independent of the old, not a KDF of it), re-encrypts every table, and
+-- destroys the old master — so a captured master VALUE (RAM scrape) is
+-- bounded to its epoch. ABSENT row ⇒ storage master == the KEK at
+-- generation 0, which reproduces the pre-ratchet derivation exactly, so
+-- existing databases open unchanged with no migration.
+CREATE TABLE IF NOT EXISTS storage_master (
+    id            INTEGER PRIMARY KEY CHECK (id = 0),
+    wrapped       BLOB    NOT NULL,
+    generation    INTEGER NOT NULL
+);
 -- Tier-11 MITM verification: "human verified this peer's identity"
 -- bit. Set true when the user has compared the safety number with the
 -- peer out-of-band; clears (or stays false) otherwise. The UI uses it
@@ -206,6 +221,21 @@ std::array<std::uint8_t, kKeyLen> derive_table_key(
     std::array<std::uint8_t, kKeyLen> out{};
     std::memcpy(out.data(), vec.data(), kKeyLen);
     return out;
+}
+
+// AAD for the wrapped storage master: a domain tag || generation_be. Binds
+// the wrapped-master blob to its generation so a row carried over from a
+// different epoch (or another DB) fails the AEAD tag rather than silently
+// re-keying the database to the wrong master.
+std::vector<std::uint8_t> storage_master_aad(std::uint64_t gen) {
+    static constexpr char kTag[] = "FinBit-DB-StorageMaster-v1";
+    std::vector<std::uint8_t> aad(
+        reinterpret_cast<const std::uint8_t*>(kTag),
+        reinterpret_cast<const std::uint8_t*>(kTag) + (sizeof(kTag) - 1));
+    for (int i = 7; i >= 0; --i) {
+        aad.push_back(static_cast<std::uint8_t>((gen >> (8 * i)) & 0xff));
+    }
+    return aad;
 }
 
 // Wrap `plaintext` as `nonce(24) || ct+tag`. AAD binds `aad` (typically
@@ -280,10 +310,18 @@ struct SqliteStore::Impl {
     std::array<std::uint8_t, kKeyLen> mls_state_key{};
     std::array<std::uint8_t, kKeyLen> mls_log_key{};
 
-    // Tier-11 Phase 2 — kept around so rotate_storage_keys() can re-wrap
-    // freshly-generated sub-keys under it. zeroize on destruction.
+    // The vault-derived KEK (the value passed to open()). It NO LONGER
+    // encrypts data directly — it only wraps the storage master below.
+    // zeroize on destruction.
     std::array<std::uint8_t, kKeyLen> master_key{};
     bool                              have_master = false;
+    // Tier-11 forward-secret storage master (audit residual). All per-table
+    // sub-keys derive from THIS, not from master_key. At generation 0 (no
+    // storage_master row on disk) it equals master_key, reproducing the
+    // pre-ratchet derivation; ratchet_storage_master() replaces it with a
+    // fresh random value and bumps the generation.
+    std::array<std::uint8_t, kKeyLen> storage_master{};
+    std::uint64_t                     storage_master_generation = 0;
     // Rotation generation counter (incremented on each successful
     // rotate_storage_keys call; bound into the AAD of the wrapped
     // sub-keys so a row swap across generations fails AEAD verify).
@@ -298,9 +336,10 @@ struct SqliteStore::Impl {
         // them via HKDF. Best-effort: a tight RLIMIT_MEMLOCK can make mlock
         // fail, in which case we run unlocked — correctness is unaffected,
         // only the swap-exposure hardening is lost.
-        for (auto* k : {&master_key, &inbox_key, &outbox_key, &sessions_key,
-                        &chan_state_key, &chan_peers_key, &chan_inbox_key,
-                        &peer_name_key, &mls_state_key, &mls_log_key}) {
+        for (auto* k : {&master_key, &storage_master, &inbox_key, &outbox_key,
+                        &sessions_key, &chan_state_key, &chan_peers_key,
+                        &chan_inbox_key, &peer_name_key, &mls_state_key,
+                        &mls_log_key}) {
             sodium_mlock(k->data(), k->size());
         }
     }
@@ -310,9 +349,10 @@ struct SqliteStore::Impl {
         // core-dump after Close-without-Quit can't carry the keys and the
         // locked pages are returned to the OS. (Replaces the bare
         // sodium_memzero now that the ctor mlocks.)
-        for (auto* k : {&master_key, &inbox_key, &outbox_key, &sessions_key,
-                        &chan_state_key, &chan_peers_key, &chan_inbox_key,
-                        &peer_name_key, &mls_state_key, &mls_log_key}) {
+        for (auto* k : {&master_key, &storage_master, &inbox_key, &outbox_key,
+                        &sessions_key, &chan_state_key, &chan_peers_key,
+                        &chan_inbox_key, &peer_name_key, &mls_state_key,
+                        &mls_log_key}) {
             sodium_munlock(k->data(), k->size());
         }
         if (db) sqlite3_close(db);
@@ -421,15 +461,57 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
         s->impl_->encrypt_at_rest = true;
         std::memcpy(s->impl_->master_key.data(), master_key.data(), kKeyLen);
         s->impl_->have_master = true;
-        s->impl_->inbox_key       = derive_table_key(master_key, "FinBit-DB-Inbox-v1");
-        s->impl_->outbox_key      = derive_table_key(master_key, "FinBit-DB-Outbox-v1");
-        s->impl_->sessions_key    = derive_table_key(master_key, "FinBit-DB-Sessions-v1");
-        s->impl_->chan_state_key  = derive_table_key(master_key, "FinBit-DB-ChanState-v1");
-        s->impl_->chan_peers_key  = derive_table_key(master_key, "FinBit-DB-ChanPeers-v1");
-        s->impl_->chan_inbox_key  = derive_table_key(master_key, "FinBit-DB-ChanInbox-v1");
-        s->impl_->peer_name_key   = derive_table_key(master_key, "FinBit-DB-PeerName-v1");
-        s->impl_->mls_state_key   = derive_table_key(master_key, "FinBit-DB-MlsState-v1");
-        s->impl_->mls_log_key     = derive_table_key(master_key, "FinBit-DB-MlsLog-v1");
+
+        // Tier-11 forward-secret master ratchet: resolve the STORAGE MASTER
+        // that the per-table sub-keys derive from. By default it IS the vault
+        // KEK (generation 0) — this reproduces the pre-ratchet derivation
+        // exactly, so a database created before this change opens with no
+        // migration. If a prior ratchet_storage_master() persisted a fresh
+        // random master, unwrap it under the KEK and use that instead.
+        std::memcpy(s->impl_->storage_master.data(), master_key.data(), kKeyLen);
+        {
+            auto* sm = s->impl_->prep(
+                "SELECT wrapped, generation FROM storage_master WHERE id = 0;");
+            const bool have_row = sqlite3_step(sm) == SQLITE_ROW;
+            if (have_row) {
+                const auto blob_len = sqlite3_column_bytes(sm, 0);
+                const auto* blob_ptr = static_cast<const std::uint8_t*>(
+                    sqlite3_column_blob(sm, 0));
+                const std::uint64_t gen = static_cast<std::uint64_t>(
+                    sqlite3_column_int64(sm, 1));
+                auto aad = storage_master_aad(gen);
+                auto unwrapped = aead_unwrap(
+                    s->impl_->master_key,
+                    std::span<const std::uint8_t>(blob_ptr,
+                                                  static_cast<std::size_t>(blob_len)),
+                    std::span<const std::uint8_t>(aad.data(), aad.size()));
+                sqlite3_finalize(sm);
+                if (!unwrapped || unwrapped->size() != kKeyLen) {
+                    // The DB has ratcheted to a random master that this KEK
+                    // can't unwrap → wrong passphrase/key or corruption.
+                    // Fail loudly rather than derive garbage sub-keys.
+                    throw std::runtime_error(
+                        "SqliteStore::open: storage_master present but could "
+                        "not be unwrapped — wrong key/passphrase or corruption");
+                }
+                std::memcpy(s->impl_->storage_master.data(),
+                            unwrapped->data(), kKeyLen);
+                sodium_memzero(unwrapped->data(), unwrapped->size());
+                s->impl_->storage_master_generation = gen;
+            } else {
+                sqlite3_finalize(sm);
+            }
+        }
+        const auto& sm_key = s->impl_->storage_master;
+        s->impl_->inbox_key       = derive_table_key(sm_key, "FinBit-DB-Inbox-v1");
+        s->impl_->outbox_key      = derive_table_key(sm_key, "FinBit-DB-Outbox-v1");
+        s->impl_->sessions_key    = derive_table_key(sm_key, "FinBit-DB-Sessions-v1");
+        s->impl_->chan_state_key  = derive_table_key(sm_key, "FinBit-DB-ChanState-v1");
+        s->impl_->chan_peers_key  = derive_table_key(sm_key, "FinBit-DB-ChanPeers-v1");
+        s->impl_->chan_inbox_key  = derive_table_key(sm_key, "FinBit-DB-ChanInbox-v1");
+        s->impl_->peer_name_key   = derive_table_key(sm_key, "FinBit-DB-PeerName-v1");
+        s->impl_->mls_state_key   = derive_table_key(sm_key, "FinBit-DB-MlsState-v1");
+        s->impl_->mls_log_key     = derive_table_key(sm_key, "FinBit-DB-MlsLog-v1");
 
         // Tier-11 Phase 2: if a prior rotation has persisted sub-keys
         // for any of {inbox, outbox, sessions}, override the
@@ -459,7 +541,7 @@ std::unique_ptr<SqliteStore> SqliteStore::open(
                     aad.push_back(static_cast<std::uint8_t>((gen >> (8 * i)) & 0xff));
                 }
                 auto unwrapped = aead_unwrap(
-                    s->impl_->master_key,
+                    s->impl_->storage_master,
                     std::span<const std::uint8_t>(blob_ptr, static_cast<std::size_t>(blob_len)),
                     std::span<const std::uint8_t>(aad.data(), aad.size()));
                 if (unwrapped && unwrapped->size() == kKeyLen) {
@@ -1092,7 +1174,7 @@ std::size_t SqliteStore::rotate_storage_keys() {
             aad.push_back(static_cast<std::uint8_t>((new_gen >> (8 * i)) & 0xff));
         }
         auto wrapped = aead_wrap(
-            impl_->master_key,
+            impl_->storage_master,
             std::span<const std::uint8_t>(k.data(), k.size()),
             std::span<const std::uint8_t>(aad.data(), aad.size()));
         auto* stmt = impl_->prep(
@@ -1147,6 +1229,208 @@ std::size_t SqliteStore::rotate_storage_keys() {
     // rotation no longer carries the pre-rotation ciphertext or sub-keys.
     impl_->exec("PRAGMA wal_checkpoint(TRUNCATE);");
     return total;
+}
+
+std::size_t SqliteStore::ratchet_storage_master() {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
+    if (!impl_->encrypt_at_rest) return 0;   // nothing to ratchet when plaintext
+
+    // A FRESH, INDEPENDENT master — random, NOT a KDF of the old one. That's
+    // the crux: a master value captured in an earlier epoch can never compute
+    // this one, so re-keying under it heals the compromise.
+    std::array<std::uint8_t, kKeyLen> new_master{};
+    randombytes_buf(new_master.data(), new_master.size());
+    const std::uint64_t new_gen = impl_->storage_master_generation + 1;
+
+    auto nk = [&](const char* info) { return derive_table_key(new_master, info); };
+    std::array<std::uint8_t, kKeyLen> n_inbox      = nk("FinBit-DB-Inbox-v1");
+    std::array<std::uint8_t, kKeyLen> n_outbox     = nk("FinBit-DB-Outbox-v1");
+    std::array<std::uint8_t, kKeyLen> n_sessions   = nk("FinBit-DB-Sessions-v1");
+    std::array<std::uint8_t, kKeyLen> n_chan_state = nk("FinBit-DB-ChanState-v1");
+    std::array<std::uint8_t, kKeyLen> n_chan_peers = nk("FinBit-DB-ChanPeers-v1");
+    std::array<std::uint8_t, kKeyLen> n_chan_inbox = nk("FinBit-DB-ChanInbox-v1");
+    std::array<std::uint8_t, kKeyLen> n_peer_name  = nk("FinBit-DB-PeerName-v1");
+    std::array<std::uint8_t, kKeyLen> n_mls_state  = nk("FinBit-DB-MlsState-v1");
+    std::array<std::uint8_t, kKeyLen> n_mls_log    = nk("FinBit-DB-MlsLog-v1");
+
+    std::size_t total = 0;
+
+    // Re-encrypt one table's `val_col` from old_k -> new_k. AAD per row is the
+    // concatenation of `aad_cols` (in order); rows are addressed by rowid so
+    // the UPDATE is unambiguous regardless of the declared PK. A row whose
+    // value is NULL/empty or won't unwrap under old_k is left untouched
+    // (e.g. chan_state.own_dist NULL, or a stray different-generation row).
+    auto rewrap = [&](const char* table, const char* val_col,
+                      std::initializer_list<const char*> aad_cols,
+                      const std::array<std::uint8_t, kKeyLen>& old_k,
+                      const std::array<std::uint8_t, kKeyLen>& new_k) {
+        const int ncols = static_cast<int>(aad_cols.size());
+        std::string sel = "SELECT rowid, ";
+        sel += val_col;
+        for (const char* c : aad_cols) { sel += ", "; sel += c; }
+        sel += " FROM "; sel += table; sel += ";";
+        auto* st = impl_->prep(sel.c_str());
+        struct Pending { sqlite3_int64 rowid; std::vector<std::uint8_t> blob; };
+        std::vector<Pending> pending;
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const auto rid     = sqlite3_column_int64(st, 0);
+            const auto val_len = sqlite3_column_bytes(st, 1);
+            if (val_len <= 0) continue;   // NULL / empty column — nothing to re-key
+            const auto* val_ptr = static_cast<const std::uint8_t*>(
+                sqlite3_column_blob(st, 1));
+            std::vector<std::uint8_t> aad;
+            for (int col = 2; col < 2 + ncols; ++col) {
+                const auto n = sqlite3_column_bytes(st, col);
+                const auto* p = static_cast<const std::uint8_t*>(
+                    sqlite3_column_blob(st, col));
+                if (p) aad.insert(aad.end(), p, p + n);
+            }
+            auto pt = aead_unwrap(old_k,
+                std::span<const std::uint8_t>(val_ptr, static_cast<std::size_t>(val_len)),
+                std::span<const std::uint8_t>(aad.data(), aad.size()));
+            if (!pt) continue;   // not our key / corrupt — skip, don't abort
+            auto rew = aead_wrap(new_k,
+                std::span<const std::uint8_t>(pt->data(), pt->size()),
+                std::span<const std::uint8_t>(aad.data(), aad.size()));
+            sodium_memzero(pt->data(), pt->size());
+            pending.push_back({rid, std::move(rew)});
+        }
+        sqlite3_finalize(st);
+        std::string upd = "UPDATE "; upd += table; upd += " SET ";
+        upd += val_col; upd += " = ? WHERE rowid = ?;";
+        for (const auto& p : pending) {
+            auto* us = impl_->prep(upd.c_str());
+            sqlite3_bind_blob(us, 1, p.blob.data(),
+                              static_cast<int>(p.blob.size()), SQLITE_TRANSIENT);
+            sqlite3_bind_int64(us, 2, p.rowid);
+            sqlite3_step(us);
+            sqlite3_finalize(us);
+            ++total;
+        }
+    };
+
+    impl_->exec("BEGIN IMMEDIATE;");
+    try {
+        rewrap("inbox",           "plaintext",  {"envelope_id"},
+               impl_->inbox_key,      n_inbox);
+        rewrap("outbox",          "ciphertext", {"envelope_id"},
+               impl_->outbox_key,     n_outbox);
+        rewrap("sessions",        "blob",       {"peer_pub"},
+               impl_->sessions_key,   n_sessions);
+        rewrap("chan_state",      "own_dist",   {"name"},
+               impl_->chan_state_key, n_chan_state);
+        rewrap("chan_peers",      "peer_dist",  {"channel_id", "peer_pub"},
+               impl_->chan_peers_key, n_chan_peers);
+        rewrap("chan_inbox",      "plaintext",  {"channel_id"},
+               impl_->chan_inbox_key, n_chan_inbox);
+        rewrap("peer_name_cache", "username",   {"peer_pub"},
+               impl_->peer_name_key,  n_peer_name);
+        rewrap("mls_group_state", "seed_blob",  {"channel_id"},
+               impl_->mls_state_key,  n_mls_state);
+
+        // mls_group_log: AAD = channel_id || seq_be (matches mls_log_aad), so
+        // it can't be re-keyed by the generic single-blob-AAD helper.
+        {
+            auto* st = impl_->prep(
+                "SELECT rowid, op_blob, channel_id, seq FROM mls_group_log;");
+            struct Pending { sqlite3_int64 rowid; std::vector<std::uint8_t> blob; };
+            std::vector<Pending> pending;
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const auto rid     = sqlite3_column_int64(st, 0);
+                const auto val_len = sqlite3_column_bytes(st, 1);
+                if (val_len <= 0) continue;
+                const auto* val_ptr = static_cast<const std::uint8_t*>(
+                    sqlite3_column_blob(st, 1));
+                const auto cid_len = sqlite3_column_bytes(st, 2);
+                const auto* cid_ptr = static_cast<const std::uint8_t*>(
+                    sqlite3_column_blob(st, 2));
+                const std::uint64_t seq = static_cast<std::uint64_t>(
+                    sqlite3_column_int64(st, 3));
+                std::vector<std::uint8_t> aad(cid_ptr, cid_ptr + cid_len);
+                for (int i = 7; i >= 0; --i) {
+                    aad.push_back(static_cast<std::uint8_t>((seq >> (8 * i)) & 0xff));
+                }
+                auto pt = aead_unwrap(impl_->mls_log_key,
+                    std::span<const std::uint8_t>(val_ptr, static_cast<std::size_t>(val_len)),
+                    std::span<const std::uint8_t>(aad.data(), aad.size()));
+                if (!pt) continue;
+                auto rew = aead_wrap(n_mls_log,
+                    std::span<const std::uint8_t>(pt->data(), pt->size()),
+                    std::span<const std::uint8_t>(aad.data(), aad.size()));
+                sodium_memzero(pt->data(), pt->size());
+                pending.push_back({rid, std::move(rew)});
+            }
+            sqlite3_finalize(st);
+            for (const auto& p : pending) {
+                auto* us = impl_->prep(
+                    "UPDATE mls_group_log SET op_blob = ? WHERE rowid = ?;");
+                sqlite3_bind_blob(us, 1, p.blob.data(),
+                                  static_cast<int>(p.blob.size()), SQLITE_TRANSIENT);
+                sqlite3_bind_int64(us, 2, p.rowid);
+                sqlite3_step(us);
+                sqlite3_finalize(us);
+                ++total;
+            }
+        }
+
+        // Persist the new master wrapped under the vault KEK, and drop the
+        // now-subsumed rotated sub-key overrides (post-ratchet every sub-key
+        // is HKDF(new_master)).
+        auto aad = storage_master_aad(new_gen);
+        auto wrapped = aead_wrap(impl_->master_key,
+            std::span<const std::uint8_t>(new_master.data(), new_master.size()),
+            std::span<const std::uint8_t>(aad.data(), aad.size()));
+        auto* ms = impl_->prep(
+            "INSERT INTO storage_master(id, wrapped, generation) VALUES(0, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET wrapped = excluded.wrapped, "
+            "generation = excluded.generation;");
+        sqlite3_bind_blob(ms, 1, wrapped.data(),
+                          static_cast<int>(wrapped.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_int64(ms, 2, static_cast<sqlite3_int64>(new_gen));
+        sqlite3_step(ms);
+        sqlite3_finalize(ms);
+        impl_->exec("DELETE FROM storage_keys;");
+
+        impl_->exec("COMMIT;");
+    } catch (...) {
+        impl_->exec("ROLLBACK;");
+        sodium_memzero(new_master.data(), new_master.size());
+        throw;
+    }
+
+    // Atomic key swap; irrecoverably destroy the predecessors so a memory
+    // dump after this point holds only the new epoch's keys.
+    auto wipe = [](std::array<std::uint8_t, kKeyLen>& a) {
+        sodium_memzero(a.data(), a.size());
+    };
+    wipe(impl_->storage_master);
+    wipe(impl_->inbox_key);      wipe(impl_->outbox_key);     wipe(impl_->sessions_key);
+    wipe(impl_->chan_state_key); wipe(impl_->chan_peers_key); wipe(impl_->chan_inbox_key);
+    wipe(impl_->peer_name_key);  wipe(impl_->mls_state_key);  wipe(impl_->mls_log_key);
+    impl_->storage_master = new_master;
+    impl_->inbox_key      = n_inbox;      impl_->outbox_key    = n_outbox;
+    impl_->sessions_key   = n_sessions;   impl_->chan_state_key= n_chan_state;
+    impl_->chan_peers_key = n_chan_peers; impl_->chan_inbox_key= n_chan_inbox;
+    impl_->peer_name_key  = n_peer_name;  impl_->mls_state_key = n_mls_state;
+    impl_->mls_log_key    = n_mls_log;
+    impl_->storage_master_generation = new_gen;
+    impl_->storage_keys_generation   = 0;   // overrides cleared above
+    // Zero the transient copies now that they've been installed.
+    for (auto* k : {&new_master, &n_inbox, &n_outbox, &n_sessions, &n_chan_state,
+                    &n_chan_peers, &n_chan_inbox, &n_peer_name, &n_mls_state,
+                    &n_mls_log}) {
+        sodium_memzero(k->data(), k->size());
+    }
+
+    // Flush the WAL so a disk image taken right after the ratchet carries
+    // neither the old-key ciphertext nor the old wrapped master.
+    impl_->exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    return total;
+}
+
+std::uint64_t SqliteStore::storage_master_generation() const {
+    std::lock_guard<std::recursive_mutex> _lk(impl_->mu);
+    return impl_->storage_master_generation;
 }
 
 std::vector<SqliteStore::InboxRow> SqliteStore::recent_inbox(std::size_t limit) const {

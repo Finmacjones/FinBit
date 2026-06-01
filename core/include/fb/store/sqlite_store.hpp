@@ -123,18 +123,15 @@ public:
     // exposure of an OLD sub-key VALUE alone (e.g. a stale value scraped
     // from a log or a freed buffer) does not decrypt post-rotation data.
     //
-    // It does NOT, however, provide forward secrecy against an attacker who
-    // captured the VAULT MASTER KEY. The master key is resident in process
-    // memory for the whole session (rotation needs it to wrap the new
-    // sub-keys), and the current sub-keys are persisted on disk wrapped
-    // UNDER that master key in `storage_keys`. So any adversary who dumps
-    // process RAM — cold-boot, kernel debugger, core dump, swap — obtains
-    // the master key and simply unwraps the current sub-keys straight off
-    // disk, exactly as open() does. Rotation does not stop them, and a
-    // pre-rotation dump that captured the master key decrypts the
-    // post-rotation disk state. (True forward secrecy here would require
-    // ratcheting the master key itself and irrecoverably destroying the old
-    // one each rotation — a larger redesign, not done here.)
+    // It does NOT, on its own, provide forward secrecy against an attacker
+    // who captured the STORAGE MASTER value, because the current sub-keys are
+    // persisted wrapped under that master in `storage_keys`: an adversary who
+    // dumps process RAM (cold-boot, kernel debugger, core dump, swap) obtains
+    // the master and unwraps the current sub-keys straight off disk. To heal
+    // a master-VALUE capture, follow rotation with ratchet_storage_master()
+    // (below), which replaces the master itself with fresh entropy and
+    // destroys the old one — that is the deeper forward-secrecy answer this
+    // comment used to say was "not done here". It is done now.
     //
     // Likewise it does NOT defend against PASSPHRASE COMPROMISE — an
     // attacker with the vault passphrase re-derives the master key and
@@ -143,6 +140,45 @@ public:
     // secure_delete's + WAL-checkpoints so destroyed rows leave no
     // decryptable residue on disk.
     [[nodiscard]] std::size_t rotate_storage_keys();
+
+    // Tier-11 forward-secret storage, MASTER RATCHET (audit residual — the
+    // deeper answer to F-4 that rotate_storage_keys() could not give).
+    //
+    // rotate_storage_keys() rotates per-table SUB-keys but leaves the master
+    // fixed and re-derivable from the vault passphrase, so a captured master
+    // value (RAM scrape) or the passphrase still unwraps everything. This
+    // ratchets the MASTER itself: it generates a FRESH RANDOM storage master
+    // (independent of the old — not a KDF of it), re-encrypts every encrypted
+    // table under sub-keys derived from the new master, persists the new
+    // master wrapped under the vault KEK, and irrecoverably destroys the old
+    // master (RAM zeroized, old wrapped form overwritten, WAL truncated).
+    //
+    // THREAT MODEL — what it does and does NOT do:
+    //   * DEFENDS against a master-key-VALUE capture (cold-boot / RAM
+    //     debugger / core dump / swap of the *storage master*): once you
+    //     ratchet + destroy, a value captured in an earlier epoch can neither
+    //     decrypt post-ratchet live data (re-keyed under the fresh master)
+    //     nor a pre-ratchet disk snapshot (its epoch master is gone). The
+    //     compromise is bounded to its epoch — post-compromise security /
+    //     forward secrecy against value capture.
+    //   * Does NOT defend against PASSPHRASE / vault-KEK compromise. The
+    //     current master is wrapped under the KEK, so whoever can derive the
+    //     KEK (knows the passphrase) unwraps the current master and reads
+    //     live data — and can unwrap any snapshot's epoch master too. The
+    //     guarantee is about key VALUES leaking, not the passphrase. (For
+    //     passphrase exposure the defense is Phase-1 sender-set TTL pruning.)
+    //   * Cost: re-encrypts the whole encrypted DB (bounded by DB size). Call
+    //     it periodically or on suspicion of memory exposure, not per message.
+    //
+    // Backward compatible: a DB created before this feature has no
+    // storage_master row, so its storage master is implicitly the vault KEK
+    // at generation 0 and it opens unchanged. Returns the number of rows
+    // re-encrypted; a no-op (returns 0) when at-rest encryption is off.
+    [[nodiscard]] std::size_t ratchet_storage_master();
+
+    // Current storage-master generation (0 = never ratcheted / implicit
+    // KEK-as-master). Bumps by one on each successful ratchet_storage_master().
+    [[nodiscard]] std::uint64_t storage_master_generation() const;
 
     // Tier-11 MITM verification (task #384) — persisted "this peer's
     // identity has been verified out-of-band" flag. The crypto side

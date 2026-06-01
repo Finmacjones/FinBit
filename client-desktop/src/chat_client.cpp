@@ -3788,24 +3788,30 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     }
                 }
 
-                // 0b. Tier-11 Phase 2 — storage-key rotation. Opt-in
-                //     (FB_ROTATE_INTERVAL_S=N). Re-wraps inbox + outbox +
-                //     sessions rows under fresh random sub-keys and
-                //     sodium_memzero's the predecessors so a memory dump
-                //     after this point can no longer decrypt the on-disk
-                //     state. Cost: O(rows in those 3 tables) per tick —
-                //     run on a slow cadence (typically 24h).
+                // 0b. Tier-11 — forward-secret storage MASTER ratchet. Opt-in
+                //     (FB_ROTATE_INTERVAL_S=N). Generates a fresh random
+                //     storage master, re-encrypts EVERY table under sub-keys
+                //     derived from it, and irrecoverably destroys the old
+                //     master — so a master value scraped from memory before
+                //     the tick can no longer decrypt the on-disk state (it
+                //     heals a value capture; it does not defend the passphrase
+                //     — see SqliteStore::ratchet_storage_master). Supersedes
+                //     the older sub-key-only rotate_storage_keys(). Cost:
+                //     O(all encrypted rows) per tick — run on a slow cadence
+                //     (typically 24h).
                 if (impl_->rotate_interval_s > 0 && impl_->store) {
                     const auto now = std::chrono::steady_clock::now();
                     if (now - impl_->last_rotate >=
                             std::chrono::seconds(impl_->rotate_interval_s)) {
                         try {
-                            const auto n = impl_->store->rotate_storage_keys();
-                            emit log(QString("storage-key rotation: re-wrapped "
-                                              "%1 row(s)")
+                            const auto n = impl_->store->ratchet_storage_master();
+                            emit log(QString("storage master ratchet (gen %1): "
+                                              "re-keyed %2 row(s)")
+                                         .arg(static_cast<qulonglong>(
+                                             impl_->store->storage_master_generation()))
                                          .arg(static_cast<qulonglong>(n)));
                         } catch (const std::exception& e) {
-                            emit log(QString("rotate_storage_keys failed: %1")
+                            emit log(QString("ratchet_storage_master failed: %1")
                                          .arg(e.what()));
                         }
                         impl_->last_rotate = now;
