@@ -16,6 +16,22 @@ namespace {
 
 using namespace fb::handshake;
 
+// Skip a test when the build lacks ML-KEM (OpenSSL < 3.5, e.g. Ubuntu 24.04's
+// stock libssl). The PQ helpers correctly THROW "PQ unavailable" at runtime in
+// that configuration — that's intended graceful degradation, so these tests
+// must skip rather than fail. (The big #if FB_HAVE_ML_KEM block below already
+// compiles its tests out; these four predate it and skip at runtime instead.)
+#if defined(FB_HAVE_ML_KEM) && FB_HAVE_ML_KEM
+constexpr bool kHaveMlKem = true;
+#else
+constexpr bool kHaveMlKem = false;
+#endif
+#define SKIP_IF_NO_MLKEM()                                                     \
+    do {                                                                      \
+        if (!kHaveMlKem)                                                      \
+            GTEST_SKIP() << "ML-KEM unavailable in this build (OpenSSL < 3.5)";\
+    } while (0)
+
 // Build a deterministic Identity from a fixed seed so the test names a
 // concrete pair of users (alice / bob) and the same seed → same Identity →
 // same X25519 + same PQ keypair across runs.
@@ -54,6 +70,7 @@ TEST(Handshake, X25519DhMatchesOnBothSides) {
 }
 
 TEST(Handshake, PqIdentityDerivationIsDeterministic) {
+    SKIP_IF_NO_MLKEM();
     auto alice = ident_from_byte(0x33);
     auto seed  = seed_of_byte(0x33);
     auto pq1 = derive_pq_identity(alice,
@@ -73,6 +90,7 @@ TEST(Handshake, PqIdentityDerivationIsDeterministic) {
 }
 
 TEST(Handshake, HybridSendRecvAgreeOnRoot) {
+    SKIP_IF_NO_MLKEM();
     auto alice = ident_from_byte(0x44);
     auto bob   = ident_from_byte(0x55);
     auto seed_alice = seed_of_byte(0x44);
@@ -119,6 +137,7 @@ TEST(Handshake, EmptyPeerPqDegradesToPureX25519) {
 }
 
 TEST(Handshake, EmptyPqCtDegradesToPureX25519OnRecv) {
+    SKIP_IF_NO_MLKEM();
     auto alice = ident_from_byte(0x88);
     auto bob   = ident_from_byte(0x99);
     auto seed_bob = seed_of_byte(0x99);
@@ -138,6 +157,7 @@ TEST(Handshake, EmptyPqCtDegradesToPureX25519OnRecv) {
 }
 
 TEST(Handshake, BundleHelperVerifiesBindingSig) {
+    SKIP_IF_NO_MLKEM();
     auto alice  = ident_from_byte(0xAA);
     auto bob    = ident_from_byte(0xBB);
     auto seed_b = seed_of_byte(0xBB);
