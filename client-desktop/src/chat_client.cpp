@@ -640,6 +640,11 @@ struct ChatClient::Impl {
     // signatures on PreKeyBundle (signed_prekey + pq_pubkey) so a CRQC
     // attacker can't downgrade.
     fb::handshake::PqSigIdentity pq_sig_id{};
+    // True iff the runtime actually provides ML-KEM-768 + ML-DSA-65 (OpenSSL
+    // 3.5+). When false the PQ identities above are left default (and never
+    // derived — derivation would throw "unavailable"); we publish a classical
+    // X25519-only bundle and every handshake degrades gracefully.
+    bool pq_ok = false;
 
     // Tier-11 MITM verification — peers the user has manually marked
     // verified via the safety-number flow. In-memory for now; sqlite
@@ -1088,13 +1093,21 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
             // input from which the PQ keypair can be recomputed; the
             // Identity object exposes only the Ed25519-derived secret key,
             // not the original seed material).
-            impl_->pq_id = derive_pq_identity(*impl_->identity,
-                std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(
-                    impl_->seed));
-            impl_->pq_sig_id = fb::handshake::derive_pq_sig_identity(
-                *impl_->identity,
-                std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(
-                    impl_->seed));
+            // Only when the runtime actually has ML-KEM-768 + ML-DSA-65
+            // (OpenSSL 3.5+). On older OpenSSL the derivation throws
+            // "unavailable" — deriving unconditionally aborted the client at
+            // sign-in. Without PQ we publish a classical bundle (X25519-only).
+            impl_->pq_ok = fb::crypto::pq::ml_kem_768_available() &&
+                           fb::crypto::pq::ml_dsa_65_available();
+            if (impl_->pq_ok) {
+                impl_->pq_id = derive_pq_identity(*impl_->identity,
+                    std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(
+                        impl_->seed));
+                impl_->pq_sig_id = fb::handshake::derive_pq_sig_identity(
+                    *impl_->identity,
+                    std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(
+                        impl_->seed));
+            }
             // We intentionally no longer call save_identity() — it was a
             // legacy path that wrote the secret key into the SQLite store
             // in cleartext. Now that LoginDialog + identity_vault are the
@@ -1776,19 +1789,24 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                 // pubkey + Ed25519 sig binding it to the identity. Peers
                 // verify the sig before encap; without binding, a MITM
                 // relay could swap a PQ key under its own control without
-                // invalidating the X25519 share.
-                b->set_pq_pubkey(std::string(
-                    reinterpret_cast<const char*>(impl_->pq_id.pub.data()),
-                    impl_->pq_id.pub.size()));
-                b->set_pq_pubkey_sig(std::string(
-                    reinterpret_cast<const char*>(impl_->pq_id.pubkey_sig.data()),
-                    impl_->pq_id.pubkey_sig.size()));
-                // Tier-11 PQ-sig: hybrid (Ed25519 + ML-DSA-65) signatures
-                // over signed_prekey and pq_pubkey. Verifier requires both
-                // halves to pass — defeats a CRQC swapping either pubkey
-                // mid-flight.
-                fb::handshake::add_pq_sig_fields_to_bundle(
-                    *b, *impl_->identity, impl_->pq_sig_id);
+                // invalidating the X25519 share. Only when PQ is actually
+                // available — otherwise leave the bundle classical (empty PQ
+                // fields = clean legacy bundle; a partial/zeroed one would be
+                // rejected by verify_bundle_pq_sigs).
+                if (impl_->pq_ok) {
+                    b->set_pq_pubkey(std::string(
+                        reinterpret_cast<const char*>(impl_->pq_id.pub.data()),
+                        impl_->pq_id.pub.size()));
+                    b->set_pq_pubkey_sig(std::string(
+                        reinterpret_cast<const char*>(impl_->pq_id.pubkey_sig.data()),
+                        impl_->pq_id.pubkey_sig.size()));
+                    // Tier-11 PQ-sig: hybrid (Ed25519 + ML-DSA-65) signatures
+                    // over signed_prekey and pq_pubkey. Verifier requires both
+                    // halves to pass — defeats a CRQC swapping either pubkey
+                    // mid-flight.
+                    fb::handshake::add_pq_sig_fields_to_bundle(
+                        *b, *impl_->identity, impl_->pq_sig_id);
+                }
                 b->set_published_at_ms(static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch())
@@ -2064,6 +2082,18 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                     // both v1 and v2 records. Coexistence is the natural
                     // upgrade path — old peers keep using old records,
                     // new peers gain the PQ defense.
+                    // Empty PQ spans when PQ is unavailable → build_prekey_record
+                    // emits a v1 (classical) record rather than a v2 record
+                    // carrying a zeroed ML-KEM pubkey.
+                    const auto pq_pub_span = impl_->pq_ok
+                        ? std::span<const std::uint8_t>(
+                              impl_->pq_id.pub.data(), impl_->pq_id.pub.size())
+                        : std::span<const std::uint8_t>();
+                    const auto pq_sig_span = impl_->pq_ok
+                        ? std::span<const std::uint8_t>(
+                              impl_->pq_id.pubkey_sig.data(),
+                              impl_->pq_id.pubkey_sig.size())
+                        : std::span<const std::uint8_t>();
                     auto pkrec = fb::p2p::build_prekey_record(
                         sig_pub, sig_priv,
                         std::span<const std::uint8_t>(
@@ -2072,11 +2102,7 @@ void ChatClient::connect_tls(const QString& host, std::uint16_t port,
                             spk_sig.data(), spk_sig_len),
                         now_ms_fn(),
                         fb::p2p::kDefaultProviderTtlMs,
-                        std::span<const std::uint8_t>(
-                            impl_->pq_id.pub.data(), impl_->pq_id.pub.size()),
-                        std::span<const std::uint8_t>(
-                            impl_->pq_id.pubkey_sig.data(),
-                            impl_->pq_id.pubkey_sig.size()));
+                        pq_pub_span, pq_sig_span);
                     auto pksent = impl_->dht->publish_prekey(pkrec);
                     emit log(QString("DHT prekey republish: sent_to=%1")
                                  .arg(static_cast<qulonglong>(pksent)));

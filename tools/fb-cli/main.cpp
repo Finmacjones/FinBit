@@ -799,14 +799,26 @@ int main(int argc, char** argv) {
     for (auto& b : seed) b = static_cast<std::uint8_t>(rng() & 0xff);
     auto identity = fb::crypto::Identity::from_seed(seed);
     auto x25519 = derive_x25519(identity);
-    auto pq_id = derive_pq_identity(identity,
-        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
-    auto pq_sig_id = fb::handshake::derive_pq_sig_identity(identity,
-        std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+    // Tier-7 PQ identity is derived ONLY when the runtime actually provides
+    // ML-KEM-768 + ML-DSA-65 (OpenSSL 3.5+). On older OpenSSL the derivation
+    // throws "unavailable" — deriving it unconditionally aborted the process
+    // at startup. When PQ is unavailable we publish a classical (X25519-only)
+    // bundle and every handshake degrades gracefully to X25519.
+    const bool pq_ok = fb::crypto::pq::ml_kem_768_available() &&
+                       fb::crypto::pq::ml_dsa_65_available();
+    fb::handshake::PqIdentity    pq_id{};
+    fb::handshake::PqSigIdentity pq_sig_id{};
+    if (pq_ok) {
+        pq_id = derive_pq_identity(identity,
+            std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+        pq_sig_id = fb::handshake::derive_pq_sig_identity(identity,
+            std::span<const std::uint8_t, fb::crypto::kIdentitySeedBytes>(seed));
+    }
 
     std::cerr << "[fb-cli] user=" << args.user
               << " fingerprint=" << identity.fingerprint()
-              << " pq=ML-KEM-768\n";
+              << " pq=" << (pq_ok ? "ML-KEM-768+ML-DSA-65"
+                                  : "off (OpenSSL<3.5; X25519-only)") << "\n";
 
     // ---- P2P mode (Phase 5) — server-less ---------------------------------
     if (args.p2p) {
@@ -1095,16 +1107,22 @@ int main(int argc, char** argv) {
         // Ed25519 signature binding it to this identity. Peers verify the
         // sig before encap; without binding, a MITM relay could swap a PQ
         // key under their own control without invalidating the X25519 share.
-        b->set_pq_pubkey(std::string(
-            reinterpret_cast<const char*>(pq_id.pub.data()), pq_id.pub.size()));
-        b->set_pq_pubkey_sig(std::string(
-            reinterpret_cast<const char*>(pq_id.pubkey_sig.data()),
-            pq_id.pubkey_sig.size()));
-        // Tier-11 PQ-sig: hybrid (Ed25519 + ML-DSA-65) signatures over
-        // signed_prekey and pq_pubkey. Peers verify both must pass —
-        // a CRQC who forges Ed25519 still has to forge ML-DSA-65 to
-        // swap either pubkey mid-flight.
-        fb::handshake::add_pq_sig_fields_to_bundle(*b, identity, pq_sig_id);
+        // Only when PQ is actually available — otherwise leave the bundle
+        // classical (all-empty PQ fields = a clean legacy bundle that peers
+        // accept and fall back to X25519 for; a partial/zeroed bundle would
+        // be rejected by verify_bundle_pq_sigs).
+        if (pq_ok) {
+            b->set_pq_pubkey(std::string(
+                reinterpret_cast<const char*>(pq_id.pub.data()), pq_id.pub.size()));
+            b->set_pq_pubkey_sig(std::string(
+                reinterpret_cast<const char*>(pq_id.pubkey_sig.data()),
+                pq_id.pubkey_sig.size()));
+            // Tier-11 PQ-sig: hybrid (Ed25519 + ML-DSA-65) signatures over
+            // signed_prekey and pq_pubkey. Peers verify both must pass — a
+            // CRQC who forges Ed25519 still has to forge ML-DSA-65 to swap
+            // either pubkey mid-flight.
+            fb::handshake::add_pq_sig_fields_to_bundle(*b, identity, pq_sig_id);
+        }
         b->set_published_at_ms(static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch())
