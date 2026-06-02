@@ -2,6 +2,9 @@
 #include "fb/crypto/padding.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
+#include <span>
 
 namespace fb::crypto {
 

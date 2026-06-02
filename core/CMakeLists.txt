@@ -202,7 +202,20 @@ if(OpenSSL_FOUND)
     # build break. See docs/censorship-resistance.md (Tier 7 — PQ hybrid).
     include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+    # Probe BOTH that the API exists AND that OpenSSL is >= 3.5.0. A bare
+    # compile check is a FALSE POSITIVE: EVP_PKEY_CTX_new_from_name has existed
+    # since 3.0, so the symbol links on (e.g.) Ubuntu 24.04's stock 3.0 — but
+    # FIPS-203 ML-KEM / FIPS-204 ML-DSA are absent from the provider there and
+    # every call throws "unsupported" at RUNTIME (and FB_HAVE_ML_KEM=1 would
+    # then make the app throw on a PQ handshake instead of falling back to
+    # X25519). Those algorithms only ship in the default provider from 3.5.0,
+    # so version-gate via #error — a pure compile check, cross-compile-safe
+    # (unlike check_cxx_source_runs).
     check_cxx_source_compiles("
+        #include <openssl/opensslv.h>
+        #if !defined(OPENSSL_VERSION_NUMBER) || OPENSSL_VERSION_NUMBER < 0x30500000L
+        #  error \"ML-KEM/ML-DSA require OpenSSL 3.5+ (FIPS-203/204 in the default provider)\"
+        #endif
         #include <openssl/evp.h>
         int main() {
             EVP_PKEY_CTX* c = EVP_PKEY_CTX_new_from_name(nullptr, \"ML-KEM-768\", nullptr);
@@ -213,10 +226,10 @@ if(OpenSSL_FOUND)
     unset(CMAKE_REQUIRED_LIBRARIES)
     if(FB_OPENSSL_HAS_ML_KEM)
         target_compile_definitions(fb_core PUBLIC FB_HAVE_ML_KEM=1)
-        message(STATUS "fb_core: OpenSSL ML-KEM-768 present → PQ-hybrid available")
+        message(STATUS "fb_core: OpenSSL 3.5+ ML-KEM-768 / ML-DSA-65 present → PQ-hybrid available")
     else()
         target_compile_definitions(fb_core PUBLIC FB_HAVE_ML_KEM=0)
-        message(STATUS "fb_core: OpenSSL has no ML-KEM-768 → PQ-hybrid throws on use")
+        message(STATUS "fb_core: OpenSSL < 3.5 (no FIPS-203/204) → PQ-hybrid gracefully disabled (X25519 fallback)")
     endif()
 else()
     target_compile_definitions(fb_core PUBLIC FB_HAVE_OPENSSL=0)
